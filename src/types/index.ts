@@ -174,6 +174,13 @@ export interface ProjectDocument {
   pdfBytes?: Uint8Array;
   status: ProjectDocumentStatus;
   processingMessage?: string;
+  /**
+   * Live progress fraction (0-1) supplied by the detector. Maps to
+   * Anthropic SSE phases (upload → thinking → tool_executing → writing
+   * → done). The DocumentList progress bar uses this as a hard floor
+   * and animates a time-based curve up to it.
+   */
+  processingProgress?: number;
   createdAt: string;
   updatedAt: string;
 }

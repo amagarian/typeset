@@ -429,10 +429,11 @@ function MainApp() {
       }
 
       // Step 3: Claude detection.
-      const setDocProcessing = (msg: string) => {
+      const setDocProcessing = (msg: string, progress?: number) => {
         updateDocumentInProject(effectiveProjectId, docId, {
           status: "processing",
           processingMessage: msg,
+          processingProgress: progress,
         });
       };
 
@@ -1283,11 +1284,12 @@ function MainApp() {
                   const bytes = pdfSource.bytes;
                   setTemplateModal(null);
 
-                  const setRedetectStatus = (msg: string) => {
+                  const setRedetectStatus = (msg: string, progress?: number) => {
                     if (activeDocumentId && selectedProjectId) {
                       updateDocumentInProject(selectedProjectId, activeDocumentId, {
                         status: "processing",
                         processingMessage: msg,
+                        processingProgress: progress,
                       });
                     }
                   };

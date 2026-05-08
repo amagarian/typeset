@@ -59,6 +59,47 @@ function progressToStatus(progress: AgenticProgress, elapsedSec: number): string
   }
 }
 
+/**
+ * Maps an agentic-progress phase to a 0-1 progress fraction. Each phase
+ * gives us a known floor for the progress bar; the UI's own time-based
+ * curve interpolates smoothly between floors so the bar doesn't stall
+ * during long phases (especially `tool_executing` and `writing`).
+ *
+ * Calibrated against measured timings:
+ *   upload (5s) → first thinking (3s) → tool exec (10-15s) → final
+ *   thinking + writing (30-60s).
+ *
+ * Extra tool iterations (idx>1) are unusual but don't penalise the bar
+ * — we just hold at the same floor.
+ */
+function progressToFraction(progress: AgenticProgress): number {
+  const idx = progress.toolIndex ?? 0;
+  switch (progress.phase) {
+    case "uploading_file":
+      return 0.05;
+    case "file_uploaded":
+      return 0.10;
+    case "request_sent":
+      return 0.15;
+    case "thinking":
+      return idx > 0 ? 0.70 : 0.20;
+    case "tool_start":
+      return 0.25;
+    case "tool_executing":
+      return 0.40;
+    case "tool_done":
+      return 0.65;
+    case "writing":
+      return 0.80;
+    case "done":
+      return 1.0;
+    case "error":
+      return 1.0;
+    default:
+      return 0.0;
+  }
+}
+
 if (typeof window !== "undefined" && !pdfjsLib.GlobalWorkerOptions.workerSrc) {
   pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 }
@@ -900,7 +941,7 @@ export interface DetectFieldsOptions {
 export async function detectFieldsWithClaude(
   pdfBytes: Uint8Array,
   _pageNumber: number = 1,
-  onStatus?: (status: string) => void,
+  onStatus?: (status: string, progress?: number) => void,
   options: DetectFieldsOptions = {}
 ): Promise<TemplateField[]> {
   const model = options.model ?? getModelPreference();
@@ -917,7 +958,7 @@ export async function detectFieldsWithClaude(
       ? options.effort
       : undefined;
 
-  onStatus?.("Reading PDF metadata…");
+  onStatus?.("Reading PDF metadata…", 0.02);
   const pageSizes = await getPageSizes(pdfBytes);
 
   // Live progress feed: Rust streams Anthropic's SSE events and emits
@@ -934,7 +975,10 @@ export async function detectFieldsWithClaude(
   };
   const elapsedSec = () => Math.round((Date.now() - startedAt) / 1000);
   const pushStatus = () =>
-    onStatus?.(progressToStatus(lastProgress, elapsedSec()));
+    onStatus?.(
+      progressToStatus(lastProgress, elapsedSec()),
+      progressToFraction(lastProgress)
+    );
 
   pushStatus();
   const heartbeat = window.setInterval(pushStatus, 1000);
@@ -970,7 +1014,8 @@ export async function detectFieldsWithClaude(
   onStatus?.(
     toolCallCount > 0
       ? `Claude ran ${toolCallCount} sandbox script(s); parsing answer…`
-      : "Parsing Claude response…"
+      : "Parsing Claude response…",
+    0.97
   );
 
   console.log(

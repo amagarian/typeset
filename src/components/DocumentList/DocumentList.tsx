@@ -11,20 +11,32 @@ interface DocumentListProps {
   onRemove: (docId: string) => void;
 }
 
-const ESTIMATED_DURATION_MS = 45_000;
+// Calibrated against measured timings on Opus 4.7 (~60-90s end-to-end).
+// Sonnet 4.6 runs 200-400s but we still cap the time-based curve at 90s
+// — once the phase floor takes over (tool_executing → writing → done),
+// it drives the bar to completion regardless of clock drift.
+const ESTIMATED_DURATION_MS = 90_000;
 
 function ProcessingRow({ doc, onRemove }: { doc: ProjectDocument; onRemove: (id: string) => void }) {
-  const [progress, setProgress] = useState(0);
+  // `timeProgress` is the smooth elapsed-time curve (asymptotic to ~95%).
+  // `phaseFloor` is the discrete progress reported by Anthropic's SSE
+  // events (uploading → thinking → tool_executing → writing → done).
+  // The displayed value is `max(timeProgress, phaseFloor)` so phase
+  // events can JUMP the bar forward, while time keeps it crawling
+  // between events.
+  const [timeProgress, setTimeProgress] = useState(0);
+  const phaseFloor = doc.processingProgress ?? 0;
 
   useEffect(() => {
     const startTime = new Date(doc.createdAt).getTime();
 
     const tick = () => {
       const elapsed = Date.now() - startTime;
-      // Asymptotic curve: fast at first, slows near 95%
       const raw = elapsed / ESTIMATED_DURATION_MS;
+      // 1 - exp(-2.5) ≈ 0.918 at the estimated duration; cap at 0.95
+      // so we never show 100% before the detector actually finishes.
       const pct = Math.min(0.95, 1 - Math.exp(-2.5 * raw));
-      setProgress(pct);
+      setTimeProgress(pct);
     };
 
     tick();
@@ -32,6 +44,7 @@ function ProcessingRow({ doc, onRemove }: { doc: ProjectDocument; onRemove: (id:
     return () => clearInterval(id);
   }, [doc.createdAt]);
 
+  const progress = Math.max(timeProgress, phaseFloor);
   const pctDisplay = Math.round(progress * 100);
 
   return (
