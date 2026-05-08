@@ -201,21 +201,28 @@ try:
             n_pages = len(pdf.pages)
         for pi, page in enumerate(pdf.pages, 1):
             chars = sorted(page.chars, key=lambda c: (round(c["top"], 1), c["x0"]))
+
+            # Underscore runs. Use the underscore characters' OWN top/bottom
+            # so the box fits the actual cell — hardcoded heights produce a
+            # ~one-line offset on fonts whose cell isn't exactly 16pt.
             run, last = [], None
             def flush():
                 if len(run) < 3:
                     return
                 x0 = min(r["x0"] for r in run)
                 x1 = max(r["x1"] for r in run)
+                top = min(r["top"] for r in run)
                 bot = max(r["bottom"] for r in run)
+                cell_h = max(12.0, bot - top)
                 candidates.append({
                     "page": pi,
                     "kind": "u",
                     "x": round(x0, 2),
-                    "y": round(bot - 16, 2),
+                    "y": round(top, 2),
                     "w": round(x1 - x0, 2),
-                    "h": 16,
+                    "h": round(cell_h, 2),
                     "context": "",
+                    "after": "",
                 })
             for c in chars:
                 is_u = c["text"] == "_"
@@ -227,18 +234,23 @@ try:
                 last = c if is_u else None
             flush()
 
+            # Drawn horizontal lines. The line itself is the underline; the
+            # fill text sits ABOVE it. Box height matches typical body font.
             for ln in page.lines:
                 if ln.get("height", 99) < 1.5 and ln.get("width", 0) > 30:
+                    cell_h = 13.0
                     candidates.append({
                         "page": pi,
                         "kind": "ln",
                         "x": round(ln["x0"], 2),
-                        "y": round(ln["top"] - 14, 2),
+                        "y": round(ln["top"] - cell_h + 2, 2),
                         "w": round(ln["width"], 2),
-                        "h": 16,
+                        "h": round(cell_h, 2),
                         "context": "",
+                        "after": "",
                     })
 
+            # Small squares (checkboxes).
             for rect in page.rects:
                 w, h = rect.get("width", 0), rect.get("height", 0)
                 if 7 < w < 18 and 7 < h < 18:
@@ -250,35 +262,55 @@ try:
                         "w": round(w, 2),
                         "h": round(h, 2),
                         "context": "",
+                        "after": "",
                     })
 
+            # Row context: for each candidate, grab up to 6 words BEFORE
+            # (left of) and 6 words AFTER (right of) it on the same row.
+            # This is the single biggest input to correct labelling — for
+            # body-text underscores ("I, ____, authorize my credit card to
+            # be charged...") the surrounding sentence is the only signal
+            # that distinguishes a cardholder-name blank from a date blank.
             try:
                 words = page.extract_words(use_text_flow=False)
             except Exception:
                 words = []
-            for cand in [c for c in candidates if c["page"] == pi and not c["context"]]:
+            for cand in [c for c in candidates if c["page"] == pi]:
                 cy = cand["y"] + cand["h"] / 2
-                cx = cand["x"]
-                best, best_d = None, 9999
-                for w in words:
-                    wy = (w["top"] + w["bottom"]) / 2
-                    if abs(wy - cy) > 14:
-                        continue
-                    if w["x1"] > cx + 6:
-                        continue
-                    d = cx - w["x1"]
-                    if d < best_d:
-                        best_d = d
-                        best = w["text"]
-                cand["context"] = best or ""
+                cx_left = cand["x"]
+                cx_right = cand["x"] + cand["w"]
+                same_row = [
+                    w for w in words
+                    if abs((w["top"] + w["bottom"]) / 2 - cy) < 14
+                ]
+                same_row.sort(key=lambda w: w["x0"])
+                prefix = [w["text"] for w in same_row if w["x1"] <= cx_left + 4]
+                suffix = [w["text"] for w in same_row if w["x0"] >= cx_right - 4]
+                cand["context"] = " ".join(prefix[-6:])
+                cand["after"] = " ".join(suffix[:6])
 except Exception:
     traceback.print_exc(file=sys.stderr)
+
+# Full body text per page — handed to Claude alongside the structural
+# candidates so it can disambiguate body-text fields by reading the
+# surrounding sentence.
+page_texts = []
+try:
+    with pdfplumber.open(PATH) as pdf:
+        for page in pdf.pages:
+            try:
+                page_texts.append(page.extract_text() or "")
+            except Exception:
+                page_texts.append("")
+except Exception:
+    pass
 
 print(json.dumps({
     "path": PATH,
     "n_pages": n_pages,
     "acroform": acroform,
     "candidates": candidates,
+    "page_texts": page_texts,
 }))
 `.trim();
 
@@ -304,10 +336,21 @@ function buildAgenticSystemPrompt(): string {
     "",
     "## TURNING SCRIPT OUTPUT INTO FIELDS",
     "- If `acroform` is non-empty, those rectangles ARE the answer. The coordinates are already top-down PDF points. Use the widget's `name` to pick a canonical_field_id when obvious; otherwise null.",
-    "- Otherwise use `candidates`:",
-    "  - `kind: \"u\"` (underscore run) and `kind: \"ln\"` (drawn line) → `field_type: \"text\"`. Width/height/x/y are already final.",
-    "  - `kind: \"rect\"` → `field_type: \"checkbox\"`. When 4 small squares appear in a row near label words containing Visa / Mastercard / Discover / Amex, emit them as a checkbox-group with `group_id: \"creditCardType\"` and `checkbox_value` of `visa | mastercard | discover | amex` respectively. Card rows ALWAYS have all four — never stop at three.",
-    "  - The `context` string is the nearest label word to the left of the candidate. Use it to pick a canonical_field_id and a human label. If you cannot map confidently, set canonical_field_id to null.",
+    "- Otherwise use `candidates`. For each candidate the script gives you:",
+    "  - `context` — up to 6 words immediately to the LEFT of the blank on the same row.",
+    "  - `after`   — up to 6 words immediately to the RIGHT of the blank on the same row.",
+    "  - `kind` — `\"u\"` underscore run, `\"ln\"` drawn line, `\"rect\"` checkbox square.",
+    "  - `x/y/w/h` — final top-down PDF points, already correctly sized. DO NOT recompute them.",
+    "- `page_texts` is the extracted body text per page. Use it to disambiguate body-text blanks where `context` and `after` alone aren't enough (e.g. distinguishing the cardholder-name blank from the date blank inside a single paragraph).",
+    "- Mapping logic:",
+    "  - `kind: \"u\"` and `kind: \"ln\"` → `field_type: \"text\"`. Pick `field_kind` based on label semantics: `date` when the label or surrounding text mentions date/exp/MM/YY, `signature` when it mentions signature, `multiline` when it's an address-like field that visibly spans multiple lines, otherwise `text`.",
+    "  - `kind: \"rect\"` → `field_type: \"checkbox\"`. When 4 small squares appear on a row near label words containing Visa / Mastercard / Discover / Amex, emit them as a checkbox-group with `group_id: \"creditCardType\"` and `checkbox_value` of `visa | mastercard | discover | amex` respectively. Card rows ALWAYS have all four — never stop at three.",
+    "- Labelling guidance for body-text blanks (`context` is short or generic like \"I,\" / \"on\" / \"of\"):",
+    "  - Read the full sentence in `page_texts` that contains the blank.",
+    "  - \"I, _______, authorize my credit card to be charged...\" → cardholder name (creditCardHolder).",
+    "  - \"...my booking at Beam Studios on _______ (date)...\" → authorizationDate.",
+    "  - \"...charged up to $_______\" → set canonical_field_id to null with a label like \"Maximum amount\". When in doubt, null is better than a wrong canonical id.",
+    "- If a candidate's `context` clearly maps to a canonical field, use it. If not, set canonical_field_id to null and copy the meaningful label words verbatim.",
     "",
     "## RULES",
     "- Coordinates are PDF points, top-left origin (y grows downward). Do NOT recompute them.",
