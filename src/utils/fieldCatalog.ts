@@ -82,6 +82,7 @@ export const CANONICAL_FIELD_DEFINITIONS: CanonicalFieldDefinition[] = [
       "credit card billing address",
       "mailing address",
       "remit to",
+      "address",
     ],
     sectionHints: ["billing", "payment", "contact"],
     multiline: true,

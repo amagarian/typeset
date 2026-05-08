@@ -83,9 +83,9 @@ interface RawClaudeField {
   group_id?: string | null;
   estimated_font_size?: number | null;
   optional?: boolean;
-  /** Up to 6 words to the LEFT of the blank on the same row. Passed through from the script. */
+  /** All words to the LEFT of the blank on the same row, space-joined. Passed through from the script. */
   context?: string;
-  /** Up to 6 words to the RIGHT of the blank on the same row. Passed through from the script. */
+  /** Up to 8 words to the RIGHT of the blank on the same row, space-joined. Passed through from the script. */
   after?: string;
 }
 
@@ -285,8 +285,12 @@ try:
                 same_row.sort(key=lambda w: w["x0"])
                 prefix = [w["text"] for w in same_row if w["x1"] <= cx_left + 4]
                 suffix = [w["text"] for w in same_row if w["x0"] >= cx_right - 4]
-                cand["context"] = " ".join(prefix[-6:])
-                cand["after"] = " ".join(suffix[:6])
+                # No left-cap. "Card Identification Number (last three
+                # digits on back of card):" is ~10 words and the alias
+                # is at the very front; truncating the prefix to 6
+                # words drops the explicit label entirely.
+                cand["context"] = " ".join(prefix)
+                cand["after"] = " ".join(suffix[:8])
 except Exception:
     traceback.print_exc(file=sys.stderr)
 
@@ -313,13 +317,22 @@ print(json.dumps({
 }))
 `.trim();
 
+/** Human-readable catalog summary for the prompt. Keep it compact —
+ * Claude only needs id, label, and example aliases. */
+function buildCatalogSummary(): string {
+  return CANONICAL_FIELD_DEFINITIONS.map((d) => {
+    const aliases = d.aliases.slice(0, 4).join(", ");
+    return `  - ${d.id} (${d.label}): ${aliases}`;
+  }).join("\n");
+}
+
 function buildAgenticSystemPrompt(): string {
   return [
     "You analyze production paperwork PDFs (vendor agreements, credit-card authorizations, deal memos, W-9s, COIs) and emit JSON describing every fillable field.",
     "",
     "## PROCESS — exactly one tool call",
     "1. Make ONE call to `code_execution`. Pass the SCRIPT below verbatim (copy-paste the whole thing into the `code` argument). Do not edit the script. Do not split it into smaller scripts. Do not run a probe/listing script first.",
-    "2. Read the JSON the script printed (`acroform` and `candidates` arrays).",
+    "2. Read the JSON the script printed (`acroform` and `candidates` arrays, plus `page_texts` for context).",
     "3. Compose your final assistant message: ONLY the answer JSON, no prose.",
     "ABSOLUTE CONSTRAINTS:",
     "- Total tool calls: exactly 1.",
@@ -334,23 +347,39 @@ function buildAgenticSystemPrompt(): string {
     "```",
     "",
     "## TURNING SCRIPT OUTPUT INTO FIELDS",
-    "Your job is mostly mechanical: convert each `acroform` widget and each `candidate` into a field entry, preserving the script's coordinates AND its `context`/`after` strings VERBATIM. The downstream code does its own canonical-id matching from the context strings — DO NOT try to be clever about which canonical id to pick; just copy `context` and `after` through.",
+    "For each `acroform` widget and each `candidate`, emit one field entry. Preserve the script's coordinates and its `context`/`after` strings VERBATIM — those strings are the host's primary signal.",
     "",
     "Per-candidate translation:",
     "- `kind: \"u\"` (underscore run) and `kind: \"ln\"` (drawn line) → `field_type: \"text\"`. Pick `field_kind`:",
-    "  - `date` when `context` or `after` mentions date / exp / MM/YY / expiration / authorization date",
+    "  - `date` when `context` or `after` mentions date / exp / MM/YY / expiration / authorization date / (date)",
     "  - `signature` when `context` or `after` mentions signature / sign / authorized",
     "  - `multiline` when the label is address-like AND the candidate is wider than ~250pt OR a similar candidate on the row directly below has the same x and width",
     "  - otherwise `text`",
-    "- `kind: \"rect\"` → `field_type: \"checkbox\"`. When 4 small squares appear on a row near Visa / Mastercard / Discover / Amex, emit them as a checkbox-group with `group_id: \"creditCardType\"` and `checkbox_value` of `visa | mastercard | discover | amex` respectively. Card rows ALWAYS have all four — never stop at three.",
+    "- `kind: \"rect\"` → `field_type: \"checkbox\"`. When 4 small squares appear on a row near Visa / Mastercard / Discover / Amex, emit them as a checkbox-group with `group_id: \"creditCardType\"` and `checkbox_value` of `visa | mastercard | discover | amex` respectively. Card rows ALWAYS have all four — never stop at three. The card name is whichever of {visa, mastercard, amex, discover} appears in this box's `after` string.",
     "",
     "For each acroform widget: `field_type: \"text\"` (or `\"checkbox\"` if `ft == \"/Btn\"`), `field_kind: \"text\"`. Set `context` to the widget's `name` field; leave `after` empty.",
+    "",
+    "## CANONICAL FIELD ID — your semantic-reasoning job",
+    "The host runs deterministic alias matching on `context`/`after` and will overwrite your `canonical_field_id` whenever an alias hits. Your job is to fill in `canonical_field_id` for the BODY-TEXT BLANKS that don't have an explicit label on their own row — the host can't see those, only you can read the surrounding sentence.",
+    "",
+    "Available canonical ids (id → label, with example aliases):",
+    buildCatalogSummary(),
+    "",
+    "Rules for `canonical_field_id`:",
+    "- ONLY set a canonical id when the surrounding sentence makes the role unambiguous. NULL IS BETTER THAN A WRONG ID. Wrong ids cause silent mis-fills downstream.",
+    "- Common body-text patterns and their mappings:",
+    "  - \"I, ____, authorize my credit card to be charged\" → `creditCardHolder` (the speaker IS the cardholder).",
+    "  - \"...damages from my booking at <company> on ____ (date)\" → `authorizationDate` (charge/booking date).",
+    "  - \"I authorize my credit card to be charged $____\" → leave NULL (this is the dollar amount, no canonical id for it).",
+    "  - \"Signature: ____\" or signature line → `cardholderSignature`.",
+    "  - \"____ /hour\" or \"plus a 3.3% processing fee\" → leave NULL (rate/fee fields without a canonical match).",
+    "- Do NOT use the form's TITLE or surrounding paragraph to guess. The signal must come from the candidate's own row context+after.",
+    "- Never guess `creditCardNumber` based on the form being a CC auth — that field has an explicit \"Credit Card Number:\" label row that the alias matcher will pick up.",
     "",
     "## RULES",
     "- Coordinates are PDF points, top-left origin. DO NOT recompute them. Pass `x`, `y`, `w`, `h` through verbatim from the script (rename `w`→`width`, `h`→`height`).",
     "- Pass `context` and `after` through VERBATIM. Do not paraphrase, do not clean them up, do not translate them.",
-    "- Set `canonical_field_id` to `null` for every field. Downstream code handles canonical matching deterministically using the alias catalog; your guesses would only conflict with it.",
-    "- `label`: the cleaned context string (strip trailing colons, drop leading prepositions like \"on\"/\"of\"/\"to\"). For body-text blanks where context is just \"I,\" or \"on\", use a short descriptive label like \"Body field 1\".",
+    "- `label`: the cleaned context string (strip trailing colons, drop leading prepositions like \"on\"/\"of\"/\"to\"). For body-text blanks where context is just \"I,\" or empty, use a short descriptive label like \"Body field 1\". The host re-derives this label, so it's mostly informational.",
     "- Repeat fields are kept: production paperwork routinely repeats the same blank across body text and signature blocks. Emit every occurrence; do not collapse.",
     "- Skip ONLY: headers, footers, page numbers, pre-printed values that obviously aren't fillable.",
     "- Pass `page_texts` through verbatim as a top-level field of the response.",
@@ -362,7 +391,7 @@ function buildAgenticSystemPrompt(): string {
     "  \"detected_via\"?: \"acroform\" | \"pdfplumber\" | \"mixed\",",
     "  \"page_texts\": string[],",
     "  \"fields\": Array<{",
-    "    canonical_field_id: null,",
+    "    canonical_field_id: string | null,",
     "    label: string,",
     "    field_type: \"text\" | \"checkbox\",",
     "    field_kind: \"text\" | \"multiline\" | \"date\" | \"signature\" | \"boolean-checkbox\" | \"checkbox-group\",",
@@ -488,25 +517,43 @@ const ALIAS_INDEX: ReadonlyArray<{ alias: string; id: CanonicalFieldId }> =
 function inferCanonicalId(
   context: string | undefined,
   after: string | undefined,
-  fieldType: "text" | "checkbox"
+  fieldType: "text" | "checkbox",
+  checkboxValue: string | null | undefined
 ): CanonicalFieldId | undefined {
   const ctx = (context ?? "").toLowerCase();
   const aft = (after ?? "").toLowerCase();
 
-  // Checkboxes: the card-type label sits to the RIGHT of the box.
   if (fieldType === "checkbox") {
-    if (/\bvisa\b/.test(aft) || /\bvisa\b/.test(ctx)) return "creditCardTypeVisa";
-    if (/\bmaster\s?card\b|\bmc\b/.test(aft) || /\bmaster\s?card\b|\bmc\b/.test(ctx))
+    // Card-type label sits to the RIGHT of the box on standard layouts
+    // ("Credit Card Type: [_]Visa  [_]Mastercard  [_]Amex  [_]Discover").
+    // CRITICAL: do not fall back to `context` for the Visa check —
+    // every box from Mastercard onwards has "Visa" in its left
+    // context, so context-based visa matching always wins for the
+    // first card listed. Use Claude's `checkbox_value` as a strong
+    // secondary signal (Claude reads the whole row and tags each box).
+    const cv = (checkboxValue ?? "").toLowerCase().trim();
+    if (cv === "visa" || /\bvisa\b/.test(aft)) return "creditCardTypeVisa";
+    if (cv === "mastercard" || /\bmaster\s?card\b/.test(aft) || /\bmc\b/.test(aft))
       return "creditCardTypeMastercard";
-    if (/\bamex\b|\bamerican\s?express\b/.test(aft) || /\bamex\b|\bamerican\s?express\b/.test(ctx))
+    if (cv === "amex" || cv === "american express" || /\bamex\b|\bamerican\s?express\b/.test(aft))
       return "creditCardTypeAmex";
-    if (/\bdiscover\b/.test(aft) || /\bdiscover\b/.test(ctx))
+    if (cv === "discover" || /\bdiscover\b/.test(aft))
       return "creditCardTypeDiscover";
+    // No `after` and no `checkbox_value` — try context as a last
+    // resort (rare layouts where the label is to the LEFT of the box).
+    if (!aft.trim() && !cv) {
+      if (/\bvisa\b/.test(ctx)) return "creditCardTypeVisa";
+      if (/\bmaster\s?card\b|\bmc\b/.test(ctx)) return "creditCardTypeMastercard";
+      if (/\bamex\b|\bamerican\s?express\b/.test(ctx)) return "creditCardTypeAmex";
+      if (/\bdiscover\b/.test(ctx)) return "creditCardTypeDiscover";
+    }
     return undefined;
   }
 
   // Text fields: only this row's context+after. Body-text blanks where
-  // the surrounding sentence doesn't contain a known label stay unmapped.
+  // the surrounding sentence doesn't contain a known label stay
+  // unmapped here; Claude's semantic canonical_field_id (when emitted)
+  // becomes the fallback in `mapToTemplateField`.
   const haystack = `${ctx} ${aft}`.trim();
   if (!haystack) return undefined;
   for (const { alias, id } of ALIAS_INDEX) {
@@ -516,18 +563,30 @@ function inferCanonicalId(
   return undefined;
 }
 
+const TRAILING_PREP_RE = /\s+(on|of|to|for|in|at|by|with|the|a|an)$/i;
+const LEADING_PREP_RE = /^(the|a|an|to|on|for|of|in|at|by|with)\s+/i;
+
 /**
  * Cleans up a raw context string into a presentable label.
- * Strips trailing punctuation/colons, removes leading prepositions, and
- * caps length.
+ * - Strips trailing punctuation
+ * - Drops leading and trailing prepositions ("my booking at Beam Studios on" → "my booking at Beam Studios")
+ * - Caps at 60 chars, truncating at a word boundary
  */
 function cleanLabel(context: string | undefined, fallback: string): string {
   const raw = (context ?? "").trim();
   if (!raw) return fallback;
   let cleaned = raw.replace(/[:.,;]+\s*$/g, "").trim();
-  cleaned = cleaned.replace(/^(the|a|an|to|on|for|of|in|at)\s+/i, "");
+  cleaned = cleaned.replace(LEADING_PREP_RE, "");
+  // Trailing prep: "my booking at Beam Studios on" → "my booking at Beam Studios"
+  while (TRAILING_PREP_RE.test(cleaned)) {
+    cleaned = cleaned.replace(TRAILING_PREP_RE, "").trim();
+  }
   if (cleaned.length === 0) return fallback;
-  if (cleaned.length > 60) return cleaned.slice(0, 57) + "...";
+  if (cleaned.length > 60) {
+    const cut = cleaned.slice(0, 60);
+    const lastSpace = cut.lastIndexOf(" ");
+    return (lastSpace > 30 ? cut.slice(0, lastSpace) : cut) + "…";
+  }
   return cleaned;
 }
 
@@ -557,12 +616,19 @@ function mapToTemplateField(
   const rawWidth = clampNumber(raw.width ?? minDim, minDim, pageSize.width - x);
   const rawHeight = clampNumber(raw.height ?? minDim, minDim, pageSize.height - y);
 
-  // Deterministic canonical-id matching from the row context. We prefer
-  // this over Claude's `canonical_field_id` because Claude tends to
-  // force-fit candidates onto canonical ids that don't actually appear
-  // in the form. Only fall back to Claude's value when our matcher can't
-  // find any alias hit on this candidate's row.
-  const inferredId = inferCanonicalId(raw.context, raw.after, fieldType);
+  // Deterministic canonical-id matching from the row context wins over
+  // Claude's reasoning for explicit-label rows ("Credit Card Number:"
+  // etc.) because Claude tends to force-fit candidates onto canonical
+  // ids that don't actually appear in the form. For body-text blanks
+  // where alias matching can't see a label, Claude's semantic
+  // canonical_field_id becomes the fallback — which is how we recover
+  // mapping for sentences like "I, ___, authorize my credit card".
+  const inferredId = inferCanonicalId(
+    raw.context,
+    raw.after,
+    fieldType,
+    raw.checkbox_value
+  );
   const claudeId =
     raw.canonical_field_id && VALID_CANONICAL_IDS.has(raw.canonical_field_id)
       ? (raw.canonical_field_id as CanonicalFieldId)
