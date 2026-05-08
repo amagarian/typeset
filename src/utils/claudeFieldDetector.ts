@@ -87,6 +87,8 @@ interface RawClaudeField {
   context?: string;
   /** Up to 8 words to the RIGHT of the blank on the same row, space-joined. Passed through from the script. */
   after?: string;
+  /** ±6 lines of words around the candidate with a [BLANK] marker at the candidate's position. */
+  paragraph?: string;
 }
 
 interface RawClaudeResponse {
@@ -291,6 +293,45 @@ try:
                 # words drops the explicit label entirely.
                 cand["context"] = " ".join(prefix)
                 cand["after"] = " ".join(suffix[:8])
+
+                # Paragraph context: ±90pt vertical (~6 lines) with a
+                # [BLANK] marker inserted at the candidate's position.
+                # This is the SINGLE most useful input for labelling
+                # body-text blanks — the same-row context is useless on
+                # sentences that wrap across multiple lines (e.g. the
+                # CC auth paragraph "...authorize my credit card to be
+                # charged an additional $___ plus a 3.3% fee for my
+                # booking at <co> on ___ (date) for ___ hours..."), so
+                # we hand Claude the whole paragraph instead.
+                para_words_raw = [
+                    w for w in words
+                    if abs((w["top"] + w["bottom"]) / 2 - cy) < 90
+                ]
+                # Sort in reading order: line-bucket first, then x.
+                para_words_raw.sort(key=lambda w: (
+                    round((w["top"] + w["bottom"]) / 2 / 7) * 7,
+                    w["x0"],
+                ))
+                parts = []
+                blank_inserted = False
+                for w in para_words_raw:
+                    wy = (w["top"] + w["bottom"]) / 2
+                    is_above = wy < cy - 5
+                    is_left_same_row = abs(wy - cy) < 7 and w["x1"] <= cx_left + 4
+                    if not (is_above or is_left_same_row) and not blank_inserted:
+                        parts.append("[BLANK]")
+                        blank_inserted = True
+                    parts.append(w["text"])
+                if not blank_inserted:
+                    parts.append("[BLANK]")
+                paragraph = " ".join(parts)
+                # Hard cap on length to keep the prompt token budget
+                # bounded; truncate at a word boundary near 320 chars.
+                if len(paragraph) > 320:
+                    cut = paragraph[:320]
+                    sp = cut.rfind(" ")
+                    paragraph = (cut[:sp] if sp > 200 else cut) + " …"
+                cand["paragraph"] = paragraph
 except Exception:
     traceback.print_exc(file=sys.stderr)
 
@@ -347,42 +388,59 @@ function buildAgenticSystemPrompt(): string {
     "```",
     "",
     "## TURNING SCRIPT OUTPUT INTO FIELDS",
-    "For each `acroform` widget and each `candidate`, emit one field entry. Preserve the script's coordinates and its `context`/`after` strings VERBATIM — those strings are the host's primary signal.",
+    "For each `acroform` widget and each `candidate`, emit one field entry. Preserve the script's coordinates and its `context`/`after`/`paragraph` strings VERBATIM — those strings are the host's primary signal.",
     "",
     "Per-candidate translation:",
     "- `kind: \"u\"` (underscore run) and `kind: \"ln\"` (drawn line) → `field_type: \"text\"`. Pick `field_kind`:",
-    "  - `date` when `context` or `after` mentions date / exp / MM/YY / expiration / authorization date / (date)",
-    "  - `signature` when `context` or `after` mentions signature / sign / authorized",
-    "  - `multiline` when the label is address-like AND the candidate is wider than ~250pt OR a similar candidate on the row directly below has the same x and width",
+    "  - `date` when `paragraph` shows the blank is a date (e.g. `[BLANK] (date)` or `MM/YY`)",
+    "  - `signature` when `paragraph` shows a signature line",
+    "  - `multiline` when the role is address-like AND the candidate is wider than ~250pt OR a similar candidate on the row directly below has the same x and width",
     "  - otherwise `text`",
     "- `kind: \"rect\"` → `field_type: \"checkbox\"`. When 4 small squares appear on a row near Visa / Mastercard / Discover / Amex, emit them as a checkbox-group with `group_id: \"creditCardType\"` and `checkbox_value` of `visa | mastercard | discover | amex` respectively. Card rows ALWAYS have all four — never stop at three. The card name is whichever of {visa, mastercard, amex, discover} appears in this box's `after` string.",
     "",
-    "For each acroform widget: `field_type: \"text\"` (or `\"checkbox\"` if `ft == \"/Btn\"`), `field_kind: \"text\"`. Set `context` to the widget's `name` field; leave `after` empty.",
+    "For each acroform widget: `field_type: \"text\"` (or `\"checkbox\"` if `ft == \"/Btn\"`), `field_kind: \"text\"`. Set `context` to the widget's `name` field; leave `after`/`paragraph` empty.",
     "",
-    "## CANONICAL FIELD ID — your semantic-reasoning job",
-    "The host runs deterministic alias matching on `context`/`after` and will overwrite your `canonical_field_id` whenever an alias hits. Your job is to fill in `canonical_field_id` for the BODY-TEXT BLANKS that don't have an explicit label on their own row — the host can't see those, only you can read the surrounding sentence.",
+    "## SEMANTIC LABEL — your most important job",
+    "Each candidate has a `paragraph` field with the surrounding ~6 lines of text and a `[BLANK]` marker at the candidate's exact position. READ the paragraph. UNDERSTAND the sentence as a whole. Then write a concise `label` (2-5 words, Title Case) that describes WHAT THIS BLANK IS FOR — the role the blank plays in the sentence, NOT a snippet of nearby text.",
     "",
+    "Examples for the body paragraph `\"I, [BLANK1], authorize my credit card to be charged an additional $[BLANK2] plus a 3.3% processing fee for my booking at Beam Studios on [BLANK3] (date) for [BLANK4] hours. In the event of overtime, I agree to pay an additional $[BLANK5] / hour rounded to the next full hour.\"`:",
+    "  - BLANK1 → label `\"Cardholder Name\"` (the speaker filling in their name).",
+    "  - BLANK2 → label `\"Additional Charge Amount\"` (the dollar amount being authorized).",
+    "  - BLANK3 → label `\"Booking Date\"` (the date suffix `(date)` confirms it).",
+    "  - BLANK4 → label `\"Hour Count\"` (\"for [BLANK] hours\").",
+    "  - BLANK5 → label `\"Overtime Hourly Rate\"` (\"$[BLANK] / hour\").",
+    "",
+    "Other examples:",
+    "  - Paragraph `\"Cardholder Name: [BLANK]\"` → label `\"Cardholder Name\"`.",
+    "  - Paragraph `\"Card Identification Number (last three digits on back of card): [BLANK]\"` → label `\"Security Code\"`.",
+    "  - Paragraph `\"Signature: [BLANK]\"` → label `\"Signature\"`.",
+    "",
+    "Rules for `label`:",
+    "- Title Case, 2-5 words. NO trailing colon, NO surrounding sentence text, NO ellipsis.",
+    "- Describe the blank's PURPOSE, not the words next to it. \"plus a 3.3% processing fee for my booking at Beam Studios\" is a BAD label; \"Booking Date\" or \"Hour Count\" is a GOOD label.",
+    "- For acroform widgets where `paragraph` is empty, derive the label from the widget's `name` field.",
+    "- Only fall back to a generic label like `\"Custom Field\"` when the paragraph is too short or ambiguous to interpret.",
+    "",
+    "## CANONICAL FIELD ID",
     "Available canonical ids (id → label, with example aliases):",
     buildCatalogSummary(),
     "",
     "Rules for `canonical_field_id`:",
-    "- ONLY set a canonical id when the surrounding sentence makes the role unambiguous. NULL IS BETTER THAN A WRONG ID. Wrong ids cause silent mis-fills downstream.",
-    "- BE CONSISTENT ACROSS REPEATS. Production paperwork repeats the same pattern several times — e.g. an authorization paragraph appears once at the top, then again under a heading like \"IF YOU WOULD LIKE TO PAY...\". If you map the FIRST occurrence of a pattern to a canonical id, you MUST map ALL identical occurrences to the same canonical id. Inconsistent mapping is a bug.",
-    "- Common body-text patterns and their mappings:",
-    "  - `\"I,\"` followed by `\"authorize my credit card to be charged\"` → `creditCardHolder` (the speaker IS the cardholder). This pattern often appears 2-3 times in a CC auth form; map ALL of them.",
-    "  - `\"on\"` followed by `\"(date)\"` → `authorizationDate`. Often appears in body text like \"my booking at <company> on ____ (date)\".",
-    "  - `\"$\"` immediately to the LEFT of the blank → leave NULL (this is a dollar amount, e.g. \"charged an additional $____\", \"$____ / hour\"). Never `creditCardNumber`.",
-    "  - `\"for\"` immediately left and `\"hours\"` immediately right → leave NULL (number of hours).",
-    "  - `\"Signature\"` or `\"Signed by\"` ending the context (with optional colon) → `cardholderSignature`. Map every signature line in the document.",
-    "  - `\"Card Identification Number\"` or `\"three digits on back of card\"` → `ccv` (NOT `creditCardNumber`).",
-    "  - Empty `context` AND no clear semantic in `after` → leave NULL.",
-    "- Do NOT use the form's TITLE or surrounding paragraph to guess. The signal must come from the candidate's own row context+after.",
-    "- Never guess `creditCardNumber` based on the form being a CC auth — that field has an explicit \"Credit Card Number:\" label row that the alias matcher will pick up.",
+    "- The host runs deterministic alias matching on `context`/`after` and will overwrite your `canonical_field_id` whenever an alias hits an explicit label. Your job is to fill in `canonical_field_id` for the BODY-TEXT BLANKS that don't have an explicit label on their own row.",
+    "- ONLY set a canonical id when the `paragraph` makes the role unambiguous AND it maps to one of the ids in the catalog above. NULL IS BETTER THAN A WRONG ID. Wrong ids cause silent mis-fills downstream.",
+    "- BE CONSISTENT ACROSS REPEATS. If `\"I, [BLANK], authorize\"` maps to `creditCardHolder` once, EVERY copy of that pattern in the document maps to `creditCardHolder` — even if the surrounding sentence differs.",
+    "- Common body-text mappings:",
+    "  - `\"I, [BLANK], authorize my credit card to be charged\"` → `creditCardHolder`.",
+    "  - `\"on [BLANK] (date)\"` → `authorizationDate`.",
+    "  - `\"$[BLANK]\"` (dollar amount, charge, fee, rate) → leave NULL — no canonical project key for ad-hoc dollar amounts.",
+    "  - `\"for [BLANK] hours\"` → leave NULL — no canonical project key for hour counts.",
+    "  - `\"Signature\"` or `\"Signed by\"` ending the context → `cardholderSignature`.",
+    "  - `\"Card Identification Number\"` / `\"three digits on back of card\"` → `ccv` (NOT `creditCardNumber`).",
+    "- Never guess `creditCardNumber` based on the form being a CC auth — that field has its own explicit \"Credit Card Number:\" label row.",
     "",
     "## RULES",
     "- Coordinates are PDF points, top-left origin. DO NOT recompute them. Pass `x`, `y`, `w`, `h` through verbatim from the script (rename `w`→`width`, `h`→`height`).",
-    "- Pass `context` and `after` through VERBATIM. Do not paraphrase, do not clean them up, do not translate them.",
-    "- `label`: the cleaned context string (strip trailing colons, drop leading prepositions like \"on\"/\"of\"/\"to\"). For body-text blanks where context is just \"I,\" or empty, use a short descriptive label like \"Body field 1\". The host re-derives this label, so it's mostly informational.",
+    "- Pass `context`, `after`, and `paragraph` through VERBATIM. Do not paraphrase, do not clean them up.",
     "- Repeat fields are kept: production paperwork routinely repeats the same blank across body text and signature blocks. Emit every occurrence; do not collapse.",
     "- Skip ONLY: headers, footers, page numbers, pre-printed values that obviously aren't fillable.",
     "- Pass `page_texts` through verbatim as a top-level field of the response.",
@@ -395,13 +453,14 @@ function buildAgenticSystemPrompt(): string {
     "  \"page_texts\": string[],",
     "  \"fields\": Array<{",
     "    canonical_field_id: string | null,",
-    "    label: string,",
+    "    label: string,                  // 2-5 word semantic descriptor (Title Case)",
     "    field_type: \"text\" | \"checkbox\",",
     "    field_kind: \"text\" | \"multiline\" | \"date\" | \"signature\" | \"boolean-checkbox\" | \"checkbox-group\",",
     "    page_number: number,",
     "    x: number, y: number, width: number, height: number,",
-    "    context: string,",
-    "    after: string,",
+    "    context: string,                // verbatim from script",
+    "    after: string,                  // verbatim from script",
+    "    paragraph: string,              // verbatim from script (with [BLANK] marker)",
     "    checkbox_value?: string | null,",
     "    group_id?: string | null",
     "  }>",
@@ -703,9 +762,19 @@ function mapToTemplateField(
   const isBooleanCheckbox = fieldType === "checkbox" && !isCardCheckbox;
 
   const catalogKey = canonicalDef?.mappedProjectKey ?? "";
+  // Label resolution priority:
+  //   1. Canonical-mapped field → use the catalog's label ("Cardholder Name",
+  //      "Credit Card Number", etc.) — keeps the UI tidy and uniform.
+  //   2. Unmapped field → use Claude's semantic label, which is generated
+  //      from the paragraph context (e.g. "Additional Charge Amount",
+  //      "Hour Count"). This is the value of having Claude in the loop.
+  //   3. Last-resort fallback → derive a label from the row context.
+  const claudeLabel = (raw.label ?? "").trim();
   const fieldLabel =
     canonicalDef?.label ??
-    cleanLabel(raw.context, (raw.label && raw.label.trim()) || `Field ${index + 1}`);
+    (claudeLabel.length > 0
+      ? claudeLabel
+      : cleanLabel(raw.context, `Field ${index + 1}`));
 
   const isUnmappedText = !isBooleanCheckbox && !isCardCheckbox && !catalogKey;
   const mappedKey: TemplateMappedProjectKey =
