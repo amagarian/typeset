@@ -14,18 +14,19 @@ const EFFORT_PREF_KEY = "typeset.anthropic.effort.v1";
 /**
  * Default Claude model.
  *
- * We default to Opus 4.7 for the agentic field-detection flow. In
- * empirical testing on production CC auth / vendor / W-9 forms, Opus:
- *   - Respects the "exactly 1 tool call" directive ~95% of the time;
+ * Opus 4.7 is currently the only first-class option for the agentic
+ * field-detection flow. In empirical testing on production CC auth /
+ * vendor / W-9 forms, Opus:
+ *   - Respects the "exactly 1 tool call" directive ~95% of the time
+ *     (typically stops at script 4);
  *   - Streams the final JSON in 60-90s for a 20-field form.
  *
- * Sonnet 4.6 has comparable per-token streaming throughput on plain
- * text but iterates the code-execution tool more aggressively (2-3
- * "verification" scripts is common), each adding 10-20s of cold-start.
- * Empirically that pushes Sonnet to 200-400s on the same workload.
- *
- * Users can switch to Sonnet 4.6 in Settings — it's ~10x cheaper per
- * call and produces flawless results, just slower end-to-end.
+ * Sonnet 4.6 was previously offered as a "cheaper, slower" alternative
+ * but iterated the code-execution tool unboundedly (10+ scripts on
+ * Sonnet vs 4 on Opus), pushing it to 400+s on the same workload. We
+ * dropped it from the preset list in v0.3.22; users who want to try
+ * other models can still paste an arbitrary API model id via the
+ * "Custom" option in Settings.
  */
 export const DEFAULT_MODEL = "claude-opus-4-7";
 
@@ -37,7 +38,8 @@ export interface ModelOption {
 
 /**
  * Built-in model presets shown in the Settings dropdown. The user can also
- * paste an arbitrary dated ID (e.g. `claude-sonnet-4-6-20260201`).
+ * paste an arbitrary dated ID (e.g. `claude-opus-4-7-20260201`) via the
+ * "Custom" option.
  */
 export const MODEL_PRESETS: ModelOption[] = [
   {
@@ -45,12 +47,6 @@ export const MODEL_PRESETS: ModelOption[] = [
     label: "Opus 4.7 (recommended)",
     description:
       "Fastest end-to-end on the agentic flow. ~60-90s per detection, flawless field placement.",
-  },
-  {
-    id: "claude-sonnet-4-6",
-    label: "Sonnet 4.6 (cheaper, slower)",
-    description:
-      "~10x cheaper per call, equally accurate, but typically 200-400s due to extra tool iterations.",
   },
 ];
 
@@ -98,11 +94,27 @@ function canUseStorage(): boolean {
   return typeof window !== "undefined" && typeof window.localStorage !== "undefined";
 }
 
+/**
+ * IDs of models that used to be presets but are no longer recommended.
+ * If a user has one of these stored from a previous version, we silently
+ * migrate them back to {@link DEFAULT_MODEL} so they don't get stuck on
+ * a slower model after an update.
+ */
+const DEPRECATED_MODELS = new Set<string>(["claude-sonnet-4-6"]);
+
 export function getModelPreference(): string {
   if (!canUseStorage()) return DEFAULT_MODEL;
   try {
-    const value = window.localStorage.getItem(MODEL_PREF_KEY);
-    return value && value.trim().length > 0 ? value.trim() : DEFAULT_MODEL;
+    const raw = window.localStorage.getItem(MODEL_PREF_KEY);
+    const value = raw?.trim();
+    if (!value) return DEFAULT_MODEL;
+    if (DEPRECATED_MODELS.has(value)) {
+      // Migrate to Opus: drop the stale preference so subsequent calls
+      // return DEFAULT_MODEL even if we change the default later.
+      window.localStorage.removeItem(MODEL_PREF_KEY);
+      return DEFAULT_MODEL;
+    }
+    return value;
   } catch {
     return DEFAULT_MODEL;
   }
