@@ -197,6 +197,11 @@ gh release create "$TAG" \
   /tmp/latest.json \
   /tmp/Typeset.dmg
 
+# APFS on the data volume is case-insensitive but case-preserving, so
+# `cp Typeset.dmg over an existing TYPESET.dmg keeps the old uppercase
+# filename. Force-remove any prior case variant before copying so the
+# Desktop entry takes the new "Typeset" casing.
+rm -f ~/Desktop/Typeset.dmg ~/Desktop/TYPESET.dmg
 cp /tmp/Typeset.dmg ~/Desktop/Typeset.dmg
 
 echo ""
