@@ -125,8 +125,18 @@ export interface TemplateField {
   contextSnippet?: string;
 }
 
-/** Local-only sources after the Supabase registry was retired. */
-export type TemplateRegistrySource = "local-draft" | "local-override" | "local-verified";
+/**
+ * Where a saved template originated. `local-*` values come from the
+ * user's own machine; `remote-registry` is a template they installed
+ * from the public registry (Supabase). The latter carries a
+ * `registryId` on the parent Template so we can re-fetch it / show
+ * vote counts / etc.
+ */
+export type TemplateRegistrySource =
+  | "local-draft"
+  | "local-override"
+  | "local-verified"
+  | "remote-registry";
 
 export type TemplateStatus = "local-draft" | "local-verified";
 
@@ -149,7 +159,7 @@ export interface TemplateFingerprint {
   fingerprintHash: string;
 }
 
-/** A saved template (always local in the new architecture) */
+/** A saved template (local store; may have been installed from the registry) */
 export interface Template {
   id: string;
   name: string;
@@ -159,6 +169,14 @@ export interface Template {
   fingerprint?: TemplateFingerprint;
   fields: TemplateField[];
   pageCount?: number;
+  /**
+   * Registry primary key, set when this template was installed from the
+   * public registry (or after the user published a local template). Lets
+   * us re-fetch the row to update vote counts, surface a "Re-publish"
+   * affordance for the original publisher, and dedupe browse results
+   * against templates the user already has locally.
+   */
+  registryId?: string;
   createdAt: string;
   updatedAt: string;
 }

@@ -61,6 +61,12 @@ interface TemplateReviewModalProps {
   onAddCheckbox: () => void;
   onProjectChange?: (updates: Partial<Project>) => void;
   onRedetect?: () => void;
+  /**
+   * Optional publish-to-public-registry handler. When provided, the
+   * modal exposes a "Publish to registry" / "Update published" button.
+   * App-level code is responsible for handling errors + toasts.
+   */
+  onPublish?: (template: Template) => Promise<void>;
 }
 
 export function TemplateReviewModal({
@@ -81,10 +87,22 @@ export function TemplateReviewModal({
   onAddCheckbox,
   onProjectChange,
   onRedetect,
+  onPublish,
 }: TemplateReviewModalProps) {
   const [pageDims, setPageDims] = useState<{ width: number; height: number; scale: number } | null>(null);
   const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
+  const [publishState, setPublishState] = useState<"idle" | "publishing">("idle");
   const fieldListRef = useRef<HTMLUListElement>(null);
+
+  const handlePublishClick = useCallback(async () => {
+    if (!onPublish) return;
+    setPublishState("publishing");
+    try {
+      await onPublish(template);
+    } finally {
+      setPublishState("idle");
+    }
+  }, [onPublish, template]);
 
   const handleDimensions = useCallback((dims: { width: number; height: number; scale: number }) => {
     setPageDims(dims);
@@ -346,6 +364,25 @@ export function TemplateReviewModal({
               title="Run fresh AI detection on this document"
             >
               Re-detect fields
+            </button>
+          )}
+          {onPublish && (
+            <button
+              type="button"
+              className={styles.cancelBtn}
+              onClick={handlePublishClick}
+              disabled={publishState === "publishing" || template.fields.length === 0}
+              title={
+                template.registryId
+                  ? "Push your latest edits to the public registry"
+                  : "Share this template publicly so other users can auto-fill the same form"
+              }
+            >
+              {publishState === "publishing"
+                ? "Publishing…"
+                : template.registryId
+                ? "Update published"
+                : "Publish to registry"}
             </button>
           )}
           <button
