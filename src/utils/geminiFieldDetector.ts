@@ -233,6 +233,14 @@ function buildSystemPrompt(): string {
     "",
     "Vertical extent: match the local line height (typically 12-18 pt for body text, 18-30 pt for signatures/dates). NEVER include the row above or below.",
     "",
+    "Tightness check before emitting each field: imagine cropping the page to your bbox. The crop should show empty space (or a drawn underline), nothing else. If you would see ANY printed letters in the crop, the bbox is too wide — shrink it.",
+    "",
+    "## Field-type rules (deterministic, do NOT deviate)",
+    "  - CVV / CVV2 / security code / `3 digit number` / `4 digits on front` → always `text`, NEVER `checkbox`. The blank may be drawn with a box outline, but the user types digits in it.",
+    "  - Card number, expiration date, signature, name, address, phone, email → always `text`.",
+    "  - Visa / MasterCard / Discover / AMEX selector boxes → `checkbox`.",
+    "  - Any ☐ glyph or empty square the size of one letter → `checkbox`.",
+    "",
     "If you cannot precisely locate the writable area, OMIT the field. We strongly prefer 10 correctly-placed fields to 20 fields where half are sitting on labels.",
   ].join("\n");
 }
@@ -542,9 +550,8 @@ function mapToTemplateField(
 ): TemplateField | null {
   if (!raw || typeof raw !== "object") return null;
 
-  const fieldType: "text" | "checkbox" =
+  const rawFieldType: "text" | "checkbox" =
     raw.field_type === "checkbox" ? "checkbox" : "text";
-  const fieldKind = normalizeFieldKind(raw.field_kind, fieldType);
 
   const pageNumber =
     typeof raw.page_number === "number" && raw.page_number >= 1
@@ -554,9 +561,6 @@ function mapToTemplateField(
     pageSizes.find((p) => p.pageNumber === pageNumber) ?? pageSizes[0];
   if (!pageSize) return null;
 
-  const rect = bboxToPdfRect(raw.bbox, pageSize, fieldType);
-  if (!rect) return null;
-
   // Three-tier canonical-id resolution:
   //   1. Alias match — explicit-label rows hit a known alias.
   //   2. Pattern match — common body-text patterns alias matching can't see.
@@ -564,10 +568,10 @@ function mapToTemplateField(
   const aliasId = inferCanonicalId(
     raw.context_before,
     raw.context_after,
-    fieldType,
+    rawFieldType,
     raw.checkbox_value
   );
-  const patternId = inferByPattern(raw.context_before, raw.context_after, fieldType);
+  const patternId = inferByPattern(raw.context_before, raw.context_after, rawFieldType);
   const geminiId =
     raw.canonical_field_id && VALID_CANONICAL_IDS.has(raw.canonical_field_id)
       ? (raw.canonical_field_id as CanonicalFieldId)
@@ -578,6 +582,31 @@ function mapToTemplateField(
   const canonicalDef = canonicalId
     ? CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === canonicalId)
     : undefined;
+
+  // Deterministic field-type guard. Every canonical id has a fixed
+  // expected type (CVV is always text; visa/mastercard/etc. are always
+  // checkboxes). When Gemini misclassifies — e.g. labelling CVV2 as a
+  // checkbox because the form draws a small box around the underline
+  // — this override fixes it without trusting the model. Only kicks
+  // in when we're confident in the canonical id.
+  const expectedType = canonicalDef
+    ? canonicalDef.fieldKind === "checkbox-group" ||
+      canonicalDef.fieldKind === "boolean-checkbox"
+      ? "checkbox"
+      : "text"
+    : null;
+  const fieldType: "text" | "checkbox" =
+    expectedType && expectedType !== rawFieldType ? expectedType : rawFieldType;
+  const fieldKind = normalizeFieldKind(raw.field_kind, fieldType);
+
+  if (rawFieldType !== fieldType) {
+    console.log(
+      `[Typeset Gemini] Coerced ${canonicalId} from ${rawFieldType} → ${fieldType} based on canonical type.`
+    );
+  }
+
+  const rect = bboxToPdfRect(raw.bbox, pageSize, fieldType);
+  if (!rect) return null;
 
   const isCardCheckbox = canonicalId && CREDIT_CARD_CHECKBOX_IDS.has(canonicalId);
   const isBooleanCheckbox = fieldType === "checkbox" && !isCardCheckbox;
