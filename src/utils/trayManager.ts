@@ -6,7 +6,7 @@ import { PhysicalPosition } from "@tauri-apps/api/dpi";
 
 let trayInstance: TrayIcon | null = null;
 let cachedProjects: { id: string; label: string }[] = [];
-const DROP_ZONE_WIDTH = 260;
+const DROP_ZONE_WIDTH = 270;
 
 async function loadTrayIcon(): Promise<Image> {
   const response = await fetch("/icons/tray-icon.png");

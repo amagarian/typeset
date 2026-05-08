@@ -147,7 +147,6 @@ export function TrayDropZone() {
 
   return (
     <div className={styles.wrapper}>
-      <div className={styles.arrow} />
       <div className={styles.container}>
 
       <div className={styles.header}>

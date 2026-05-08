@@ -1,6 +1,6 @@
 {
   "productName": "Typeset",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "identifier": "com.typeset.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -26,15 +26,21 @@
       {
         "label": "dropzone",
         "title": "Drop PDF",
-        "width": 260,
-        "height": 210,
+        "width": 270,
+        "height": 220,
         "resizable": false,
         "fullscreen": false,
         "decorations": false,
         "transparent": true,
         "alwaysOnTop": true,
         "visible": false,
-        "skipTaskbar": true
+        "skipTaskbar": true,
+        "shadow": false,
+        "windowEffects": {
+          "effects": ["popover"],
+          "state": "active",
+          "radius": 12.0
+        }
       }
     ],
     "security": {
