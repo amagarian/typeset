@@ -475,14 +475,20 @@ const ALIAS_INDEX: ReadonlyArray<{ alias: string; id: CanonicalFieldId }> =
  * has no separate city/state fields. Alias-based matching against the
  * actual context strings is far more reliable.
  *
- * Returns `undefined` if no alias matches; the caller can then leave the
- * field unmapped for the user to assign manually.
+ * IMPORTANT: only matches against the candidate's OWN row (context +
+ * after). Earlier versions also fell back to the full page text, but
+ * that's actively hostile on forms whose subject matter overlaps with
+ * an alias — e.g. on a Credit Card Authorization form the page text
+ * contains "credit card" / "card number" everywhere, so every
+ * unlabelled candidate would match `creditCardNumber`.
+ *
+ * Returns `undefined` if no alias matches the row; the caller leaves
+ * the field unmapped for the user to assign manually.
  */
 function inferCanonicalId(
   context: string | undefined,
   after: string | undefined,
-  fieldType: "text" | "checkbox",
-  pageText: string | undefined
+  fieldType: "text" | "checkbox"
 ): CanonicalFieldId | undefined {
   const ctx = (context ?? "").toLowerCase();
   const aft = (after ?? "").toLowerCase();
@@ -499,22 +505,13 @@ function inferCanonicalId(
     return undefined;
   }
 
-  // Text fields: try context (left of blank) first — that's usually the
-  // explicit field label like "Cardholder Name:". Fall back to the full
-  // row + nearby page text for body-text blanks where context is short.
-  const haystacks = [
-    ctx,
-    aft,
-    `${ctx} ${aft}`.trim(),
-    (pageText ?? "").toLowerCase(),
-  ];
+  // Text fields: only this row's context+after. Body-text blanks where
+  // the surrounding sentence doesn't contain a known label stay unmapped.
+  const haystack = `${ctx} ${aft}`.trim();
+  if (!haystack) return undefined;
   for (const { alias, id } of ALIAS_INDEX) {
     if (alias.length < 3) continue;
-    for (const haystack of haystacks) {
-      if (haystack.includes(alias)) {
-        return id;
-      }
-    }
+    if (haystack.includes(alias)) return id;
   }
   return undefined;
 }
@@ -537,8 +534,7 @@ function cleanLabel(context: string | undefined, fallback: string): string {
 function mapToTemplateField(
   raw: RawClaudeField,
   index: number,
-  pageSizes: PdfPageSize[],
-  pageTexts: string[]
+  pageSizes: PdfPageSize[]
 ): TemplateField | null {
   if (!raw || typeof raw !== "object") return null;
 
@@ -565,9 +561,8 @@ function mapToTemplateField(
   // this over Claude's `canonical_field_id` because Claude tends to
   // force-fit candidates onto canonical ids that don't actually appear
   // in the form. Only fall back to Claude's value when our matcher can't
-  // find any alias hit.
-  const pageText = pageTexts[pageNumber - 1] ?? "";
-  const inferredId = inferCanonicalId(raw.context, raw.after, fieldType, pageText);
+  // find any alias hit on this candidate's row.
+  const inferredId = inferCanonicalId(raw.context, raw.after, fieldType);
   const claudeId =
     raw.canonical_field_id && VALID_CANONICAL_IDS.has(raw.canonical_field_id)
       ? (raw.canonical_field_id as CanonicalFieldId)
@@ -772,9 +767,8 @@ export async function detectFieldsWithClaude(
     return [];
   }
 
-  const pageTexts = Array.isArray(parsed.page_texts) ? parsed.page_texts : [];
   const templateFields = rawFields
-    .map((raw, index) => mapToTemplateField(raw, index, pageSizes, pageTexts))
+    .map((raw, index) => mapToTemplateField(raw, index, pageSizes))
     .filter((field): field is TemplateField => field !== null);
 
   const deduped = dedupeFields(templateFields);
