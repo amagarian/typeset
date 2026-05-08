@@ -1,0 +1,40 @@
+.toast {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 1100;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 12px 12px 14px;
+  border-radius: var(--radius);
+  background: rgba(28, 25, 23, 0.94);
+  color: #fafaf9;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.22);
+  max-width: 420px;
+}
+
+.message {
+  font-size: 13px;
+  line-height: 1.35;
+}
+
+.close {
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  background: transparent;
+  color: #fafaf9;
+  font-size: 18px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.close:hover {
+  background: rgba(255, 255, 255, 0.08);
+}
+

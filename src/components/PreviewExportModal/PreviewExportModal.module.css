@@ -1,0 +1,172 @@
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1050;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+}
+
+.backdrop {
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.35);
+}
+
+.modal {
+  position: relative;
+  width: 100%;
+  max-width: 820px;
+  max-height: 90vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-panel);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+}
+
+.header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--border);
+}
+
+.title {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--letter-wide);
+  color: var(--text);
+}
+
+.subtitle {
+  margin: 4px 0 0 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.closeBtn {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0;
+  cursor: pointer;
+}
+
+.closeBtn:hover {
+  color: var(--text);
+  background: var(--bg-input);
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  padding: 16px 20px;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+}
+
+.pdfContainer {
+  display: flex;
+  justify-content: center;
+  background: #f5f5f4;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 8px;
+}
+
+.generating {
+  padding: 60px 0;
+  text-align: center;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.error {
+  padding: 20px;
+  text-align: center;
+  color: #c44;
+  font-size: 13px;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.pageBtn {
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.pageBtn:hover:not(:disabled) {
+  background: var(--bg-input);
+}
+
+.pageBtn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.pageInfo {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.footer {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding: 12px 20px;
+  border-top: 1px solid var(--border);
+}
+
+.primaryBtn {
+  padding: 7px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  background: var(--text);
+  color: var(--bg-panel);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.primaryBtn:hover {
+  opacity: 0.85;
+}
+
+.secondaryBtn {
+  padding: 7px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  background: transparent;
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.secondaryBtn:hover {
+  background: var(--bg-input);
+}

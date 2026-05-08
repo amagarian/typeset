@@ -1,0 +1,62 @@
+@import url('https://fonts.googleapis.com/css2?family=Caveat:wght@400;600&display=swap');
+
+:root {
+  --bg-app: #f2f2f0;
+  --bg-panel: #ffffff;
+  --bg-sidebar: #e8e8e6;
+  --bg-input: #eaeae8;
+  --border: #d4d4d2;
+  --border-focus: #a0a09e;
+  --text: #1a1a1a;
+  --text-muted: #6b6b69;
+  --text-label: #8a8a88;
+  --radius: 8px;
+  --radius-sm: 4px;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --sidebar-width: 200px;
+  --header-uppercase: 600;
+  --letter-wide: 0.08em;
+  --letter-normal: 0.02em;
+  --font-signature: "Caveat", cursive;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body, #root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: 13px;
+  color: var(--text);
+  background: var(--bg-app);
+  -webkit-font-smoothing: antialiased;
+}
+
+button {
+  font-family: inherit;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+input, select, textarea {
+  font-family: inherit;
+  font-size: inherit;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+a {
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+
+@keyframes processingSpinner {
+  to { transform: rotate(360deg); }
+}

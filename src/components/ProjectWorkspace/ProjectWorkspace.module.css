@@ -1,0 +1,111 @@
+.workspace {
+  flex: 1;
+  overflow-y: auto;
+  padding: 40px 24px 32px;
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  position: relative;
+}
+
+.empty {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.emptyText {
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.summaryHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.summaryTitle {
+  font-size: 13px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--letter-wide);
+  color: var(--text);
+  margin: 0;
+}
+
+.headerActions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.editBtn,
+.deleteBtn {
+  width: 28px;
+  height: 28px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  border-radius: var(--radius-sm);
+  padding: 0;
+  cursor: pointer;
+}
+
+.editBtn:hover {
+  color: var(--text);
+  background: var(--bg-input);
+}
+
+.deleteBtn:hover {
+  color: #c44;
+  background: var(--bg-input);
+}
+
+.summaryGrid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.summaryField {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 14px;
+  background: var(--bg-input);
+}
+
+.summaryLabel {
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--letter-wide);
+  color: var(--text-label);
+}
+
+.summaryValue {
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.documentsSection {
+  min-height: 0;
+}
+
+.dropSection {
+  flex: 1;
+  display: flex;
+  min-height: 120px;
+}
+

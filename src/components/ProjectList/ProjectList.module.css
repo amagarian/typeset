@@ -1,0 +1,38 @@
+.list {
+  flex: 1;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+
+.items {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+.items li {
+  margin: 0;
+}
+
+.item,
+.itemActive {
+  display: block;
+  width: 100%;
+  padding: 8px 16px;
+  text-align: left;
+  border: none;
+  background: none;
+  color: var(--text);
+  font-size: 13px;
+  border-radius: 0;
+  transition: background 0.1s;
+}
+
+.item:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+
+.itemActive {
+  background: rgba(0, 0, 0, 0.08);
+  font-weight: 500;
+}

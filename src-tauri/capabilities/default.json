@@ -1,0 +1,36 @@
+{
+  "identifier": "default",
+  "description": "Default capability for all windows",
+  "windows": ["main", "dropzone"],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "shell:default",
+    "fs:default",
+    "updater:default",
+    "notification:default",
+    "process:allow-restart",
+    "core:window:allow-start-dragging",
+    "core:window:allow-show",
+    "core:window:allow-hide",
+    "core:window:allow-set-focus",
+    "core:window:allow-center",
+    "core:window:allow-is-visible",
+    "core:window:allow-is-focused",
+    "core:window:allow-set-position",
+    "fs:allow-read-file",
+    "fs:allow-write-file",
+    "fs:allow-exists",
+    {
+      "identifier": "fs:scope",
+      "allow": [
+        "$HOME/**",
+        "$DESKTOP/**",
+        "$DOWNLOAD/**",
+        "$DOCUMENT/**",
+        "/Volumes/**",
+        "/tmp/**"
+      ]
+    }
+  ]
+}

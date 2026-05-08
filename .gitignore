@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+target/
+*.tsbuildinfo
+vite.config.js
+vite.config.d.ts
+
+# IDE
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# Tauri
+src-tauri/target/

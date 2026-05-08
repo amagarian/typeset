@@ -1,0 +1,65 @@
+.form {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.group {
+  display: contents;
+}
+
+.field {
+  position: relative;
+}
+
+.input {
+  display: block;
+  width: 100%;
+  padding: 14px 16px 6px;
+  background: var(--bg-input);
+  border: none;
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: 13px;
+  outline: none;
+  transition: background 0.15s;
+}
+
+.input:focus {
+  background: #e0e0de;
+}
+
+.input::placeholder {
+  color: transparent;
+}
+
+.label {
+  position: absolute;
+  top: 4px;
+  left: 16px;
+  font-size: 9px;
+  font-weight: var(--header-uppercase);
+  text-transform: uppercase;
+  letter-spacing: var(--letter-wide);
+  color: var(--text-label);
+  pointer-events: none;
+}
+
+select.input {
+  appearance: none;
+  cursor: pointer;
+  padding-right: 32px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236b6b69' stroke-width='2'%3E%3Cpath d='M6 9l6 6 6-6'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 12px center;
+}
+
+.signatureInput {
+  composes: input;
+  font-family: var(--font-signature);
+  font-size: 22px;
+  padding-top: 10px;
+  padding-bottom: 2px;
+  line-height: 1;
+}
+
