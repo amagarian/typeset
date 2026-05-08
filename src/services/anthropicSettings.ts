@@ -12,11 +12,21 @@ const MODEL_PREF_KEY = "typeset.anthropic.model.v1";
 const EFFORT_PREF_KEY = "typeset.anthropic.effort.v1";
 
 /**
- * Default Claude model. Anthropic ships dated and aliased IDs; users can
- * override this with the exact dated ID in Settings if a new release lands
- * before we update the default.
+ * Default Claude model.
+ *
+ * We default to Sonnet 4.6 because the agentic field-detection flow is
+ * dominated by Python execution time inside Anthropic's sandbox — the
+ * model itself only needs to map a deterministic structural extractor's
+ * output onto canonical field ids. Sonnet does that mapping with
+ * essentially identical accuracy to Opus 4.7, but generates tokens
+ * 2-3x faster, which translates to a 2-3x reduction in end-to-end
+ * detection time (matching Claude.ai's typical ~60s envelope).
+ *
+ * Users can override this in Settings if they want Opus's marginally
+ * better label-to-canonical mapping for novel form types — at the cost
+ * of running ~3-4 minutes per first-time detection.
  */
-export const DEFAULT_MODEL = "claude-opus-4-7";
+export const DEFAULT_MODEL = "claude-sonnet-4-6";
 
 export interface ModelOption {
   id: string;
@@ -26,18 +36,20 @@ export interface ModelOption {
 
 /**
  * Built-in model presets shown in the Settings dropdown. The user can also
- * paste an arbitrary dated ID (e.g. `claude-opus-4-7-20260201`).
+ * paste an arbitrary dated ID (e.g. `claude-sonnet-4-6-20260201`).
  */
 export const MODEL_PRESETS: ModelOption[] = [
   {
-    id: "claude-opus-4-7",
-    label: "Opus 4.7 (best quality)",
-    description: "Strongest accuracy on complex forms. Slower and more expensive.",
+    id: "claude-sonnet-4-6",
+    label: "Sonnet 4.6 (recommended)",
+    description:
+      "Matches Claude.ai's speed (~60-90s) and accuracy on production forms. ~10x cheaper than Opus.",
   },
   {
-    id: "claude-sonnet-4-6",
-    label: "Sonnet 4.6 (balanced)",
-    description: "Strong accuracy, ~10x cheaper than Opus, faster.",
+    id: "claude-opus-4-7",
+    label: "Opus 4.7 (slower, marginally smarter)",
+    description:
+      "Slightly stronger label inference on novel form types. Detection takes 3-4 minutes per form.",
   },
 ];
 
