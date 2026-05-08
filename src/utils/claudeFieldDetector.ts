@@ -367,12 +367,15 @@ function buildAgenticSystemPrompt(): string {
     "",
     "Rules for `canonical_field_id`:",
     "- ONLY set a canonical id when the surrounding sentence makes the role unambiguous. NULL IS BETTER THAN A WRONG ID. Wrong ids cause silent mis-fills downstream.",
+    "- BE CONSISTENT ACROSS REPEATS. Production paperwork repeats the same pattern several times — e.g. an authorization paragraph appears once at the top, then again under a heading like \"IF YOU WOULD LIKE TO PAY...\". If you map the FIRST occurrence of a pattern to a canonical id, you MUST map ALL identical occurrences to the same canonical id. Inconsistent mapping is a bug.",
     "- Common body-text patterns and their mappings:",
-    "  - \"I, ____, authorize my credit card to be charged\" → `creditCardHolder` (the speaker IS the cardholder).",
-    "  - \"...damages from my booking at <company> on ____ (date)\" → `authorizationDate` (charge/booking date).",
-    "  - \"I authorize my credit card to be charged $____\" → leave NULL (this is the dollar amount, no canonical id for it).",
-    "  - \"Signature: ____\" or signature line → `cardholderSignature`.",
-    "  - \"____ /hour\" or \"plus a 3.3% processing fee\" → leave NULL (rate/fee fields without a canonical match).",
+    "  - `\"I,\"` followed by `\"authorize my credit card to be charged\"` → `creditCardHolder` (the speaker IS the cardholder). This pattern often appears 2-3 times in a CC auth form; map ALL of them.",
+    "  - `\"on\"` followed by `\"(date)\"` → `authorizationDate`. Often appears in body text like \"my booking at <company> on ____ (date)\".",
+    "  - `\"$\"` immediately to the LEFT of the blank → leave NULL (this is a dollar amount, e.g. \"charged an additional $____\", \"$____ / hour\"). Never `creditCardNumber`.",
+    "  - `\"for\"` immediately left and `\"hours\"` immediately right → leave NULL (number of hours).",
+    "  - `\"Signature\"` or `\"Signed by\"` ending the context (with optional colon) → `cardholderSignature`. Map every signature line in the document.",
+    "  - `\"Card Identification Number\"` or `\"three digits on back of card\"` → `ccv` (NOT `creditCardNumber`).",
+    "  - Empty `context` AND no clear semantic in `after` → leave NULL.",
     "- Do NOT use the form's TITLE or surrounding paragraph to guess. The signal must come from the candidate's own row context+after.",
     "- Never guess `creditCardNumber` based on the form being a CC auth — that field has an explicit \"Credit Card Number:\" label row that the alias matcher will pick up.",
     "",
@@ -514,6 +517,57 @@ const ALIAS_INDEX: ReadonlyArray<{ alias: string; id: CanonicalFieldId }> =
  * Returns `undefined` if no alias matches the row; the caller leaves
  * the field unmapped for the user to assign manually.
  */
+/**
+ * Matches common body-text patterns that don't have an explicit
+ * label on their own row. Runs BEFORE Claude's `canonical_field_id`
+ * fallback so identical patterns always map identically across the
+ * document (Claude is inconsistent — sometimes maps the first
+ * "I, ___, authorize" but misses the second).
+ *
+ * Returns `undefined` for anything that isn't a clearly-recognised
+ * pattern; do not over-extend, NULL is better than wrong.
+ */
+function inferByPattern(
+  context: string | undefined,
+  after: string | undefined,
+  fieldType: "text" | "checkbox"
+): CanonicalFieldId | undefined {
+  if (fieldType !== "text") return undefined;
+  const ctx = (context ?? "").toLowerCase().trim();
+  const aft = (after ?? "").toLowerCase().trim();
+
+  // "I, ____, authorize..." → cardholder name. The speaker IS the
+  // cardholder, by definition. Catches both first-paragraph
+  // ("I, ___, authorize my credit card to be charged") and
+  // second-paragraph ("I, ___, authorize my credit card to be charged
+  // an additional $...") instances consistently.
+  if (/^i,?$/.test(ctx) && /^,?\s*authoriz/.test(aft)) {
+    return "creditCardHolder";
+  }
+
+  // "Signature:" / "Signed by:" / row ending in "sign" → signature line.
+  if (/(?:^|\s)(signature|signed(\s+by)?)\s*[:.]?$/.test(ctx)) {
+    return "cardholderSignature";
+  }
+
+  // "(date)" or "date:" appearing in the suffix → it's a date blank.
+  // Common in body text like "...on ____ (date) for ____ hours".
+  if (/^\(\s*date\s*\)/.test(aft) || /^date\s*[:.)]?/.test(aft)) {
+    return "authorizationDate";
+  }
+
+  // Context ends with "exp", "expir", "exp date", or suffix begins with
+  // "MM/YY" → expiration date.
+  if (
+    /\bexp(\.|ir(es|ation|y)?)?(\s+date)?\s*[:.]?$/.test(ctx) ||
+    /^mm\s*[\/.]\s*yy/.test(aft)
+  ) {
+    return "expDate";
+  }
+
+  return undefined;
+}
+
 function inferCanonicalId(
   context: string | undefined,
   after: string | undefined,
@@ -616,24 +670,30 @@ function mapToTemplateField(
   const rawWidth = clampNumber(raw.width ?? minDim, minDim, pageSize.width - x);
   const rawHeight = clampNumber(raw.height ?? minDim, minDim, pageSize.height - y);
 
-  // Deterministic canonical-id matching from the row context wins over
-  // Claude's reasoning for explicit-label rows ("Credit Card Number:"
-  // etc.) because Claude tends to force-fit candidates onto canonical
-  // ids that don't actually appear in the form. For body-text blanks
-  // where alias matching can't see a label, Claude's semantic
-  // canonical_field_id becomes the fallback — which is how we recover
-  // mapping for sentences like "I, ___, authorize my credit card".
-  const inferredId = inferCanonicalId(
+  // Three-tier canonical-id resolution:
+  //   1. Alias match — explicit-label rows ("Credit Card Number:", etc.)
+  //      hit a known alias on this row's context+after.
+  //   2. Pattern match — common body-text patterns that alias matching
+  //      can't see ("I, ___, authorize" → cardholder, "Signature:" →
+  //      signature, "(date)" in suffix → date). Runs before Claude so
+  //      these patterns map identically everywhere they occur.
+  //   3. Claude semantic — the model read the surrounding sentence and
+  //      assigned a canonical_field_id; only used when both above miss.
+  // We prefer 1 and 2 over Claude because Claude tends to force-fit
+  // and is inconsistent across repeats of the same pattern.
+  const aliasId = inferCanonicalId(
     raw.context,
     raw.after,
     fieldType,
     raw.checkbox_value
   );
+  const patternId = inferByPattern(raw.context, raw.after, fieldType);
   const claudeId =
     raw.canonical_field_id && VALID_CANONICAL_IDS.has(raw.canonical_field_id)
       ? (raw.canonical_field_id as CanonicalFieldId)
       : undefined;
-  const canonicalId: CanonicalFieldId | undefined = inferredId ?? claudeId;
+  const canonicalId: CanonicalFieldId | undefined =
+    aliasId ?? patternId ?? claudeId;
 
   const canonicalDef = canonicalId
     ? CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === canonicalId)
