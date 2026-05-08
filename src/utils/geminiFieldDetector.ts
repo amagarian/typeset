@@ -708,6 +708,100 @@ function progressToFraction(progress: GeminiProgress): number {
 }
 
 // ---------------------------------------------------------------------------
+// Truncated-JSON salvage
+// ---------------------------------------------------------------------------
+
+/**
+ * Best-effort recovery from a malformed JSON payload. Two scenarios:
+ *
+ *   1. The response was truncated mid-array because of `MAX_TOKENS`,
+ *      leaving something like
+ *        `{"fields":[{"label":"A",...},{"label":"B`
+ *      We walk the string forward keeping a balanced bracket/brace
+ *      stack, stop at the last comma that completed an array element,
+ *      and then close all open scopes.
+ *   2. The model leaked preamble text before/after the JSON object.
+ *      We trim to the outermost balanced `{...}` we can find.
+ *
+ * Returns the parsed object on success or null if no salvage is
+ * possible. Always defensive — if the salvage attempt itself throws,
+ * we just return null and let the caller surface the original error.
+ */
+function salvageTruncatedJson(raw: string): unknown | null {
+  if (!raw) return null;
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+
+  let depthCurly = 0;
+  let depthSquare = 0;
+  let inString = false;
+  let escape = false;
+  let lastSafeEnd = -1;
+
+  for (let i = start; i < raw.length; i += 1) {
+    const ch = raw[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escape = true;
+      continue;
+    }
+    if (ch === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+
+    if (ch === "{") depthCurly += 1;
+    else if (ch === "}") {
+      depthCurly -= 1;
+      if (depthCurly === 0 && depthSquare === 0) {
+        // We just closed the top-level object cleanly.
+        try {
+          return JSON.parse(raw.slice(start, i + 1));
+        } catch {
+          // Continue scanning — stray `}` inside a string we missed.
+        }
+      }
+    } else if (ch === "[") depthSquare += 1;
+    else if (ch === "]") depthSquare -= 1;
+
+    // Mark every position where we just completed an array element —
+    // i.e. a `}` immediately followed by `,` inside an array. Those
+    // are the points we can rewind to and append `]}` to close cleanly.
+    if (
+      ch === "}" &&
+      depthCurly > 0 &&
+      depthSquare > 0 &&
+      raw[i + 1] === ","
+    ) {
+      lastSafeEnd = i;
+    }
+  }
+
+  // We never closed the top-level object cleanly. If we have a safe
+  // rewind point, close everything from there.
+  if (lastSafeEnd > 0) {
+    let candidate = raw.slice(start, lastSafeEnd + 1);
+    // We left off after `}` of the last complete element, so close
+    // remaining open arrays/objects. We don't know the exact shape of
+    // the partial state at this point, so we close conservatively:
+    // strip any trailing comma we may pick up, then append `]}`.
+    candidate = candidate.replace(/,\s*$/, "");
+    candidate = `${candidate}]}`;
+    try {
+      return JSON.parse(candidate);
+    } catch {
+      return null;
+    }
+  }
+
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
@@ -782,9 +876,14 @@ async function detectFieldsImpl(
       systemPrompt: buildSystemPrompt(),
       userPrompt: buildUserPrompt(pageSizes, filename),
       responseSchema: RESPONSE_SCHEMA,
-      // 1500 tokens is plenty for a typical 20-field form; double it as
-      // headroom for very dense multi-page documents.
-      maxOutputTokens: 4096,
+      // Empirical: a typical CCAUTH form with 20-30 fields, each
+      // carrying a ~6-word context snippet + 4-element bbox + canonical
+      // id, runs ~150-220 output tokens per field. Multi-page vendor
+      // packets push past 25 fields. 4096 truncates mid-array on every
+      // dense form (manifests as "Expected ']' " parse errors). 32k
+      // gives ~3-4x headroom against the worst form we've seen and is
+      // well within the 65k output budget on Gemini 2.5 Pro.
+      maxOutputTokens: 32768,
       temperature: 0.0,
     });
   } finally {
@@ -798,15 +897,38 @@ async function detectFieldsImpl(
     `[Typeset Gemini] model=${model} stop=${result.finishReason} usage=${JSON.stringify(result.usage)}`
   );
 
+  // Two failure modes manifest as JSON parse errors here:
+  //   1. `finishReason === "MAX_TOKENS"` — output got cut mid-array,
+  //      leaving e.g. `[{...}, {"label":"X"`. We salvage by closing
+  //      the open structures and surface a louder warning so the user
+  //      knows fields are missing.
+  //   2. The model emitted preamble before the JSON despite
+  //      responseSchema (rare, but happens on Flash). The salvager
+  //      handles this too — it scans for the first `{` and last
+  //      balanced `}` it can find.
   let parsed: RawGeminiResponse;
+  const truncated = result.finishReason === "MAX_TOKENS";
   try {
     parsed = JSON.parse(result.text) as RawGeminiResponse;
   } catch (err) {
-    throw new GeminiApiError(
-      `Gemini returned non-JSON content. (parse error: ${
-        err instanceof Error ? err.message : String(err)
-      })`
-    );
+    const salvaged = salvageTruncatedJson(result.text);
+    if (salvaged) {
+      parsed = salvaged as RawGeminiResponse;
+      console.warn(
+        `[Typeset Gemini] Recovered ${
+          parsed.fields?.length ?? 0
+        } fields from truncated/malformed response (finishReason=${result.finishReason}).`
+      );
+    } else {
+      const hint = truncated
+        ? " The response was truncated by the token limit — try a denser form on Pro instead of Flash, or split the form into fewer pages."
+        : "";
+      throw new GeminiApiError(
+        `Gemini returned non-JSON content.${hint} (parse error: ${
+          err instanceof Error ? err.message : String(err)
+        })`
+      );
+    }
   }
 
   const rawFields = parsed.fields ?? [];
