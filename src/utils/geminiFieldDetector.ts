@@ -217,7 +217,12 @@ function buildSystemPrompt(): string {
     "If the same field type appears multiple times (e.g. cardholder name in two paragraphs), emit one entry per occurrence — each with its own bbox. The downstream system fills repeats with the same value.",
     "",
     "## Be tight",
-    "Bounding boxes should hug the writable area, not include the printed label. For underscore lines, the box covers the underscore characters only.",
+    "Bounding boxes MUST hug the WRITABLE BLANK ITSELF — never the printed label.",
+    "  - For an `Address: __________` row, the bbox covers the underscores only, NOT the word `Address`.",
+    "  - For a checkbox row `[ ] Visa`, the bbox covers the SQUARE only, NOT the word `Visa`.",
+    "  - For inline blanks like `I, _________, authorize…`, the bbox covers the underscores between the commas.",
+    "  - The box's vertical extent should match the line height of nearby text (typically 12-18 points). Do NOT include the row label or the row above/below.",
+    "If you cannot locate the actual blank/underline, OMIT the field rather than guess. We would rather have 12 right fields than 20 fields where half are misplaced.",
   ].join("\n");
 }
 

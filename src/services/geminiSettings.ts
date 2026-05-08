@@ -10,17 +10,17 @@ const MODEL_PREF_KEY = "typeset.gemini.model.v1";
 /**
  * Default Gemini model.
  *
- * Pro is recommended because it ranks 1st on document-understanding
- * benchmarks and finishes a typical 1-3 page production form in
- * 20-30 seconds end-to-end with native multimodal PDF input — no
- * Python sandbox, no agentic loop, no tool calls. That speed is the
- * entire reason we moved off Anthropic.
+ * 3.1 Pro is recommended because Gemini 3.x added a major leap in
+ * spatial understanding / bounding-box accuracy over the 2.5
+ * generation. The 2.5 family is rated ~YOLO-V3-2018 level on bbox
+ * tasks (~0.34 mAP); Gemini 3 is "notably improved." The desktop
+ * client uses 3.x by default and that's the experience we're trying
+ * to mirror.
  *
- * Flash is offered as a "cheaper, faster" option for users with very
- * simple forms; it's typically 2-3x cheaper per call but loses ~5-10%
- * accuracy on dense, irregular layouts.
+ * Pro takes ~30-40s per detection vs Flash's ~12-18s, but is
+ * dramatically more accurate on dense forms (which is what we have).
  */
-export const DEFAULT_MODEL = "gemini-2.5-pro";
+export const DEFAULT_MODEL = "gemini-3.1-pro-preview";
 
 export interface ModelOption {
   id: string;
@@ -31,20 +31,26 @@ export interface ModelOption {
 /**
  * Built-in model presets shown in the Settings dropdown. Users can
  * also paste an arbitrary dated model id (e.g.
- * `gemini-2.5-pro-preview-06-05`) via the "Custom" option.
+ * `gemini-3.1-pro-preview-2026-04`) via the "Custom" option.
  */
 export const MODEL_PRESETS: ModelOption[] = [
   {
-    id: "gemini-2.5-pro",
-    label: "Gemini 2.5 Pro (recommended)",
+    id: "gemini-3.1-pro-preview",
+    label: "Gemini 3.1 Pro (recommended)",
     description:
-      "Highest accuracy on document understanding. ~20-30s per detection on a typical production form.",
+      "Top accuracy on bbox / form-field detection. ~30-40s per detection on a typical production form. Mirrors the desktop client's default.",
   },
   {
-    id: "gemini-2.5-flash",
-    label: "Gemini 2.5 Flash (cheaper, faster)",
+    id: "gemini-3-flash-preview",
+    label: "Gemini 3 Flash (faster)",
     description:
-      "~2-3x cheaper per call, ~10-15s per detection. Slight accuracy drop on dense or irregular layouts.",
+      "~12-18s per detection. Slightly less precise on dense forms but huge speed win on simple ones.",
+  },
+  {
+    id: "gemini-2.5-pro",
+    label: "Gemini 2.5 Pro (legacy)",
+    description:
+      "Older generation. Kept for compatibility — bbox accuracy is significantly weaker than 3.1.",
   },
 ];
 
@@ -104,18 +110,32 @@ export function clearModelPreference(): void {
   }
 }
 
+const MODEL_MIGRATION_FLAG = "typeset.gemini.model.migrated.v2";
+
 /**
- * Migrate any pre-Gemini model preferences eagerly. Safe to call from
- * app startup; idempotent.
+ * Migrate any pre-Gemini model preferences eagerly, plus run a one-
+ * shot bump from the original `gemini-2.5-pro` default to the new
+ * `gemini-3.1-pro-preview` default. Safe to call from app startup;
+ * idempotent.
+ *
+ * Why bump existing prefs? The 2.5 → 3.1 generation jump is large for
+ * spatial reasoning (~YOLO-V3 → notably-improved on bbox tasks). Users
+ * who picked up 2.5 as the install-time default are almost certainly
+ * happier on 3.1; users who actively *chose* 2.5 can flip it back in
+ * Settings and won't be migrated again because the flag is set.
  */
 export function migrateLegacyModelPreference(): void {
   if (!canUseStorage()) return;
   try {
-    // The pre-Gemini Anthropic preference was stored under a different
-    // key; clean it up so users who downgrade and then re-upgrade don't
-    // see a ghost setting.
     window.localStorage.removeItem("typeset.anthropic.model.v1");
     window.localStorage.removeItem("typeset.anthropic.effort.v1");
+
+    if (window.localStorage.getItem(MODEL_MIGRATION_FLAG)) return;
+    const current = window.localStorage.getItem(MODEL_PREF_KEY);
+    if (current === "gemini-2.5-pro") {
+      window.localStorage.setItem(MODEL_PREF_KEY, DEFAULT_MODEL);
+    }
+    window.localStorage.setItem(MODEL_MIGRATION_FLAG, "1");
   } catch {
     /* ignore */
   }
