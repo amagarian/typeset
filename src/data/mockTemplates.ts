@@ -39,7 +39,7 @@ const baseFields: TemplateField[] = [
   },
 ];
 
-/** Draft template with guessed fields (used when Claude detection fails) */
+/** Draft template with guessed fields (used when Gemini detection fails) */
 export const mockDraftTemplate: Template = {
   id: "tpl-draft-1",
   name: "Unknown form — draft",

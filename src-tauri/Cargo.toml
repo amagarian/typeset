@@ -1,7 +1,7 @@
 [package]
 name = "typeset"
 version = "0.1.0"
-description = "Film production PDF autofill powered by Claude with local template caching"
+description = "Film production PDF autofill powered by Gemini with local template caching"
 authors = ["Aiden Magarian"]
 edition = "2021"
 
@@ -23,9 +23,12 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 tauri-plugin-notification = "2.3.3"
 
-# Anthropic Claude integration
+# Google Gemini integration. We talk to the public Generative Language
+# API directly (no Vertex SDK) so the only third-party deps are an HTTP
+# client (reqwest), the keychain wrapper for the API key, base64 for
+# inline-PDF payloads, and futures-util for SSE stream consumption.
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "multipart", "stream"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 base64 = "0.22"
 thiserror = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }

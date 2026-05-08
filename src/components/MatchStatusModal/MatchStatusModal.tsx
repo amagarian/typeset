@@ -62,7 +62,7 @@ export function MatchStatusModal({
           {kind === "none" && (
             <div className={styles.card}>
               <span className={`${styles.badge} ${styles.none}`}>No saved template</span>
-              <p className={styles.hint}>Open the template editor to confirm Claude&apos;s detected fields, or create a fresh one.</p>
+              <p className={styles.hint}>Open the template editor to confirm Gemini&apos;s detected fields, or create a fresh one.</p>
               {draftTemplateId ? (
                 <div className={styles.actions}>
                   <button type="button" className={styles.primaryBtn} onClick={() => onOpenTemplateReview(draftTemplateId)}>

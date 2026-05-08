@@ -25,18 +25,10 @@ import {
   detectFieldsWithClaude,
   extractProjectFromPdfWithClaude,
   ClaudeNotConfiguredError,
-} from "@/utils/claudeFieldDetector";
-import { hasApiKey } from "@/services/claudeClient";
-import {
-  findRegistryMatches,
-  isRegistryEnabled,
-  publishTemplate,
-  updatePublishedTemplate,
-  type MatchedRegistryTemplate,
-} from "@/services/templateRegistry";
+} from "@/utils/geminiFieldDetector";
+import { hasApiKey } from "@/services/geminiClient";
 import {
   buildPdfFingerprint,
-  buildTemplateFingerprintFromTemplate,
   scoreFingerprintMatch,
 } from "@/utils/templateFingerprint";
 import {
@@ -125,33 +117,11 @@ function findMatchingLocalTemplate(
   return null;
 }
 
-/**
- * Convert a community-published registry template into a local Template
- * suitable for installation. We give it a fresh local id and tag it as
- * `remote-registry` so future flows can show "Synced from registry"
- * affordances without mistaking it for a draft.
- */
-function buildTemplateFromRegistry(remote: MatchedRegistryTemplate): Template {
-  const now = new Date().toISOString();
-  return {
-    id: `tpl-registry-${remote.template.id}`,
-    name: remote.template.name,
-    status: "local-verified",
-    source: "remote-registry",
-    registryId: remote.template.id,
-    fields: remote.template.fields,
-    fingerprint: remote.template.fingerprint,
-    pageCount: remote.template.pageCount,
-    createdAt: now,
-    updatedAt: now,
-  };
-}
-
 function cloneTemplate(template: Template): Template {
   return JSON.parse(JSON.stringify(template)) as Template;
 }
 
-function buildTemplateFromClaudeFields(
+function buildTemplateFromDetectedFields(
   fields: TemplateField[],
   fileName: string,
   fingerprint: ReturnType<typeof buildPdfFingerprint> extends Promise<infer T> ? T : never
@@ -163,7 +133,7 @@ function buildTemplateFromClaudeFields(
     ...fields.map((field) => field.pageNumber)
   );
   return {
-    id: `tpl-claude-${Date.now()}`,
+    id: `tpl-gemini-${Date.now()}`,
     name: `${baseName} — draft`,
     status: "local-draft",
     source: "local-draft",
@@ -331,7 +301,7 @@ function MainApp() {
     const configured = await hasApiKey();
     if (!configured) {
       showToast(
-        "Add your Anthropic API key in Settings to enable Claude detection.",
+        "Add your Gemini API key in Settings to enable detection.",
         "info"
       );
       setSettingsOpen(true);
@@ -444,75 +414,12 @@ function MainApp() {
         return "verified-ready";
       }
 
-      // Step 1.5: nothing in the LOCAL cache — try the public registry
-      // before paying for a Claude detection. Hits here are gold: zero
-      // cost, ~200ms round-trip, and the user gets a community-verified
-      // field map. We use the same 0.92 confidence threshold as the
-      // local matcher so behaviour is symmetric — a registry hit is
-      // semantically equivalent to a local hit, just sourced remotely.
-      if (isRegistryEnabled()) {
-        try {
-          const remoteMatches = await findRegistryMatches(fingerprint, 4);
-          const best = remoteMatches[0];
-          if (best && best.matchScore >= 0.92) {
-            const installed = buildTemplateFromRegistry(best);
-            // Cache locally so the next drop of the same form is instant
-            // and works offline.
-            upsertLocalTemplate(installed);
-            setEditedTemplates((prev) => ({ ...prev, [installed.id]: installed }));
-            setDraftTemplate(installed);
-
-            const upvoteSummary =
-              best.template.upvotes > 0
-                ? ` (${best.template.upvotes} upvote${best.template.upvotes === 1 ? "" : "s"})`
-                : "";
-            const result: PdfMatchResult = {
-              kind: "verified",
-              verifiedMatch: {
-                templateId: installed.id,
-                templateName: installed.name,
-                status: installed.status,
-                confidence: best.matchScore,
-                source: "remote-registry",
-              },
-              fileName: file.name,
-              lookupMessage: `Matched a community template${upvoteSummary}.`,
-              matchSource: "remote-registry",
-              syncState: "matched",
-            };
-
-            updateDocumentInProject(effectiveProjectId, docId, {
-              status: "matched",
-              matchResult: result,
-              templateId: installed.id,
-            });
-
-            if (options.showMatchModal !== false) {
-              setMatchModal(result);
-            }
-
-            autoFillDocument(installed, docId, effectiveProjectId);
-            if (!options.silentToasts) {
-              showToast(
-                `Matched a community template${upvoteSummary} — ready to fill.`,
-                "success"
-              );
-            }
-            return "verified-ready";
-          }
-        } catch (err) {
-          // Registry is best-effort. Any failure (network, RPC, RLS)
-          // silently falls through to the Claude detection path.
-          console.warn("[Typeset] Registry lookup failed; falling back to Claude:", err);
-        }
-      }
-
-      // Step 2: nothing in cache or registry. Make sure Claude is configured.
+      // Step 2: nothing in cache. Make sure Gemini is configured.
       const configured = await hasApiKey();
       if (!configured) {
         if (!options.silentToasts) {
           showToast(
-            "Add your Anthropic API key in Settings to detect fields with Claude.",
+            "Add your Gemini API key in Settings to detect fields.",
             "info"
           );
         }
@@ -521,7 +428,7 @@ function MainApp() {
         return "no-key";
       }
 
-      // Step 3: Claude detection.
+      // Step 3: Gemini detection.
       const setDocProcessing = (msg: string, progress?: number) => {
         updateDocumentInProject(effectiveProjectId, docId, {
           status: "processing",
@@ -537,7 +444,7 @@ function MainApp() {
           filename: file.name,
         });
       } catch (err) {
-        console.warn("[Typeset] Claude detection failed:", err);
+        console.warn("[Typeset] Gemini detection failed:", err);
         if (err instanceof ClaudeNotConfiguredError) {
           if (!options.silentToasts) {
             showToast(err.message, "info");
@@ -548,7 +455,7 @@ function MainApp() {
         }
         if (!options.silentToasts) {
           showToast(
-            `Claude detection failed: ${
+            `Gemini detection failed: ${
               err instanceof Error ? err.message : "unknown error"
             }`,
             "error"
@@ -558,7 +465,7 @@ function MainApp() {
 
       const draft: Template =
         detectedFields.length > 0
-          ? buildTemplateFromClaudeFields(detectedFields, file.name, fingerprint)
+          ? buildTemplateFromDetectedFields(detectedFields, file.name, fingerprint)
           : {
               ...createEmptyDraftTemplate(file.name),
               fingerprint,
@@ -573,8 +480,8 @@ function MainApp() {
         fileName: file.name,
         lookupMessage:
           detectedFields.length > 0
-            ? `Claude detected ${detectedFields.length} field(s). Review and save to reuse on future drops of this form.`
-            : "Claude could not identify fields automatically. Open the editor to add them.",
+            ? `Gemini detected ${detectedFields.length} field(s). Review and save to reuse on future drops of this form.`
+            : "Gemini could not identify fields automatically. Open the editor to add them.",
         matchSource: "detector",
         syncState: "matched",
       };
@@ -589,7 +496,7 @@ function MainApp() {
       autoFillDocument(draft, docId, effectiveProjectId);
       if (!options.silentToasts && detectedFields.length > 0) {
         showToast(
-          `Claude detected ${detectedFields.length} field(s). Use Edit Template to refine.`,
+          `Gemini detected ${detectedFields.length} field(s). Use Edit Template to refine.`,
           "info"
         );
       }
@@ -944,58 +851,6 @@ function MainApp() {
       showToast("Saved template locally.", "success");
     },
     [activeDocumentId, selectedProjectId, showToast, updateDocumentInProject]
-  );
-
-  /**
-   * Publish (or update) a template to the public registry. The template's
-   * fingerprint is rebuilt from the latest fields so any edits since
-   * the original detection are reflected in the public row.
-   *
-   * After a successful publish we stash the returned `registryId` on the
-   * local copy so subsequent edits route through `updatePublishedTemplate`
-   * (which RLS scopes to the original publisher device).
-   */
-  const handlePublishTemplate = useCallback(
-    async (template: Template) => {
-      if (!isRegistryEnabled()) {
-        showToast(
-          "Public registry isn't configured (missing VITE_SUPABASE_* env).",
-          "info"
-        );
-        return;
-      }
-      try {
-        // Always recompute the fingerprint from the latest fields so the
-        // anchor terms / canonical ids reflect any post-detection edits.
-        const fingerprint = buildTemplateFingerprintFromTemplate(template);
-        const ready: Template = { ...template, fingerprint };
-
-        if (template.registryId) {
-          await updatePublishedTemplate(template.registryId, ready);
-          showToast("Updated your published template.", "success");
-        } else {
-          const { registryId } = await publishTemplate(ready);
-          const updated: Template = {
-            ...ready,
-            registryId,
-            source: "remote-registry",
-            updatedAt: new Date().toISOString(),
-          };
-          upsertLocalTemplate(updated);
-          setEditedTemplates((prev) => ({ ...prev, [updated.id]: updated }));
-          setDraftTemplate(updated);
-          showToast(
-            "Published to the public registry — other users can now match this form.",
-            "success"
-          );
-        }
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Publish failed.";
-        console.warn("[Typeset] Publish failed:", err);
-        showToast(message, "error");
-      }
-    },
-    [showToast]
   );
 
   const exportFilledPdf = useCallback(
@@ -1409,7 +1264,6 @@ function MainApp() {
             }
           }}
           onSaveLocal={(template) => handleSaveTemplate(template, { promote: true })}
-          onPublish={isRegistryEnabled() ? handlePublishTemplate : undefined}
           onUndo={handleUndoTemplateEdit}
           canUndo={templateUndoStack.length > 0}
           onRedo={handleRedoTemplateEdit}
@@ -1452,7 +1306,7 @@ function MainApp() {
                       }
                     );
                   } catch (err) {
-                    console.warn("[Typeset] Claude re-detection failed:", err);
+                    console.warn("[Typeset] Gemini re-detection failed:", err);
                     if (err instanceof ClaudeNotConfiguredError) {
                       showToast(err.message, "info");
                       setSettingsOpen(true);
@@ -1468,12 +1322,12 @@ function MainApp() {
                   }
 
                   if (detectedFields.length === 0) {
-                    showToast("Claude found no fields.", "info");
+                    showToast("Gemini found no fields.", "info");
                     return;
                   }
 
                   const fingerprint = await buildPdfFingerprint(bytes, pdfSource.fileName);
-                  const newTemplate = buildTemplateFromClaudeFields(
+                  const newTemplate = buildTemplateFromDetectedFields(
                     detectedFields,
                     pdfSource.fileName,
                     fingerprint

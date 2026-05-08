@@ -3,15 +3,15 @@ import {
   setApiKey,
   hasApiKey,
   clearApiKey,
-  testClaudeConnection,
-  ClaudeNotConfiguredError,
-} from "@/services/claudeClient";
+  testGeminiConnection,
+  GeminiNotConfiguredError,
+} from "@/services/geminiClient";
 import {
   DEFAULT_MODEL,
   MODEL_PRESETS,
   getModelPreference,
   setModelPreference,
-} from "@/services/anthropicSettings";
+} from "@/services/geminiSettings";
 import styles from "./SettingsModal.module.css";
 
 const CUSTOM_OPTION_VALUE = "__custom__";
@@ -117,10 +117,10 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
         setKeyConfigured(true);
         setKeyInput("");
       }
-      await testClaudeConnection(effectiveModel);
+      await testGeminiConnection(effectiveModel);
       setTestStatus({ kind: "ok" });
     } catch (err) {
-      if (err instanceof ClaudeNotConfiguredError) {
+      if (err instanceof GeminiNotConfiguredError) {
         setTestStatus({
           kind: "error",
           message:
@@ -158,16 +158,16 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
 
         <div className={styles.body}>
           <div className={styles.section}>
-            <span className={styles.label}>Anthropic API key</span>
+            <span className={styles.label}>Gemini API key</span>
             <p className={styles.helpText}>
               Stored in your operating system&apos;s secure keychain. Never written to
               disk in plain text. Get a key at{" "}
-              <code>console.anthropic.com</code>.
+              <code>aistudio.google.com/app/apikey</code>.
             </p>
             <input
               type="password"
               className={`${styles.input} ${styles.maskedInput}`}
-              placeholder={keyConfigured ? "•••••••••••••••• (saved)" : "sk-ant-..."}
+              placeholder={keyConfigured ? "•••••••••••••••• (saved)" : "AIza..."}
               value={keyInput}
               onChange={(e) => setKeyInput(e.target.value)}
               autoComplete="off"
@@ -196,7 +196,7 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
               <input
                 type="text"
                 className={styles.input}
-                placeholder="e.g. claude-opus-4-7-20260201"
+                placeholder="e.g. gemini-2.5-pro-preview-06-05"
                 value={customModelId}
                 onChange={(e) => setCustomModelId(e.target.value)}
                 autoComplete="off"

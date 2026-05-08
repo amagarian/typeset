@@ -1,4 +1,4 @@
-mod anthropic;
+mod gemini;
 mod keychain;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -11,13 +11,12 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
         .invoke_handler(tauri::generate_handler![
-            keychain::set_anthropic_key,
-            keychain::get_anthropic_key,
-            keychain::has_anthropic_key,
-            keychain::clear_anthropic_key,
-            anthropic::analyze_pdf_with_claude,
-            anthropic::analyze_pdf_agentic,
-            anthropic::test_anthropic_connection,
+            keychain::set_gemini_key,
+            keychain::get_gemini_key,
+            keychain::has_gemini_key,
+            keychain::clear_gemini_key,
+            gemini::gemini_detect_fields,
+            gemini::gemini_test_connection,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

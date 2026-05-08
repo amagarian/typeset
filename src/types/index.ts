@@ -1,6 +1,6 @@
 /**
  * Typeset type definitions.
- * Local-only template architecture (Claude detection + local fingerprint matching).
+ * Local-only template architecture (Gemini detection + local fingerprint matching).
  */
 
 export type CreditCardType = "visa" | "mastercard" | "discover" | "amex" | "";
@@ -45,6 +45,10 @@ export type TemplateFieldSource =
   | "glyph-checkbox"
   | "acroform"
   | "manual"
+  | "gemini"
+  // Legacy discriminator preserved so templates serialised by older
+  // (Claude-backed) versions still deserialise without migration. New
+  // detections emit "gemini".
   | "claude";
 
 export interface ConfidenceDetails {
@@ -125,18 +129,8 @@ export interface TemplateField {
   contextSnippet?: string;
 }
 
-/**
- * Where a saved template originated. `local-*` values come from the
- * user's own machine; `remote-registry` is a template they installed
- * from the public registry (Supabase). The latter carries a
- * `registryId` on the parent Template so we can re-fetch it / show
- * vote counts / etc.
- */
-export type TemplateRegistrySource =
-  | "local-draft"
-  | "local-override"
-  | "local-verified"
-  | "remote-registry";
+/** Local-only sources after the Supabase registry was retired. */
+export type TemplateRegistrySource = "local-draft" | "local-override" | "local-verified";
 
 export type TemplateStatus = "local-draft" | "local-verified";
 
@@ -159,7 +153,7 @@ export interface TemplateFingerprint {
   fingerprintHash: string;
 }
 
-/** A saved template (local store; may have been installed from the registry) */
+/** A saved template (always local in the new architecture) */
 export interface Template {
   id: string;
   name: string;
@@ -169,14 +163,6 @@ export interface Template {
   fingerprint?: TemplateFingerprint;
   fields: TemplateField[];
   pageCount?: number;
-  /**
-   * Registry primary key, set when this template was installed from the
-   * public registry (or after the user published a local template). Lets
-   * us re-fetch the row to update vote counts, surface a "Re-publish"
-   * affordance for the original publisher, and dedupe browse results
-   * against templates the user already has locally.
-   */
-  registryId?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -194,7 +180,7 @@ export interface ProjectDocument {
   processingMessage?: string;
   /**
    * Live progress fraction (0-1) supplied by the detector. Maps to
-   * Anthropic SSE phases (upload → thinking → tool_executing → writing
+   * Gemini SSE phases (upload → request_sent → streaming
    * → done). The DocumentList progress bar uses this as a hard floor
    * and animates a time-based curve up to it.
    */

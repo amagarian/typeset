@@ -19,7 +19,7 @@ const ESTIMATED_DURATION_MS = 90_000;
 
 function ProcessingRow({ doc, onRemove }: { doc: ProjectDocument; onRemove: (id: string) => void }) {
   // `timeProgress` is the smooth elapsed-time curve (asymptotic to ~95%).
-  // `phaseFloor` is the discrete progress reported by Anthropic's SSE
+  // `phaseFloor` is the discrete progress reported by Gemini's SSE
   // events (uploading → thinking → tool_executing → writing → done).
   // The displayed value is `max(timeProgress, phaseFloor)` so phase
   // events can JUMP the bar forward, while time keeps it crawling
