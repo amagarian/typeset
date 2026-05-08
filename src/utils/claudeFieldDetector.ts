@@ -307,7 +307,7 @@ function buildAgenticSystemPrompt(): string {
     "## RULES",
     "- Coordinates are PDF points, top-left origin (y grows downward). Do NOT recompute them.",
     "- Skip headers, footers, page numbers, instructions, and pre-printed values.",
-    "- Repeat a canonical_field_id only when the form legitimately duplicates it (e.g. signature top AND bottom).",
+    "- IMPORTANT: production paperwork routinely repeats the same logical field across the document — cardholder name often appears in body text AND in the signature block, dates appear at the top AND the bottom, signatures appear top AND bottom, etc. Emit EVERY occurrence as its own field with the SAME canonical_field_id. The downstream filler will fill each occurrence with the same value. Do NOT collapse repeats; do NOT skip later instances because you already emitted an earlier one.",
     "- field_kind: text | multiline | date | signature | boolean-checkbox | checkbox-group.",
     "- Standalone checkboxes: `field_kind: \"boolean-checkbox\"`, `checkbox_value: \"yes\"`.",
     "",
@@ -493,18 +493,20 @@ function mapToTemplateField(
   };
 }
 
+/**
+ * De-duplicate detections by spatial overlap only. Production paperwork
+ * routinely repeats the same canonical field across the document — e.g.
+ * the cardholder's name appears in body text AND in the signature
+ * block, dates appear at top and bottom, signatures appear top and
+ * bottom — and every instance needs to be filled with the same project
+ * value. Earlier versions kept a `usedCanonicalIds` set that dropped
+ * legitimate repeats; we now keep every instance unless two detections
+ * sit on top of each other (within 12pt on the same page, same field
+ * type), which only happens when the model double-tags one location.
+ */
 function dedupeFields(fields: TemplateField[]): TemplateField[] {
   const result: TemplateField[] = [];
-  const usedCanonicalIds = new Set<string>();
-
   for (const field of fields) {
-    if (field.canonicalFieldId) {
-      const def = CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === field.canonicalFieldId);
-      if (!def?.allowDuplicates && usedCanonicalIds.has(field.canonicalFieldId)) {
-        continue;
-      }
-    }
-
     const overlapping = result.find(
       (existing) =>
         existing.pageNumber === field.pageNumber &&
@@ -513,11 +515,7 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
         existing.fieldType === field.fieldType
     );
     if (overlapping) continue;
-
     result.push(field);
-    if (field.canonicalFieldId) {
-      usedCanonicalIds.add(field.canonicalFieldId);
-    }
   }
   return result;
 }
