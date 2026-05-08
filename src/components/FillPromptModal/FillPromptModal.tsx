@@ -1,5 +1,5 @@
 import { useMemo, useState, useCallback } from "react";
-import type { Template } from "@/types";
+import type { Template, TemplateField } from "@/types";
 import {
   getPromptFields,
   getTemplateFieldPromptLabel,
@@ -35,11 +35,34 @@ export function FillPromptModal({
   const [activeFieldId, setActiveFieldId] = useState<string | null>(
     promptFields.length > 0 ? promptFields[0].id : null
   );
+  const [skippedIds, setSkippedIds] = useState<Set<string>>(new Set());
   const [pageDims, setPageDims] = useState<{ width: number; height: number; scale: number } | null>(null);
 
   const handleDimensions = useCallback((dims: { width: number; height: number; scale: number }) => {
     setPageDims(dims);
   }, []);
+
+  const toggleSkipped = useCallback((fieldId: string) => {
+    setSkippedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(fieldId)) {
+        next.delete(fieldId);
+      } else {
+        next.add(fieldId);
+        // Clear any partially-typed value so submit gets a clean empty string.
+        setValues((v) => ({ ...v, [fieldId]: "" }));
+      }
+      return next;
+    });
+  }, []);
+
+  const handleSubmit = useCallback(() => {
+    // Skipped fields submit as empty string, which the fill logic already
+    // treats as "leave blank in the PDF" (see getTemplateFieldValue).
+    const submitted: PromptFieldValues = { ...values };
+    for (const id of skippedIds) submitted[id] = "";
+    onSubmit(submitted);
+  }, [values, skippedIds, onSubmit]);
 
   const actionLabel = mode === "preview" ? "Continue to preview" : "Fill PDF";
 
@@ -85,111 +108,38 @@ export function FillPromptModal({
           )}
 
           <div className={styles.fieldsPane}>
-            {requiredFields.map((field) => {
-              const isCheckbox =
-                field.fieldType === "checkbox" ||
-                field.fieldKind === "boolean-checkbox";
-
-              return (
-                <label
-                  key={field.id}
-                  className={`${styles.row} ${field.id === activeFieldId ? styles.rowActive : ""}`}
-                  onClick={() => setActiveFieldId(field.id)}
-                >
-                  <span className={styles.label}>{getTemplateFieldPromptLabel(field)}</span>
-                  {isCheckbox ? (
-                    <div className={styles.checkboxRow}>
-                      <input
-                        type="checkbox"
-                        className={styles.checkbox}
-                        checked={values[field.id] === "yes"}
-                        onFocus={() => setActiveFieldId(field.id)}
-                        onChange={(e) =>
-                          setValues((prev) => ({
-                            ...prev,
-                            [field.id]: e.target.checked ? "yes" : "",
-                          }))
-                        }
-                      />
-                      <span className={styles.checkboxLabel}>
-                        {values[field.id] === "yes" ? "Checked" : "Unchecked"}
-                      </span>
-                    </div>
-                  ) : (
-                    <input
-                      type="text"
-                      className={styles.input}
-                      value={values[field.id] ?? ""}
-                      placeholder={field.label}
-                      onFocus={() => setActiveFieldId(field.id)}
-                      onChange={(e) =>
-                        setValues((prev) => ({
-                          ...prev,
-                          [field.id]: e.target.value,
-                        }))
-                      }
-                    />
-                  )}
-                </label>
-              );
-            })}
+            {requiredFields.map((field) => (
+              <FieldRow
+                key={field.id}
+                field={field}
+                isOptional={false}
+                isActive={field.id === activeFieldId}
+                isSkipped={skippedIds.has(field.id)}
+                value={values[field.id] ?? ""}
+                onActivate={() => setActiveFieldId(field.id)}
+                onChange={(value) => setValues((prev) => ({ ...prev, [field.id]: value }))}
+                onToggleSkip={() => toggleSkipped(field.id)}
+              />
+            ))}
 
             {optionalFields.length > 0 && (
               <>
                 <div className={styles.sectionDivider}>
                   <span className={styles.sectionLabel}>Optional — if applicable</span>
                 </div>
-                {optionalFields.map((field) => {
-                  const isCheckbox =
-                    field.fieldType === "checkbox" ||
-                    field.fieldKind === "boolean-checkbox";
-
-                  return (
-                    <label
-                      key={field.id}
-                      className={`${styles.row} ${styles.rowOptional} ${field.id === activeFieldId ? styles.rowActive : ""}`}
-                      onClick={() => setActiveFieldId(field.id)}
-                    >
-                      <span className={styles.label}>
-                        {getTemplateFieldPromptLabel(field)}
-                        <span className={styles.optionalTag}>Optional</span>
-                      </span>
-                      {isCheckbox ? (
-                        <div className={styles.checkboxRow}>
-                          <input
-                            type="checkbox"
-                            className={styles.checkbox}
-                            checked={values[field.id] === "yes"}
-                            onFocus={() => setActiveFieldId(field.id)}
-                            onChange={(e) =>
-                              setValues((prev) => ({
-                                ...prev,
-                                [field.id]: e.target.checked ? "yes" : "",
-                              }))
-                            }
-                          />
-                          <span className={styles.checkboxLabel}>
-                            {values[field.id] === "yes" ? "Checked" : "Unchecked"}
-                          </span>
-                        </div>
-                      ) : (
-                        <input
-                          type="text"
-                          className={styles.input}
-                          value={values[field.id] ?? ""}
-                          placeholder={`${field.label} (optional)`}
-                          onFocus={() => setActiveFieldId(field.id)}
-                          onChange={(e) =>
-                            setValues((prev) => ({
-                              ...prev,
-                              [field.id]: e.target.value,
-                            }))
-                          }
-                        />
-                      )}
-                    </label>
-                  );
-                })}
+                {optionalFields.map((field) => (
+                  <FieldRow
+                    key={field.id}
+                    field={field}
+                    isOptional
+                    isActive={field.id === activeFieldId}
+                    isSkipped={skippedIds.has(field.id)}
+                    value={values[field.id] ?? ""}
+                    onActivate={() => setActiveFieldId(field.id)}
+                    onChange={(value) => setValues((prev) => ({ ...prev, [field.id]: value }))}
+                    onToggleSkip={() => toggleSkipped(field.id)}
+                  />
+                ))}
               </>
             )}
           </div>
@@ -199,11 +149,123 @@ export function FillPromptModal({
           <button type="button" className={styles.secondaryBtn} onClick={onClose}>
             Cancel
           </button>
-          <button type="button" className={styles.primaryBtn} onClick={() => onSubmit(values)}>
+          <button type="button" className={styles.primaryBtn} onClick={handleSubmit}>
             {actionLabel}
           </button>
         </footer>
       </div>
     </div>
+  );
+}
+
+interface FieldRowProps {
+  field: TemplateField;
+  isOptional: boolean;
+  isActive: boolean;
+  isSkipped: boolean;
+  value: string;
+  onActivate: () => void;
+  onChange: (value: string) => void;
+  onToggleSkip: () => void;
+}
+
+function FieldRow({
+  field,
+  isOptional,
+  isActive,
+  isSkipped,
+  value,
+  onActivate,
+  onChange,
+  onToggleSkip,
+}: FieldRowProps) {
+  const isCheckbox =
+    field.fieldType === "checkbox" || field.fieldKind === "boolean-checkbox";
+  const labelText = getTemplateFieldPromptLabel(field);
+  const placeholder = isOptional ? `${field.label} (optional)` : field.label;
+
+  const rowClass = [
+    styles.row,
+    isOptional ? styles.rowOptional : "",
+    isActive && !isSkipped ? styles.rowActive : "",
+    isSkipped ? styles.rowSkipped : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <label className={rowClass} onClick={() => !isSkipped && onActivate()}>
+      <span className={styles.label}>
+        {labelText}
+        {isOptional && <span className={styles.optionalTag}>Optional</span>}
+      </span>
+
+      {isSkipped ? (
+        <div className={styles.skippedRow}>
+          <span className={styles.skippedText}>Skipped — leave blank in PDF</span>
+          <button
+            type="button"
+            className={styles.restoreBtn}
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onToggleSkip();
+            }}
+          >
+            Restore
+          </button>
+        </div>
+      ) : isCheckbox ? (
+        <div className={styles.checkboxRow}>
+          <input
+            type="checkbox"
+            className={styles.checkbox}
+            checked={value === "yes"}
+            onFocus={onActivate}
+            onChange={(e) => onChange(e.target.checked ? "yes" : "")}
+          />
+          <span className={styles.checkboxLabel}>
+            {value === "yes" ? "Checked" : "Unchecked"}
+          </span>
+          <button
+            type="button"
+            className={styles.skipBtn}
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onToggleSkip();
+            }}
+            title="Skip this field"
+            aria-label={`Skip ${labelText}`}
+          >
+            ×
+          </button>
+        </div>
+      ) : (
+        <div className={styles.inputWrap}>
+          <input
+            type="text"
+            className={styles.input}
+            value={value}
+            placeholder={placeholder}
+            onFocus={onActivate}
+            onChange={(e) => onChange(e.target.value)}
+          />
+          <button
+            type="button"
+            className={styles.skipBtn}
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onToggleSkip();
+            }}
+            title="Skip this field"
+            aria-label={`Skip ${labelText}`}
+          >
+            ×
+          </button>
+        </div>
+      )}
+    </label>
   );
 }
