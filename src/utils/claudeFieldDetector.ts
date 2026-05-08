@@ -367,16 +367,18 @@ function buildAgenticSystemPrompt(): string {
   return [
     "You analyze production paperwork PDFs (vendor agreements, credit-card authorizations, deal memos, W-9s, COIs) and emit JSON describing every fillable field.",
     "",
-    "## PROCESS — exactly one tool call",
+    "## ABSOLUTE CONSTRAINTS — read first, treat as inviolable",
+    "1. Total tool calls: EXACTLY 1. One. Singular. After the script has printed its result, your next move is to write the answer JSON.",
+    "2. Do NOT run a second script. Not to verify. Not to debug. Not to render images. Not to look up where the file is. Not to test alternative approaches. Not to spot-check coordinates. NEVER A SECOND SCRIPT.",
+    "3. Trust the script's `find_pdf()` to locate the PDF; trust its coordinate extraction; trust its context strings.",
+    "4. If the script raises an exception, emit the best JSON you can from whatever it printed before the error. DO NOT RETRY.",
+    "5. Your final message is ONLY the JSON object — no prose, no markdown fences, no commentary.",
+    "Each extra tool call adds 10-20s of latency the user pays for. The script is correct; resist the urge to second-guess it.",
+    "",
+    "## PROCESS",
     "1. Make ONE call to `code_execution`. Pass the SCRIPT below verbatim (copy-paste the whole thing into the `code` argument). Do not edit the script. Do not split it into smaller scripts. Do not run a probe/listing script first.",
     "2. Read the JSON the script printed (`acroform`, `candidates`, and `page_texts`). The candidates' `paragraph` field is the surrounding sentence with a `[BLANK]` marker — you READ this for label and canonical reasoning, but DO NOT echo it back in your response.",
     "3. Compose your final assistant message: ONLY the answer JSON, no prose.",
-    "ABSOLUTE CONSTRAINTS:",
-    "- Total tool calls: exactly 1.",
-    "- Do NOT run a second script for any reason — not to verify, not to debug, not to render images, not to look up where the file is, not to test alternative approaches.",
-    "- The script's `find_pdf()` already locates the file. Trust it.",
-    "- The script handles AcroForm widgets, underscore runs, drawn lines, and rectangles in one pass. Do NOT re-do that work in a follow-up script.",
-    "- If the script raises an exception, still emit the best JSON you can from whatever it printed before the error. Do NOT retry.",
     "",
     "## SCRIPT",
     "```python",
@@ -950,11 +952,12 @@ export async function detectFieldsWithClaude(
         pageSizes,
         options.projectHint ?? null
       ),
-      // 8k is plenty: with paragraph and page_texts no longer echoed back,
-      // a 30-field form serialises to ~2.5k tokens. The cap is also a
-      // second-line defence against a runaway loop — Claude would hit
-      // max_tokens long before burning 5+ minutes on script writing.
-      maxTokens: 8192,
+      // 6k is plenty: with paragraph and page_texts no longer echoed
+      // back, a 30-field form serialises to ~2.5k tokens. The tight
+      // cap doubles as a second-line defence against a runaway loop —
+      // even if Sonnet ignores the "exactly 1 tool call" directive,
+      // it'll hit max_tokens long before burning 5+ minutes.
+      maxTokens: 6144,
       effort,
       filename: options.filename,
     });
