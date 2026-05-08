@@ -115,6 +115,14 @@ export interface TemplateField {
   optional?: boolean;
   /** Estimated font size (pt) of the nearby label text. */
   estimatedFontSize?: number;
+  /**
+   * Short snippet of the surrounding sentence with `___` standing in for the
+   * blank — e.g. "…charged an additional $ ___ plus a 3.3% fee…". Shown above
+   * the input in the Fill Required Values modal so the user can see the
+   * context they're filling into. Generated at detection time from the
+   * script's row context.
+   */
+  contextSnippet?: string;
 }
 
 /** Local-only sources after the Supabase registry was retired. */

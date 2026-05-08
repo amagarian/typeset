@@ -189,12 +189,16 @@ function FieldRow({
     isOptional ? styles.rowOptional : "",
     isActive && !isSkipped ? styles.rowActive : "",
     isSkipped ? styles.rowSkipped : "",
+    field.contextSnippet ? styles.rowWithSnippet : "",
   ]
     .filter(Boolean)
     .join(" ");
 
   return (
     <label className={rowClass} onClick={() => !isSkipped && onActivate()}>
+      {field.contextSnippet && (
+        <span className={styles.contextSnippet}>{field.contextSnippet}</span>
+      )}
       <span className={styles.label}>
         {labelText}
         {isOptional && <span className={styles.optionalTag}>Optional</span>}

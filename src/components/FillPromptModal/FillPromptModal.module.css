@@ -130,6 +130,19 @@
   background: rgba(230, 126, 34, 0.06);
 }
 
+.contextSnippet {
+  display: block;
+  padding: 8px 16px 0;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--text-muted);
+  font-style: italic;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  pointer-events: none;
+}
+
 .label {
   position: absolute;
   top: 4px;
@@ -140,6 +153,19 @@
   letter-spacing: var(--letter-wide);
   color: var(--text-label);
   pointer-events: none;
+}
+
+/* When a context snippet is shown, push the floating label and the
+   input/checkbox/skipped row down to make room for it. */
+.rowWithSnippet .label {
+  top: 24px;
+}
+.rowWithSnippet .input {
+  padding-top: 38px;
+}
+.rowWithSnippet .checkboxRow,
+.rowWithSnippet .skippedRow {
+  padding-top: 38px;
 }
 
 .inputWrap {

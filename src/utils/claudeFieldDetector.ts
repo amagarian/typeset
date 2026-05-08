@@ -95,10 +95,6 @@ interface RawClaudeResponse {
   page_count?: number;
   form_type?: string;
   fields?: RawClaudeField[];
-  /** Optional pass-through from the script: full text per page, used as a
-   * fallback haystack for canonical-id alias matching when the row's
-   * context/after strings are too short. */
-  page_texts?: string[];
 }
 
 const VALID_CANONICAL_IDS = new Set<string>(
@@ -373,7 +369,7 @@ function buildAgenticSystemPrompt(): string {
     "",
     "## PROCESS — exactly one tool call",
     "1. Make ONE call to `code_execution`. Pass the SCRIPT below verbatim (copy-paste the whole thing into the `code` argument). Do not edit the script. Do not split it into smaller scripts. Do not run a probe/listing script first.",
-    "2. Read the JSON the script printed (`acroform` and `candidates` arrays, plus `page_texts` for context).",
+    "2. Read the JSON the script printed (`acroform`, `candidates`, and `page_texts`). The candidates' `paragraph` field is the surrounding sentence with a `[BLANK]` marker — you READ this for label and canonical reasoning, but DO NOT echo it back in your response.",
     "3. Compose your final assistant message: ONLY the answer JSON, no prose.",
     "ABSOLUTE CONSTRAINTS:",
     "- Total tool calls: exactly 1.",
@@ -440,17 +436,16 @@ function buildAgenticSystemPrompt(): string {
     "",
     "## RULES",
     "- Coordinates are PDF points, top-left origin. DO NOT recompute them. Pass `x`, `y`, `w`, `h` through verbatim from the script (rename `w`→`width`, `h`→`height`).",
-    "- Pass `context`, `after`, and `paragraph` through VERBATIM. Do not paraphrase, do not clean them up.",
+    "- Pass `context` and `after` through VERBATIM (those go into the host's deterministic alias matcher). Do not paraphrase, do not clean them up.",
+    "- DO NOT include `paragraph` or `page_texts` in your response — you READ those for label/canonical reasoning, but echoing them back wastes tokens and slows the user down. The host has already discarded them at parse time.",
     "- Repeat fields are kept: production paperwork routinely repeats the same blank across body text and signature blocks. Emit every occurrence; do not collapse.",
     "- Skip ONLY: headers, footers, page numbers, pre-printed values that obviously aren't fillable.",
-    "- Pass `page_texts` through verbatim as a top-level field of the response.",
     "",
     "## OUTPUT — your final assistant message must be ONLY this JSON object (no markdown fences, no prose):",
     "{",
     "  \"page_count\": number,",
     "  \"form_type\"?: string,",
     "  \"detected_via\"?: \"acroform\" | \"pdfplumber\" | \"mixed\",",
-    "  \"page_texts\": string[],",
     "  \"fields\": Array<{",
     "    canonical_field_id: string | null,",
     "    label: string,                  // 2-5 word semantic descriptor (Title Case)",
@@ -460,13 +455,12 @@ function buildAgenticSystemPrompt(): string {
     "    x: number, y: number, width: number, height: number,",
     "    context: string,                // verbatim from script",
     "    after: string,                  // verbatim from script",
-    "    paragraph: string,              // verbatim from script (with [BLANK] marker)",
     "    checkbox_value?: string | null,",
     "    group_id?: string | null",
     "  }>",
     "}",
     "",
-    "If the script returns no acroform widgets and no candidates: `{ \"page_count\": N, \"page_texts\": [...], \"fields\": [] }`.",
+    "If the script returns no acroform widgets and no candidates: `{ \"page_count\": N, \"fields\": [] }`.",
   ].join("\n");
 }
 
@@ -680,6 +674,30 @@ const TRAILING_PREP_RE = /\s+(on|of|to|for|in|at|by|with|the|a|an)$/i;
 const LEADING_PREP_RE = /^(the|a|an|to|on|for|of|in|at|by|with)\s+/i;
 
 /**
+ * Builds a short, presentable preview of the sentence around the blank,
+ * with `___` standing in for the blank. Used by the Fill modal to show
+ * the user what they're filling into. Truncates to ~8 words on the
+ * left and ~6 on the right and adds ellipses when more text was
+ * available — keeps the snippet compact but informative.
+ */
+function buildContextSnippet(
+  context: string | undefined,
+  after: string | undefined
+): string | undefined {
+  const left = (context ?? "").trim();
+  const right = (after ?? "").trim();
+  if (!left && !right) return undefined;
+  const leftWords = left.split(/\s+/).filter(Boolean);
+  const rightWords = right.split(/\s+/).filter(Boolean);
+  const leftKeep = leftWords.slice(-8).join(" ");
+  const rightKeep = rightWords.slice(0, 6).join(" ");
+  const leftEllipsis = leftWords.length > 8 ? "…" : "";
+  const rightEllipsis = rightWords.length > 6 ? "…" : "";
+  const snippet = `${leftEllipsis}${leftKeep} ___ ${rightKeep}${rightEllipsis}`.trim();
+  return snippet.length > 0 ? snippet : undefined;
+}
+
+/**
  * Cleans up a raw context string into a presentable label.
  * - Strips trailing punctuation
  * - Drops leading and trailing prepositions ("my booking at Beam Studios on" → "my booking at Beam Studios")
@@ -815,6 +833,7 @@ function mapToTemplateField(
     promptLabel: isBooleanCheckbox || isUnmappedText ? fieldLabel : undefined,
     optional: raw.optional ?? undefined,
     estimatedFontSize,
+    contextSnippet: buildContextSnippet(raw.context, raw.after),
   };
 }
 
@@ -931,11 +950,11 @@ export async function detectFieldsWithClaude(
         pageSizes,
         options.projectHint ?? null
       ),
-      // 12k is plenty: a 30-field form serialises to ~4k tokens. A tight cap
-      // is the second line of defence against a runaway loop — even if
-      // Claude ignored the "one script" directive, it would hit max_tokens
-      // long before burning 5+ minutes on script writing.
-      maxTokens: 12288,
+      // 8k is plenty: with paragraph and page_texts no longer echoed back,
+      // a 30-field form serialises to ~2.5k tokens. The cap is also a
+      // second-line defence against a runaway loop — Claude would hit
+      // max_tokens long before burning 5+ minutes on script writing.
+      maxTokens: 8192,
       effort,
       filename: options.filename,
     });
