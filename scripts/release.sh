@@ -4,6 +4,14 @@
 # otherwise), wraps it for the Tauri auto-updater, and publishes a tagged
 # release on GitHub via the gh CLI.
 #
+# We deliberately build into /tmp (via CARGO_TARGET_DIR) instead of the
+# in-tree `src-tauri/target` directory because the project lives under
+# ~/Desktop, which on most modern Macs is iCloud-synced. iCloud Drive
+# continuously re-stamps files inside synced folders with metadata xattrs
+# (`com.apple.FinderInfo`, `com.apple.metadata:_kMDItemUserTags`, etc.),
+# which `codesign --verify --strict` refuses to ignore. Moving the bundle
+# out of iCloud's reach makes signing deterministic.
+#
 # Prerequisites (one-time):
 #   1. Tauri minisign signing key at ~/.tauri/typeset.key (no password):
 #        npx tauri signer generate -p "" -w ~/.tauri/typeset.key
@@ -16,11 +24,8 @@
 #
 # Per-release steps:
 #   - Bump `version` in src-tauri/tauri.conf.json + package.json + run
-#     `npm install --package-lock-only` to update the lockfile.
+#     `npm install --package-lock-only` to update the lockfile, commit, push.
 #   - Run this script: `bash scripts/release.sh`
-#
-# The script tags off the version string in tauri.conf.json — make sure
-# you've committed the version bump so the tag points at a real commit.
 
 set -euo pipefail
 
@@ -36,7 +41,17 @@ TAG="v${VERSION}"
 
 echo "==> Releasing TYPESET ${TAG}"
 
-# --- Tauri updater signing key ---
+# --- Out-of-iCloud build location ---------------------------------------
+# Anything under /tmp is on a tmpfs/local volume and not synced anywhere,
+# so xattrs and resource forks don't get re-added by iCloud or Spotlight
+# between codesign passes.
+BUILD_DIR="/tmp/typeset-build-$$"
+SIGN_STAGE="/tmp/typeset-sign-$$"
+mkdir -p "$BUILD_DIR" "$SIGN_STAGE"
+trap 'rm -rf "$BUILD_DIR" "$SIGN_STAGE"' EXIT
+export CARGO_TARGET_DIR="$BUILD_DIR"
+
+# --- Tauri updater signing key ------------------------------------------
 if [ ! -f "$KEY_PATH" ]; then
   echo "ERROR: Tauri signing key not found at $KEY_PATH"
   echo "Generate one with: npx tauri signer generate -p '' -w $KEY_PATH"
@@ -49,7 +64,7 @@ export TAURI_SIGNING_PRIVATE_KEY
 TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY_PATH")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
 
-# --- Apple code-signing identity (auto-detected) ---
+# --- Apple code-signing identity (auto-detected) ------------------------
 # Override with `TYPESET_APPLE_SIGNING_IDENTITY="..."` when you want to force
 # a specific identity (e.g. on a CI runner with multiple certs installed).
 APPLE_SIGNING_IDENTITY="${TYPESET_APPLE_SIGNING_IDENTITY:-}"
@@ -66,51 +81,73 @@ if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
   CODESIGN_TARGET="$APPLE_SIGNING_IDENTITY"
 else
   echo "==> No 'Developer ID Application' cert found — using ad-hoc signing."
-  echo "    The app will install on your Mac (right-click → Open the first time"
-  echo "    to clear Gatekeeper) but isn't distributable to other Macs without"
-  echo "    a Developer ID + notarization."
   CODESIGN_TARGET="-"
 fi
 
-# Eject any stale DMG volumes from prior runs
-for vol in /Volumes/dmg.*; do
+# Eject any stale DMG volumes from prior runs.
+for vol in /Volumes/dmg.* /Volumes/TYPESET; do
   [ -d "$vol" ] && hdiutil detach "$vol" 2>/dev/null || true
 done
 
-echo "==> Building (npx tauri build)…"
+echo "==> Building (npx tauri build, output -> $BUILD_DIR)…"
 env -u CI npx tauri build
 
-BUNDLE_DIR="$PROJECT_DIR/src-tauri/target/release/bundle"
-APP_DIR="$BUNDLE_DIR/macos/TYPESET.app"
-DMG="$BUNDLE_DIR/dmg/TYPESET_${VERSION}_aarch64.dmg"
+BUNDLE_DIR="$BUILD_DIR/release/bundle"
+RAW_APP="$BUNDLE_DIR/macos/TYPESET.app"
 
-if [ ! -d "$APP_DIR" ]; then
-  echo "ERROR: TYPESET.app not found at $APP_DIR"
+if [ ! -d "$RAW_APP" ]; then
+  echo "ERROR: TYPESET.app not found at $RAW_APP"
   exit 1
 fi
 
-echo "==> Stripping macOS extended attributes & signing…"
-# `xattr -cr` clears every extended attribute recursively. tauri's bundler
-# leaves provenance xattrs that break codesign, so this scrub is required.
-xattr -cr "$APP_DIR"
-codesign --force --deep --sign "$CODESIGN_TARGET" "$APP_DIR"
-codesign --verify --deep --strict --verbose=2 "$APP_DIR" || {
-  echo "ERROR: codesign verify failed."
-  exit 1
-}
+# --- Sign the .app in /tmp ----------------------------------------------
+# `ditto --noextattr --noacl --norsrc` copies the bundle without any
+# extended attributes, ACLs, or resource forks. Even though the source is
+# already in /tmp this is a belt-and-suspenders move.
+echo "==> Code-signing in $SIGN_STAGE…"
+SIGNED_APP="$SIGN_STAGE/TYPESET.app"
+ditto --noextattr --noacl --norsrc "$RAW_APP" "$SIGNED_APP"
+xattr -cr "$SIGNED_APP"
+codesign --force --deep --options runtime --sign "$CODESIGN_TARGET" "$SIGNED_APP"
+codesign --verify --deep --strict --verbose=2 "$SIGNED_APP" 2>&1 | tail -5
 echo "==> Code-signing OK"
 
-# Recreate the updater tar.gz from the freshly signed app
-echo "==> Creating updater archive…"
-cd "$BUNDLE_DIR/macos"
-COPYFILE_DISABLE=1 tar czf TYPESET.app.tar.gz TYPESET.app
-cd "$PROJECT_DIR"
+# --- Recreate the DMG with the signed app -------------------------------
+# Tauri's bundle_dmg.sh ran during `tauri build` and produced an unsigned
+# DMG (because tauri.conf.json has signingIdentity = null). We replace it
+# with a fresh DMG built from the signed app, plus a /Applications shortcut
+# so users can drag-install.
+DMG_STAGE="/tmp/typeset-dmg-$$"
+mkdir -p "$DMG_STAGE"
+ditto --noextattr --noacl --norsrc "$SIGNED_APP" "$DMG_STAGE/TYPESET.app"
+ln -s /Applications "$DMG_STAGE/Applications"
 
-# Tauri-sign the updater archive (produces .sig alongside)
-npx tauri signer sign "$BUNDLE_DIR/macos/TYPESET.app.tar.gz"
+DMG="$BUNDLE_DIR/dmg/TYPESET_${VERSION}_aarch64.dmg"
+mkdir -p "$(dirname "$DMG")"
+rm -f "$DMG"
+echo "==> Building DMG with signed app…"
+hdiutil create \
+  -volname "TYPESET" \
+  -srcfolder "$DMG_STAGE" \
+  -fs HFS+ \
+  -format UDZO \
+  -ov \
+  "$DMG" >/dev/null
+rm -rf "$DMG_STAGE"
 
+# --- Updater archive (signed app, tar.gz, then minisign signature) ------
+echo "==> Creating updater archive from signed app…"
 APP_TAR_GZ="$BUNDLE_DIR/macos/TYPESET.app.tar.gz"
-APP_SIG="$BUNDLE_DIR/macos/TYPESET.app.tar.gz.sig"
+mkdir -p "$(dirname "$APP_TAR_GZ")"
+# Replace the unsigned .app from the original bundle with the signed one
+# before tarring so the updater payload is signed.
+rm -rf "$RAW_APP"
+ditto --noextattr --noacl --norsrc "$SIGNED_APP" "$RAW_APP"
+( cd "$BUNDLE_DIR/macos" && COPYFILE_DISABLE=1 tar czf TYPESET.app.tar.gz TYPESET.app )
+
+# Tauri-sign the updater archive (produces .sig alongside).
+npx tauri signer sign "$APP_TAR_GZ"
+APP_SIG="${APP_TAR_GZ}.sig"
 
 for f in "$APP_TAR_GZ" "$APP_SIG" "$DMG"; do
   if [ ! -f "$f" ]; then
