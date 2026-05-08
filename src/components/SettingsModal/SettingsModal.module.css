@@ -160,6 +160,50 @@
   line-height: 1.45;
 }
 
+.radioGroup {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 2px;
+}
+
+.radioOption {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 8px 10px;
+  text-align: left;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color 0.15s, background 0.15s;
+}
+
+.radioOption:hover {
+  border-color: var(--border-focus);
+}
+
+.radioOptionActive {
+  background: var(--bg-panel);
+  border-color: var(--text);
+  box-shadow: 0 0 0 1px var(--text) inset;
+}
+
+.radioOptionLabel {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  letter-spacing: var(--letter-normal);
+}
+
+.radioOptionDescription {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
 .footer {
   display: flex;
   justify-content: space-between;

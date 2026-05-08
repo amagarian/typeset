@@ -7,9 +7,14 @@ import {
   ClaudeNotConfiguredError,
 } from "@/services/claudeClient";
 import {
+  DEFAULT_EFFORT,
   DEFAULT_MODEL,
+  EFFORT_PRESETS,
   MODEL_PRESETS,
+  type DetectionEffort,
+  getEffortPreference,
   getModelPreference,
+  setEffortPreference,
   setModelPreference,
 } from "@/services/anthropicSettings";
 import styles from "./SettingsModal.module.css";
@@ -33,6 +38,7 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
   const [keyConfigured, setKeyConfigured] = useState(false);
   const [presetSelection, setPresetSelection] = useState<string>(DEFAULT_MODEL);
   const [customModelId, setCustomModelId] = useState("");
+  const [effort, setEffort] = useState<DetectionEffort>(DEFAULT_EFFORT);
   const [testStatus, setTestStatus] = useState<TestStatus>({ kind: "idle" });
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -55,6 +61,7 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
         setPresetSelection(CUSTOM_OPTION_VALUE);
         setCustomModelId(stored);
       }
+      setEffort(getEffortPreference());
       setTestStatus({ kind: "idle" });
       setSaveError(null);
     })();
@@ -79,6 +86,7 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
         setKeyInput("");
       }
       setModelPreference(effectiveModel);
+      setEffortPreference(effort);
       onSaved?.();
       onClose();
     } catch (err) {
@@ -88,7 +96,7 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
     } finally {
       setSaving(false);
     }
-  }, [keyInput, effectiveModel, onSaved, onClose]);
+  }, [keyInput, effectiveModel, effort, onSaved, onClose]);
 
   const handleClear = useCallback(async () => {
     setSaving(true);
@@ -208,6 +216,37 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
                 {MODEL_PRESETS.find((p) => p.id === presetSelection)?.description}
               </p>
             )}
+          </div>
+
+          <div className={styles.section}>
+            <span className={styles.label}>Detection effort</span>
+            <p className={styles.helpText}>
+              How deeply Claude reasons before writing field coordinates.
+              Balanced matches the depth of Claude.ai&apos;s standalone app.
+              Maximum is 3-5x slower for ~5% more accuracy on novel forms.
+            </p>
+            <div className={styles.radioGroup} role="radiogroup" aria-label="Detection effort">
+              {EFFORT_PRESETS.map((preset) => {
+                const isActive = effort === preset.id;
+                return (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={isActive}
+                    className={`${styles.radioOption} ${
+                      isActive ? styles.radioOptionActive : ""
+                    }`}
+                    onClick={() => setEffort(preset.id)}
+                  >
+                    <span className={styles.radioOptionLabel}>{preset.label}</span>
+                    <span className={styles.radioOptionDescription}>
+                      {preset.description}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           <div className={styles.section}>

@@ -15,7 +15,7 @@ import {
   type AgenticProgress,
   type ClaudeEffort,
 } from "@/services/claudeClient";
-import { getModelPreference } from "@/services/anthropicSettings";
+import { effectiveEffort, getModelPreference } from "@/services/anthropicSettings";
 import { CANONICAL_FIELD_DEFINITIONS } from "@/utils/fieldCatalog";
 import { normalizeCardType } from "@/utils/fill";
 
@@ -112,21 +112,17 @@ const CREDIT_CARD_CHECKBOX_IDS = new Set<CanonicalFieldId>([
 ]);
 
 /**
- * Picks an adaptive-thinking effort level for a given model.
+ * Picks an adaptive-thinking effort level for a given model, honoring
+ * the user's `Detection effort` preference from Settings.
  *
- * - Opus 4.7 supports the new `xhigh` tier — strongest spatial reasoning.
- * - Opus 4.6 / Sonnet 4.6 cap out at `high`.
- * - Haiku doesn't support adaptive thinking at all → return undefined to
- *   omit the `thinking` / `output_config` parameters entirely.
+ * - Haiku doesn't support adaptive thinking → undefined to omit the
+ *   `thinking` / `output_config` parameters entirely.
+ * - All other models: use the persisted preference, capped to model
+ *   capabilities (xhigh → high on non-Opus-4.7).
  */
 function effortForModel(model: string): ClaudeEffort | undefined {
-  const lower = model.toLowerCase();
-  if (lower.includes("haiku")) return undefined;
-  if (lower.includes("opus-4-7") || lower.includes("opus_4_7")) return "xhigh";
-  if (lower.includes("opus")) return "high";
-  if (lower.includes("sonnet")) return "high";
-  // Unknown / custom: be conservative.
-  return "high";
+  if (model.toLowerCase().includes("haiku")) return undefined;
+  return effectiveEffort(model);
 }
 
 async function getPageSizes(pdfBytes: Uint8Array): Promise<PdfPageSize[]> {
