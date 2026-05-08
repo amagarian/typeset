@@ -6,25 +6,23 @@ import { getTemplateFieldValue, normalizeCardType } from "@/utils/fill";
 import styles from "./TemplateReviewModal.module.css";
 
 const PROJECT_KEY_LABELS: Record<string, string> = {
-  label: "Project label",
   jobName: "Job name",
   jobNumber: "Job number",
   poNumber: "PO / Order number",
-  authorizationDate: "Authorization date",
   productionCompany: "Production company",
   billingAddress: "Billing address",
   billingCity: "City",
   billingState: "State",
   billingZipCode: "Zip code",
-  producer: "Producer",
+  creditCardHolder: "Name",
   email: "Email",
   phone: "Phone",
-  creditCardHolder: "Cardholder name",
   creditCardType: "Credit card type",
   creditCardNumber: "Card number",
   expDate: "Exp date",
-  ccv: "CCV / Security code",
+  ccv: "CCV",
   cardholderSignature: "Signature",
+  authorizationDate: "Authorization date",
 };
 
 const CHECKBOX_VALUE_LABELS: Record<string, string> = {
