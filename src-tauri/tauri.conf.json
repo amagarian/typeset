@@ -1,6 +1,6 @@
 {
-  "productName": "TYPESET",
-  "version": "0.3.0",
+  "productName": "Typeset",
+  "version": "0.3.1",
   "identifier": "com.typeset.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -12,7 +12,7 @@
     "withGlobalTauri": false,
     "windows": [
       {
-        "title": "TYPESET",
+        "title": "Typeset",
         "width": 1200,
         "height": 800,
         "minWidth": 800,

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Builds TYPESET, code-signs the .app (Developer ID if available, ad-hoc
+# Builds Typeset, code-signs the .app (Developer ID if available, ad-hoc
 # otherwise), wraps it for the Tauri auto-updater, and publishes a tagged
 # release on GitHub via the gh CLI.
 #
@@ -39,7 +39,7 @@ cd "$PROJECT_DIR"
 VERSION=$(python3 -c "import json; print(json.load(open('src-tauri/tauri.conf.json'))['version'])")
 TAG="v${VERSION}"
 
-echo "==> Releasing TYPESET ${TAG}"
+echo "==> Releasing Typeset ${TAG}"
 
 # --- Out-of-iCloud build location ---------------------------------------
 # Anything under /tmp is on a tmpfs/local volume and not synced anywhere,
@@ -84,19 +84,23 @@ else
   CODESIGN_TARGET="-"
 fi
 
-# Eject any stale DMG volumes from prior runs.
-for vol in /Volumes/dmg.* /Volumes/TYPESET; do
+# Eject any stale DMG volumes from prior runs (cover both the new
+# 'Typeset' volume name and the legacy 'TYPESET' from <= v0.3.0).
+for vol in /Volumes/dmg.* /Volumes/Typeset /Volumes/TYPESET; do
   [ -d "$vol" ] && hdiutil detach "$vol" 2>/dev/null || true
 done
 
-echo "==> Building (npx tauri build, output -> $BUILD_DIR)…"
-env -u CI npx tauri build
+# `--bundles app` skips Tauri's bundle_dmg.sh, which is fragile on recent
+# macOS (AppleScript / Finder automation in non-interactive shells fails
+# with exit 1). We rebuild the DMG ourselves with hdiutil below.
+echo "==> Building (npx tauri build --bundles app, output -> $BUILD_DIR)..."
+env -u CI npx tauri build --bundles app
 
 BUNDLE_DIR="$BUILD_DIR/release/bundle"
-RAW_APP="$BUNDLE_DIR/macos/TYPESET.app"
+RAW_APP="$BUNDLE_DIR/macos/Typeset.app"
 
 if [ ! -d "$RAW_APP" ]; then
-  echo "ERROR: TYPESET.app not found at $RAW_APP"
+  echo "ERROR: Typeset.app not found at $RAW_APP"
   exit 1
 fi
 
@@ -104,30 +108,29 @@ fi
 # `ditto --noextattr --noacl --norsrc` copies the bundle without any
 # extended attributes, ACLs, or resource forks. Even though the source is
 # already in /tmp this is a belt-and-suspenders move.
-echo "==> Code-signing in $SIGN_STAGE…"
-SIGNED_APP="$SIGN_STAGE/TYPESET.app"
+echo "==> Code-signing in $SIGN_STAGE..."
+SIGNED_APP="$SIGN_STAGE/Typeset.app"
 ditto --noextattr --noacl --norsrc "$RAW_APP" "$SIGNED_APP"
 xattr -cr "$SIGNED_APP"
 codesign --force --deep --options runtime --sign "$CODESIGN_TARGET" "$SIGNED_APP"
 codesign --verify --deep --strict --verbose=2 "$SIGNED_APP" 2>&1 | tail -5
 echo "==> Code-signing OK"
 
-# --- Recreate the DMG with the signed app -------------------------------
-# Tauri's bundle_dmg.sh ran during `tauri build` and produced an unsigned
-# DMG (because tauri.conf.json has signingIdentity = null). We replace it
-# with a fresh DMG built from the signed app, plus a /Applications shortcut
-# so users can drag-install.
+# --- Build the DMG with the signed app ----------------------------------
+# Tauri's own bundle_dmg.sh is skipped via --bundles app above (it breaks
+# on Sequoia+ in non-interactive shells). We assemble a clean DMG here from
+# the signed app plus an /Applications shortcut so users can drag-install.
 DMG_STAGE="/tmp/typeset-dmg-$$"
 mkdir -p "$DMG_STAGE"
-ditto --noextattr --noacl --norsrc "$SIGNED_APP" "$DMG_STAGE/TYPESET.app"
+ditto --noextattr --noacl --norsrc "$SIGNED_APP" "$DMG_STAGE/Typeset.app"
 ln -s /Applications "$DMG_STAGE/Applications"
 
-DMG="$BUNDLE_DIR/dmg/TYPESET_${VERSION}_aarch64.dmg"
+DMG="$BUNDLE_DIR/dmg/Typeset_${VERSION}_aarch64.dmg"
 mkdir -p "$(dirname "$DMG")"
 rm -f "$DMG"
-echo "==> Building DMG with signed app…"
+echo "==> Building DMG with signed app..."
 hdiutil create \
-  -volname "TYPESET" \
+  -volname "Typeset" \
   -srcfolder "$DMG_STAGE" \
   -fs HFS+ \
   -format UDZO \
@@ -136,14 +139,14 @@ hdiutil create \
 rm -rf "$DMG_STAGE"
 
 # --- Updater archive (signed app, tar.gz, then minisign signature) ------
-echo "==> Creating updater archive from signed app…"
-APP_TAR_GZ="$BUNDLE_DIR/macos/TYPESET.app.tar.gz"
+echo "==> Creating updater archive from signed app..."
+APP_TAR_GZ="$BUNDLE_DIR/macos/Typeset.app.tar.gz"
 mkdir -p "$(dirname "$APP_TAR_GZ")"
 # Replace the unsigned .app from the original bundle with the signed one
 # before tarring so the updater payload is signed.
 rm -rf "$RAW_APP"
 ditto --noextattr --noacl --norsrc "$SIGNED_APP" "$RAW_APP"
-( cd "$BUNDLE_DIR/macos" && COPYFILE_DISABLE=1 tar czf TYPESET.app.tar.gz TYPESET.app )
+( cd "$BUNDLE_DIR/macos" && COPYFILE_DISABLE=1 tar czf Typeset.app.tar.gz Typeset.app )
 
 # Tauri-sign the updater archive (produces .sig alongside).
 npx tauri signer sign "$APP_TAR_GZ"
@@ -164,16 +167,16 @@ NOW=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
 cat > /tmp/latest.json <<ENDJSON
 {
   "version": "${VERSION}",
-  "notes": "TYPESET ${TAG}",
+  "notes": "Typeset ${TAG}",
   "pub_date": "${NOW}",
   "platforms": {
     "darwin-aarch64": {
       "signature": "${SIGNATURE}",
-      "url": "https://github.com/${REPO}/releases/download/${TAG}/TYPESET.app.tar.gz"
+      "url": "https://github.com/${REPO}/releases/download/${TAG}/Typeset.app.tar.gz"
     },
     "darwin-x86_64": {
       "signature": "${SIGNATURE}",
-      "url": "https://github.com/${REPO}/releases/download/${TAG}/TYPESET.app.tar.gz"
+      "url": "https://github.com/${REPO}/releases/download/${TAG}/Typeset.app.tar.gz"
     }
   }
 }
@@ -182,21 +185,21 @@ ENDJSON
 echo "==> Created latest.json"
 cat /tmp/latest.json
 
-cp "$DMG" /tmp/TYPESET.dmg
+cp "$DMG" /tmp/Typeset.dmg
 
-echo "==> Creating GitHub release ${TAG}…"
+echo "==> Creating GitHub release ${TAG}..."
 gh release create "$TAG" \
   --repo "$REPO" \
-  --title "TYPESET ${TAG}" \
-  --notes "TYPESET ${TAG}" \
+  --title "Typeset ${TAG}" \
+  --notes "Typeset ${TAG}" \
   "$APP_TAR_GZ" \
   "$APP_SIG" \
   /tmp/latest.json \
-  /tmp/TYPESET.dmg
+  /tmp/Typeset.dmg
 
-cp /tmp/TYPESET.dmg ~/Desktop/TYPESET.dmg
+cp /tmp/Typeset.dmg ~/Desktop/Typeset.dmg
 
 echo ""
 echo "==> Release ${TAG} published!"
 echo "    https://github.com/${REPO}/releases/tag/${TAG}"
-echo "    DMG copied to ~/Desktop/TYPESET.dmg"
+echo "    DMG copied to ~/Desktop/Typeset.dmg"

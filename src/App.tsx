@@ -214,7 +214,7 @@ function MainApp() {
       label: p.label || p.jobName || "Untitled",
     }));
     void initTray(projectList).catch((err) =>
-      console.warn("[TYPESET] Tray init failed (expected in browser):", err)
+      console.warn("[Typeset] Tray init failed (expected in browser):", err)
     );
   }, []);
 
@@ -443,7 +443,7 @@ function MainApp() {
           filename: file.name,
         });
       } catch (err) {
-        console.warn("[TYPESET] Claude detection failed:", err);
+        console.warn("[Typeset] Claude detection failed:", err);
         if (err instanceof ClaudeNotConfiguredError) {
           if (!options.silentToasts) {
             showToast(err.message, "info");
@@ -1304,7 +1304,7 @@ function MainApp() {
                       }
                     );
                   } catch (err) {
-                    console.warn("[TYPESET] Claude re-detection failed:", err);
+                    console.warn("[Typeset] Claude re-detection failed:", err);
                     if (err instanceof ClaudeNotConfiguredError) {
                       showToast(err.message, "info");
                       setSettingsOpen(true);

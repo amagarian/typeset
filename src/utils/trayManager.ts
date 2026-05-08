@@ -45,7 +45,7 @@ export async function initTray(
     id: "typeset-tray",
     icon,
     iconAsTemplate: true,
-    tooltip: "TYPESET — Drop PDFs",
+    tooltip: "Typeset — Drop PDFs",
     showMenuOnLeftClick: false,
     action: (event) => {
       if (

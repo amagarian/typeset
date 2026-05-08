@@ -1,5 +1,5 @@
 /**
- * TYPESET type definitions.
+ * Typeset type definitions.
  * Local-only template architecture (Claude detection + local fingerprint matching).
  */
 

@@ -463,13 +463,13 @@ export async function detectFieldsWithClaude(
   );
 
   console.log(
-    `[TYPESET Claude] model=${model} thinking=${result.thinkingMode} stop=${result.stopReason} tool_calls=${toolCallCount} file_id=${result.fileId} usage=${JSON.stringify(result.usage)}`
+    `[Typeset Claude] model=${model} thinking=${result.thinkingMode} stop=${result.stopReason} tool_calls=${toolCallCount} file_id=${result.fileId} usage=${JSON.stringify(result.usage)}`
   );
 
   const parsed = parseClaudeJson(result.text);
   const rawFields = Array.isArray(parsed.fields) ? parsed.fields : [];
   if (rawFields.length === 0) {
-    console.warn("[TYPESET Claude] No fields returned by Claude.");
+    console.warn("[Typeset Claude] No fields returned by Claude.");
     return [];
   }
 
@@ -479,7 +479,7 @@ export async function detectFieldsWithClaude(
 
   const deduped = dedupeFields(templateFields);
   console.log(
-    `[TYPESET Claude] Produced ${deduped.length} field(s) from ${rawFields.length} raw entries (detected_via=${parsed.form_type ?? "unknown"}).`
+    `[Typeset Claude] Produced ${deduped.length} field(s) from ${rawFields.length} raw entries (detected_via=${parsed.form_type ?? "unknown"}).`
   );
   return deduped;
 }

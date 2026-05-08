@@ -42,10 +42,10 @@ export function migrateLegacyStorage(): void {
 
     if (migratedCount > 0) {
       console.log(
-        `[TYPESET] Migrated ${migratedCount} legacy wrapkit.* localStorage key(s) to typeset.*`
+        `[Typeset] Migrated ${migratedCount} legacy wrapkit.* localStorage key(s) to typeset.*`
       );
     }
   } catch (error) {
-    console.warn("[TYPESET] Storage migration failed:", error);
+    console.warn("[Typeset] Storage migration failed:", error);
   }
 }

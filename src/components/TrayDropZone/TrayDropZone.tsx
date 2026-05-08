@@ -102,7 +102,7 @@ export function TrayDropZone() {
         }
         if (granted) {
           sendNotification({
-            title: "TYPESET",
+            title: "Typeset",
             body: `${file.name} added to ${selectedProject.label}`,
           });
         }

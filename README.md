@@ -1,4 +1,4 @@
-# TYPESET
+# Typeset
 
 Desktop app for film and production: auto-fill production PDFs using project-level source data and Anthropic Claude for first-time field detection. Once a form is reviewed, the local template fingerprint match short-circuits future drops — no Claude call required.
 
