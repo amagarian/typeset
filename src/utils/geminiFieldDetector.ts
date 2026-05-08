@@ -19,8 +19,18 @@
  *      hard-won accuracy on body-text patterns like
  *      `I, ____, authorize my credit card to be charged...`.
  *
- * The whole call typically completes in 20-30s on a 1-3 page production
- * form (Gemini 2.5 Pro), or 10-15s on Flash. There is no Python
+ * Two-pass mode (v0.4.7+, default = "maximum"):
+ *   When the user picks the "Maximum" accuracy preset, we run a second
+ *   Gemini round-trip after Pass 1 finishes. Pass 2 sees the SAME PDF
+ *   plus a structured dump of every field Pass 1 produced, and returns
+ *   keep/drop/fix corrections per field. The corrections are applied
+ *   deterministically and re-run through `mapToTemplateField` so the
+ *   v0.4.5/v0.4.6 type-guard (CVV-as-checkbox → text) cannot be
+ *   weakened by a Pass-2 mistake. ~12s typical end-to-end on Pro vs.
+ *   ~6s for the single-pass Fast preset.
+ *
+ * Single-pass call typically completes in 5-10s on a 1-3 page production
+ * form (Gemini 3.x Pro). Two-pass adds 4-6s. There is no Python
  * sandbox, no code-execution tool, no thinking-effort knob.
  *
  * Coordinate system contract with Gemini:
@@ -40,7 +50,7 @@ import {
   subscribeGeminiProgress,
   type GeminiProgress,
 } from "@/services/geminiClient";
-import { getModelPreference } from "@/services/geminiSettings";
+import { getAccuracyMode, getModelPreference } from "@/services/geminiSettings";
 import {
   type CanonicalFieldId,
   type Project,
@@ -205,7 +215,7 @@ function buildSystemPrompt(): string {
     "  - `field_type` is `text` or `checkbox`.",
     "  - `field_kind` is one of: text, multiline, date, signature, checkbox-group, boolean-checkbox.",
     "  - `label` is a 2-5 word Title Case description of what belongs in the blank, derived from the surrounding sentence (NOT the literal text after the blank). Example: for `...charged an additional $______ plus a 3.3% fee for my booking...`, the label is `Additional Charge Amount`, not `plus a 3.3% fee`.",
-    "  - `context_before` is up to 8 words IMMEDIATELY before the blank on the same row.",
+    "  - `context_before` is up to 8 words IMMEDIATELY before the blank on the same row, AND it MUST include the printed label that precedes the writable area on the same scan line (e.g. for the `CVV2: ___ (3 digit number on back of Visa/MC, 4 digits on front of AMEX)` row, context_before MUST contain `CVV2`). If the row has no on-line label and the context comes from the surrounding sentence, include the closest preceding semantically meaningful tokens. NEVER return an empty string for context_before; if you cannot identify any preceding text, omit the field instead.",
     "  - `context_after` is up to 8 words IMMEDIATELY after the blank on the same row.",
     "  - `checkbox_value` is the literal label text next to the checkbox (e.g. `Visa`, `Mastercard`, `Yes`).",
     "",
@@ -584,10 +594,33 @@ function bboxToPdfRect(
   };
 }
 
+/**
+ * Convert a PDF user-space rect back into Gemini's normalized
+ * `[y_min, x_min, y_max, x_max]` (0-1000) coordinate system. Inverse of
+ * {@link bboxToPdfRect}; used by the QC pass so Pass 2 sees the same
+ * coordinate frame Pass 1 produced.
+ */
+function pdfRectToBbox(
+  rect: { x: number; y: number; width: number; height: number },
+  pageSize: PdfPageSize
+): [number, number, number, number] {
+  const norm = (v: number, max: number) =>
+    Math.round(clampNumber((v / Math.max(1, max)) * 1000, 0, 1000));
+  return [
+    norm(rect.y, pageSize.height),
+    norm(rect.x, pageSize.width),
+    norm(rect.y + rect.height, pageSize.height),
+    norm(rect.x + rect.width, pageSize.width),
+  ];
+}
+
 function mapToTemplateField(
   raw: RawGeminiField,
   index: number,
-  pageSizes: PdfPageSize[]
+  pageSizes: PdfPageSize[],
+  /** Optional explicit id — used by the QC pass when re-mapping a fixed
+   *  field so its id stays stable across passes. */
+  explicitId?: string
 ): TemplateField | null {
   if (!raw || typeof raw !== "object") return null;
 
@@ -683,7 +716,7 @@ function mapToTemplateField(
       : undefined;
 
   return {
-    id: `gemini-field-${index}-${Date.now().toString(36)}`,
+    id: explicitId ?? `gemini-field-${index}-${Date.now().toString(36)}`,
     label: fieldLabel,
     mappedProjectKey: mappedKey,
     canonicalFieldId: canonicalId,
@@ -736,8 +769,42 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
 // Streaming progress → user-facing status
 // ---------------------------------------------------------------------------
 
-function progressToStatus(progress: GeminiProgress, elapsedSec: number): string {
+/**
+ * Which Gemini round-trip is currently in flight. Pass 1 is the
+ * existing single-pass detection; Pass 2 is the QC audit. The phase
+ * mapping is the same between the two — only the user-facing labels
+ * and the progress-bar fraction band differ.
+ */
+type DetectionPhase = "pass1" | "qc";
+
+function progressToStatus(
+  progress: GeminiProgress,
+  elapsedSec: number,
+  phase: DetectionPhase
+): string {
   const elapsed = elapsedSec > 0 ? ` (${elapsedSec}s)` : "";
+  if (phase === "qc") {
+    switch (progress.phase) {
+      case "uploading_file":
+        return `Verifying detected fields — uploading PDF${elapsed}…`;
+      case "file_uploaded":
+        return `Verifying detected fields — Gemini is auditing${elapsed}…`;
+      case "request_sent":
+        return `Verifying detected fields${elapsed}…`;
+      case "streaming":
+        return progress.tokens
+          ? `Verifying detected fields (${progress.tokens} tokens)${elapsed}…`
+          : `Verifying detected fields${elapsed}…`;
+      case "done":
+        return `Verification complete${elapsed}.`;
+      case "error":
+        return progress.detail
+          ? `Verification error: ${progress.detail}`
+          : `Verification failed.`;
+      default:
+        return `Verifying${elapsed}…`;
+    }
+  }
   switch (progress.phase) {
     case "uploading_file":
       return `Uploading PDF to Gemini${elapsed}…`;
@@ -761,36 +828,61 @@ function progressToStatus(progress: GeminiProgress, elapsedSec: number): string 
 }
 
 /**
- * Maps a phase to a 0-1 progress fraction. The DocumentList progress
- * bar uses this as a hard floor and animates a time-based curve up to
- * it. Calibrated against measured timings on Gemini 2.5 Pro:
+ * Maps a phase to a 0-1 progress fraction within a band. The
+ * DocumentList progress bar uses this as a hard floor and animates a
+ * time-based curve up to it.
  *
- *   inline-encode (1-3s) → request fire (1-2s) → streaming (15-25s).
- *
- * The streaming phase is interpolated between 0.30 and 0.95 by token
- * count: a typical field map is 800-2000 output tokens.
+ * In single-pass (Fast) mode Pass 1 occupies the full [0, 1] band.
+ * In two-pass (Maximum) mode Pass 1 is squashed into [0, 0.55] and
+ * Pass 2 occupies [0.55, 0.95] (with the final 0.05 reserved for the
+ * deterministic correction-application step).
  */
-function progressToFraction(progress: GeminiProgress): number {
+function progressToFraction(
+  progress: GeminiProgress,
+  phase: DetectionPhase,
+  twoPass: boolean
+): number {
+  // Inner [0, 1] mapping calibrated against measured timings on
+  // Gemini 2.5/3.x Pro: inline-encode (1-3s) → request fire (1-2s) →
+  // streaming (5-25s). Streaming is interpolated by token count
+  // (typical field map / correction set 800-2000 output tokens).
+  let inner = 0;
   switch (progress.phase) {
     case "uploading_file":
-      return 0.05;
+      inner = 0.05;
+      break;
     case "file_uploaded":
-      return 0.15;
+      inner = 0.15;
+      break;
     case "request_sent":
-      return 0.30;
+      inner = 0.3;
+      break;
     case "streaming": {
       const tokens = progress.tokens ?? 0;
       const expected = 1500;
       const ratio = Math.min(1, tokens / expected);
-      return 0.30 + ratio * 0.65;
+      inner = 0.3 + ratio * 0.65;
+      break;
     }
     case "done":
-      return 1.0;
+      inner = 1.0;
+      break;
     case "error":
-      return 1.0;
+      inner = 1.0;
+      break;
     default:
-      return 0.0;
+      inner = 0.0;
   }
+
+  if (!twoPass) return inner;
+
+  if (phase === "pass1") {
+    // Squash Pass 1 into [0, 0.55].
+    return inner * 0.55;
+  }
+  // Pass 2 occupies [0.55, 0.95]. The final 0.05 jump to 1.0 happens
+  // when corrections are applied deterministically.
+  return 0.55 + inner * 0.4;
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +1014,173 @@ export async function detectFieldsWithClaude(
 /** Preferred name going forward — calls into the same implementation. */
 export const detectFieldsWithGeminiPublic = detectFieldsWithClaude;
 
+/**
+ * Run a single Gemini round-trip with streaming progress events. Used
+ * by both Pass 1 (field detection) and Pass 2 (QC audit). Emits
+ * `progressToStatus` / `progressToFraction` values keyed by `phase`
+ * so the renderer can show distinct messages and progress-bar bands
+ * for each pass.
+ */
+async function runGeminiRoundTrip(args: {
+  pdfBytes: Uint8Array;
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+  responseSchema: Record<string, unknown>;
+  maxOutputTokens: number;
+  temperature: number;
+  onStatus?: (status: string, progress?: number) => void;
+  phase: DetectionPhase;
+  twoPass: boolean;
+}): Promise<{
+  text: string;
+  finishReason: string | null;
+  usage: unknown;
+  modelEcho: string;
+}> {
+  const startedAt = Date.now();
+  let lastProgress: GeminiProgress = {
+    phase: "uploading_file",
+    detail: null,
+    tokens: null,
+  };
+  const elapsedSec = () => Math.round((Date.now() - startedAt) / 1000);
+  const pushStatus = () =>
+    args.onStatus?.(
+      progressToStatus(lastProgress, elapsedSec(), args.phase),
+      progressToFraction(lastProgress, args.phase, args.twoPass)
+    );
+
+  pushStatus();
+  const heartbeat = window.setInterval(pushStatus, 1000);
+  const unsubscribe = await subscribeGeminiProgress((progress) => {
+    lastProgress = progress;
+    pushStatus();
+  });
+
+  try {
+    const result = await detectFieldsWithGemini(args.pdfBytes, {
+      model: args.model,
+      systemPrompt: args.systemPrompt,
+      userPrompt: args.userPrompt,
+      responseSchema: args.responseSchema,
+      maxOutputTokens: args.maxOutputTokens,
+      temperature: args.temperature,
+    });
+    return {
+      text: result.text,
+      finishReason: result.finishReason,
+      usage: result.usage,
+      modelEcho: result.model,
+    };
+  } finally {
+    window.clearInterval(heartbeat);
+    unsubscribe();
+  }
+}
+
+/**
+ * Parse a Gemini structured-output response, with the same salvager
+ * fallbacks the original Pass 1 used. Shared by Pass 1 and Pass 2.
+ */
+function parseStructuredResponse<T>(
+  text: string,
+  finishReason: string | null,
+  context: string
+): T {
+  const truncated = finishReason === "MAX_TOKENS";
+  try {
+    return JSON.parse(text) as T;
+  } catch (err) {
+    const salvaged = salvageTruncatedJson(text);
+    if (salvaged) {
+      console.warn(
+        `[Typeset Gemini] Recovered ${context} from truncated/malformed response (finishReason=${finishReason}).`
+      );
+      return salvaged as T;
+    }
+    const hint = truncated
+      ? " The response was truncated by the token limit — try a denser form on Pro instead of Flash, or split the form into fewer pages."
+      : "";
+    throw new GeminiApiError(
+      `Gemini returned non-JSON content during ${context}.${hint} (parse error: ${
+        err instanceof Error ? err.message : String(err)
+      })`
+    );
+  }
+}
+
+interface Pass1Result {
+  fields: TemplateField[];
+  /** Original raw fields keyed by mapped TemplateField id. The QC pass
+   *  uses these to re-map any field whose action is `fix`, so the
+   *  deterministic post-processing (alias matcher, type guard, label
+   *  cleanup) runs on the corrected raw payload exactly the way it did
+   *  for Pass 1. */
+  rawByFieldId: Map<string, RawGeminiField>;
+}
+
+async function runPass1(
+  pdfBytes: Uint8Array,
+  pageSizes: PdfPageSize[],
+  filename: string,
+  model: string,
+  twoPass: boolean,
+  onStatus?: (status: string, progress?: number) => void
+): Promise<Pass1Result> {
+  const result = await runGeminiRoundTrip({
+    pdfBytes,
+    model,
+    systemPrompt: buildSystemPrompt(),
+    userPrompt: buildUserPrompt(pageSizes, filename),
+    responseSchema: RESPONSE_SCHEMA,
+    // Empirical: a typical CCAUTH form with 20-30 fields, each
+    // carrying a ~6-word context snippet + 4-element bbox + canonical
+    // id, runs ~150-220 output tokens per field. Multi-page vendor
+    // packets push past 25 fields. 4096 truncates mid-array on every
+    // dense form (manifests as "Expected ']' " parse errors). 32k
+    // gives ~3-4x headroom against the worst form we've seen and is
+    // well within the 65k output budget on Gemini 2.5/3.x Pro.
+    maxOutputTokens: 32768,
+    temperature: 0.0,
+    onStatus,
+    phase: "pass1",
+    twoPass,
+  });
+
+  console.log(
+    `[Typeset Gemini] pass1 model=${model} stop=${result.finishReason} usage=${JSON.stringify(result.usage)}`
+  );
+
+  const parsed = parseStructuredResponse<RawGeminiResponse>(
+    result.text,
+    result.finishReason,
+    "Pass 1"
+  );
+
+  const rawFields = parsed.fields ?? [];
+  const mapped: TemplateField[] = [];
+  const rawByFieldId = new Map<string, RawGeminiField>();
+  for (let i = 0; i < rawFields.length; i += 1) {
+    const raw = rawFields[i];
+    const field = mapToTemplateField(raw, i, pageSizes);
+    if (field) {
+      mapped.push(field);
+      rawByFieldId.set(field.id, raw);
+    }
+  }
+  const deduped = dedupeFields(mapped);
+
+  // Drop any raw entries whose mapped field got dedup'd away — the QC
+  // pass should only audit fields we actually kept.
+  const keptIds = new Set(deduped.map((f) => f.id));
+  for (const id of rawByFieldId.keys()) {
+    if (!keptIds.has(id)) rawByFieldId.delete(id);
+  }
+
+  return { fields: deduped, rawByFieldId };
+}
+
 async function detectFieldsImpl(
   pdfBytes: Uint8Array,
   onStatus?: (status: string, progress?: number) => void,
@@ -935,96 +1194,414 @@ async function detectFieldsImpl(
   }
 
   const model = getModelPreference();
-  const startedAt = Date.now();
-  let lastProgress: GeminiProgress = {
-    phase: "uploading_file",
-    detail: null,
-    tokens: null,
-  };
-  const elapsedSec = () => Math.round((Date.now() - startedAt) / 1000);
-  const pushStatus = () =>
-    onStatus?.(
-      progressToStatus(lastProgress, elapsedSec()),
-      progressToFraction(lastProgress)
-    );
+  const accuracyMode = getAccuracyMode();
+  const twoPass = accuracyMode === "maximum";
 
-  pushStatus();
-  const heartbeat = window.setInterval(pushStatus, 1000);
-  const unsubscribe = await subscribeGeminiProgress((progress) => {
-    lastProgress = progress;
-    pushStatus();
-  });
+  const pass1 = await runPass1(pdfBytes, pageSizes, filename, model, twoPass, onStatus);
 
-  let result;
-  try {
-    result = await detectFieldsWithGemini(pdfBytes, {
-      model,
-      systemPrompt: buildSystemPrompt(),
-      userPrompt: buildUserPrompt(pageSizes, filename),
-      responseSchema: RESPONSE_SCHEMA,
-      // Empirical: a typical CCAUTH form with 20-30 fields, each
-      // carrying a ~6-word context snippet + 4-element bbox + canonical
-      // id, runs ~150-220 output tokens per field. Multi-page vendor
-      // packets push past 25 fields. 4096 truncates mid-array on every
-      // dense form (manifests as "Expected ']' " parse errors). 32k
-      // gives ~3-4x headroom against the worst form we've seen and is
-      // well within the 65k output budget on Gemini 2.5 Pro.
-      maxOutputTokens: 32768,
-      temperature: 0.0,
-    });
-  } finally {
-    window.clearInterval(heartbeat);
-    unsubscribe();
+  if (!twoPass) {
+    onStatus?.(`Gemini detected ${pass1.fields.length} field(s).`, 1);
+    return pass1.fields;
   }
 
-  onStatus?.("Parsing Gemini response…", 0.97);
-
-  console.log(
-    `[Typeset Gemini] model=${model} stop=${result.finishReason} usage=${JSON.stringify(result.usage)}`
+  // ----- Pass 2: quality-control audit ------------------------------------
+  onStatus?.(
+    `Pass 1 detected ${pass1.fields.length} field(s); starting verification…`,
+    0.55
   );
 
-  // Two failure modes manifest as JSON parse errors here:
-  //   1. `finishReason === "MAX_TOKENS"` — output got cut mid-array,
-  //      leaving e.g. `[{...}, {"label":"X"`. We salvage by closing
-  //      the open structures and surface a louder warning so the user
-  //      knows fields are missing.
-  //   2. The model emitted preamble before the JSON despite
-  //      responseSchema (rare, but happens on Flash). The salvager
-  //      handles this too — it scans for the first `{` and last
-  //      balanced `}` it can find.
-  let parsed: RawGeminiResponse;
-  const truncated = result.finishReason === "MAX_TOKENS";
+  let qcFields: TemplateField[];
   try {
-    parsed = JSON.parse(result.text) as RawGeminiResponse;
+    qcFields = await runQualityControlPass({
+      pdfBytes,
+      pageSizes,
+      filename,
+      model,
+      pass1Fields: pass1.fields,
+      rawByFieldId: pass1.rawByFieldId,
+      onStatus,
+    });
   } catch (err) {
-    const salvaged = salvageTruncatedJson(result.text);
-    if (salvaged) {
-      parsed = salvaged as RawGeminiResponse;
-      console.warn(
-        `[Typeset Gemini] Recovered ${
-          parsed.fields?.length ?? 0
-        } fields from truncated/malformed response (finishReason=${result.finishReason}).`
-      );
+    // Never let a Pass-2 failure regress accuracy below Pass 1. Log the
+    // exception loudly and fall back to Pass-1 output.
+    console.warn(
+      `[Typeset Gemini QC] Verification pass failed; falling back to Pass 1: ${
+        err instanceof Error ? err.message : String(err)
+      }`
+    );
+    onStatus?.(
+      `Verification failed; using Pass 1 results (${pass1.fields.length} field(s)).`,
+      1
+    );
+    return pass1.fields;
+  }
+
+  onStatus?.(
+    `Detection complete — ${qcFields.length} field(s) after verification.`,
+    1
+  );
+  return qcFields;
+}
+
+// ---------------------------------------------------------------------------
+// Quality-control (Pass 2) audit
+// ---------------------------------------------------------------------------
+
+interface AuditFieldDescriptor {
+  id: string;
+  page_number: number;
+  bbox: [number, number, number, number];
+  field_type: "text" | "checkbox";
+  canonical_field_id: string | null;
+  label: string;
+  context_before: string;
+  context_after: string;
+}
+
+interface FieldCorrection {
+  id?: string;
+  action?: string;
+  fixed_bbox?: number[] | null;
+  fixed_field_type?: string | null;
+  fixed_canonical_field_id?: string | null;
+  reason?: string;
+}
+
+interface CorrectionResponse {
+  corrections?: FieldCorrection[];
+}
+
+const QC_RESPONSE_SCHEMA: Record<string, unknown> = {
+  type: "object",
+  required: ["corrections"],
+  properties: {
+    corrections: {
+      type: "array",
+      items: {
+        type: "object",
+        required: ["id", "action"],
+        propertyOrdering: [
+          "id",
+          "action",
+          "fixed_bbox",
+          "fixed_field_type",
+          "fixed_canonical_field_id",
+          "reason",
+        ],
+        properties: {
+          id: { type: "string" },
+          action: { type: "string", enum: ["keep", "drop", "fix"] },
+          fixed_bbox: {
+            type: "array",
+            description:
+              "[y_min, x_min, y_max, x_max], integers in normalized 0-1000 range. Required only when action=fix and the bbox is wrong.",
+            items: { type: "integer", minimum: 0, maximum: 1000 },
+            minItems: 4,
+            maxItems: 4,
+            nullable: true,
+          },
+          fixed_field_type: {
+            type: "string",
+            enum: ["text", "checkbox"],
+            nullable: true,
+          },
+          fixed_canonical_field_id: {
+            type: "string",
+            nullable: true,
+            description:
+              "One of the canonical ids listed in the system prompt, or null. Required only when the field's canonical id is wrong.",
+          },
+          reason: { type: "string" },
+        },
+      },
+    },
+  },
+};
+
+function buildQualityControlSystemPrompt(): string {
+  return [
+    "You are auditing field detection on a PDF form. A previous Gemini pass produced a list of detected fields; for each one, decide whether it is correctly placed and typed given the actual PDF.",
+    "",
+    "Return ONLY a JSON object that conforms to the supplied responseSchema. No prose, no markdown fences.",
+    "",
+    "## Coordinate system",
+    "Bounding boxes use the SAME native Gemini system as Pass 1: `[y_min, x_min, y_max, x_max]` integers in the normalized 0-1000 range, per page. Y-first ordering is mandatory.",
+    "",
+    "## Output shape",
+    "For every input field, emit exactly one entry in `corrections` keyed by its `id`. Use:",
+    "  - `action: \"keep\"` — the field is correct as-is. Set every `fixed_*` to null.",
+    "  - `action: \"drop\"` — there is no writable area at this location, or the field is a duplicate of another. Set every `fixed_*` to null.",
+    "  - `action: \"fix\"` — at least one of the field's properties is wrong. Set ONLY the `fixed_*` properties that need to change; leave the others null.",
+    "",
+    "Always include the original `id` exactly as provided. Never invent new fields and never re-key.",
+    "",
+    "## Audit rules — apply EVERY rule to EVERY field",
+    "",
+    "### 1. Bbox tightness",
+    "The bbox must hug the writable blank only. If a horizontal scan line through your bbox would cross any printed letters of the label, the bbox is wrong — `action: \"fix\"` with a tighter `fixed_bbox` that starts just past the label and covers only empty space (or the drawn underline). If there is no writable area at the location at all, `action: \"drop\"`.",
+    "",
+    "### 2. Type accuracy — CVV / security code is ALWAYS text",
+    "If the surrounding text contains any of: 'CVV', 'CVV2', 'CVC', 'security code', 'verification code', 'card identification', '3 digit', '3-digit', '4 digit', '4-digit', the field MUST be `text` with `canonical_field_id: \"ccv\"` — even if the form draws a small rectangle around it. The 'Visa', 'MC', or 'AMEX' tokens that often appear in CVV instructional text (e.g. '3-digit number on back of Visa/MC, 4 digits on front of AMEX') are NOT card-type checkboxes; they are part of the CVV's instructional sentence. If the input field has any of these properties wrong, `action: \"fix\"` with the corrected values.",
+    "",
+    "### 3. Card-type checkboxes",
+    "A Visa / MasterCard / AMEX / Discover field is a checkbox ONLY when:",
+    "  (a) the box is one of a row of card-type selectors (e.g. `☐ Visa  ☐ MasterCard  ☐ AMEX  ☐ Discover`), AND",
+    "  (b) the printed card name appears IMMEDIATELY to the right of the box on the same horizontal scan line, AND",
+    "  (c) the row context does NOT mention CVV / CVC / security / verification code / 'digit'.",
+    "If those conditions don't hold, the field is not a card-type checkbox. Fix it accordingly.",
+    "",
+    "### 4. Duplicates",
+    "If two fields share the same `canonical_field_id` AND their bboxes overlap by more than 50% of their area, drop the lower-confidence one (`action: \"drop\"`). Different positions on the same form ARE allowed (e.g. two Cardholder Name lines, two date lines) — do NOT drop those.",
+    "",
+    "### 5. Default",
+    "When in doubt and the field looks correct, return `action: \"keep\"` with all `fixed_*` null. Do not churn fields that are already right; you should only `fix` or `drop` when you are confident the input is wrong.",
+    "",
+    "## Canonical field ids",
+    "When you set `fixed_canonical_field_id`, it MUST be one of the ids below or null. Inventing ids breaks the downstream mapping:",
+    buildCatalogSummary(),
+    "",
+    "## `reason`",
+    "One short sentence (≤ 15 words) explaining why you took the chosen action. Used for diagnostic logs.",
+  ].join("\n");
+}
+
+function buildQualityControlUserPrompt(
+  pageSizes: PdfPageSize[],
+  filename: string,
+  fields: AuditFieldDescriptor[]
+): string {
+  return [
+    `Filename: ${filename}`,
+    "Page sizes (PDF user-space points; bbox is normalized 0-1000):",
+    pageSizes
+      .map((p) => `  page ${p.pageNumber}: ${p.width} x ${p.height} pt`)
+      .join("\n"),
+    "",
+    `Pass 1 detected ${fields.length} field(s). Audit each one and return the corrections JSON.`,
+    "",
+    "Detected fields:",
+    JSON.stringify(fields, null, 2),
+  ].join("\n");
+}
+
+/**
+ * Apply a single correction to a Pass-1 field. Re-runs the
+ * `mapToTemplateField` pipeline on the corrected raw payload so the
+ * deterministic post-processing (alias matcher, type guard, label
+ * cleanup) runs identically to Pass 1. Returns null when the field
+ * should be dropped.
+ *
+ * The v0.4.5/v0.4.6 type guard is preserved here by definition: we
+ * patch the raw `field_type` / `canonical_field_id` / `bbox`, then
+ * delegate to `mapToTemplateField`, which still runs the canonical-id
+ * resolver, the type guard ("CVV is always text"), and the dedup-
+ * relevant rect normalization. Pass 2 cannot weaken these protections
+ * because the same code path validates the result.
+ */
+function applyCorrectionToField(
+  field: TemplateField,
+  raw: RawGeminiField,
+  correction: FieldCorrection,
+  index: number,
+  pageSizes: PdfPageSize[]
+): TemplateField | null {
+  const action = (correction.action ?? "keep").toLowerCase();
+  if (action === "drop") return null;
+  if (action !== "fix") return field;
+
+  const patched: RawGeminiField = { ...raw };
+
+  if (Array.isArray(correction.fixed_bbox) && correction.fixed_bbox.length === 4) {
+    patched.bbox = correction.fixed_bbox.slice(0, 4);
+  }
+
+  if (typeof correction.fixed_field_type === "string") {
+    const t = correction.fixed_field_type.toLowerCase();
+    if (t === "text" || t === "checkbox") {
+      patched.field_type = t;
+    }
+  }
+
+  if (typeof correction.fixed_canonical_field_id === "string") {
+    const candidate = correction.fixed_canonical_field_id.trim();
+    if (VALID_CANONICAL_IDS.has(candidate)) {
+      patched.canonical_field_id = candidate;
     } else {
-      const hint = truncated
-        ? " The response was truncated by the token limit — try a denser form on Pro instead of Flash, or split the form into fewer pages."
-        : "";
-      throw new GeminiApiError(
-        `Gemini returned non-JSON content.${hint} (parse error: ${
-          err instanceof Error ? err.message : String(err)
-        })`
+      console.warn(
+        `[Typeset Gemini QC] Ignoring invalid fixed_canonical_field_id "${candidate}" on ${field.id}.`
       );
     }
   }
 
-  const rawFields = parsed.fields ?? [];
-  const mapped: TemplateField[] = [];
-  for (let i = 0; i < rawFields.length; i += 1) {
-    const field = mapToTemplateField(rawFields[i], i, pageSizes);
-    if (field) mapped.push(field);
+  // Re-run the full mapping pipeline on the patched raw. The type
+  // guard inside `mapToTemplateField` still has the final word — e.g.
+  // a fixed_field_type of "checkbox" with canonical_field_id "ccv"
+  // will still be coerced back to "text" because ccv's canonical type
+  // is text.
+  const remapped = mapToTemplateField(patched, index, pageSizes, field.id);
+  return remapped ?? field;
+}
+
+/**
+ * Build the audit-input payload that gets sent to Pass 2. The QC pass
+ * receives the SAME PDF Gemini saw during Pass 1, plus a structured
+ * dump of every Pass-1 field — bbox in normalized coordinates, field
+ * type, canonical id, label, and row context.
+ */
+function buildAuditDescriptors(
+  pass1Fields: TemplateField[],
+  rawByFieldId: Map<string, RawGeminiField>,
+  pageSizes: PdfPageSize[]
+): AuditFieldDescriptor[] {
+  return pass1Fields.map((field) => {
+    const raw = rawByFieldId.get(field.id);
+    const pageSize =
+      pageSizes.find((p) => p.pageNumber === field.pageNumber) ?? pageSizes[0];
+    const bbox = pdfRectToBbox(
+      { x: field.x, y: field.y, width: field.width, height: field.height },
+      pageSize ?? { pageNumber: 1, width: 612, height: 792 }
+    );
+    return {
+      id: field.id,
+      page_number: field.pageNumber,
+      bbox,
+      field_type: (field.fieldType ?? "text") as "text" | "checkbox",
+      canonical_field_id: field.canonicalFieldId ?? null,
+      label: field.label,
+      context_before: (raw?.context_before ?? "").trim(),
+      context_after: (raw?.context_after ?? "").trim(),
+    };
+  });
+}
+
+interface QcArgs {
+  pdfBytes: Uint8Array;
+  pageSizes: PdfPageSize[];
+  filename: string;
+  model: string;
+  pass1Fields: TemplateField[];
+  rawByFieldId: Map<string, RawGeminiField>;
+  onStatus?: (status: string, progress?: number) => void;
+}
+
+async function runQualityControlPass(args: QcArgs): Promise<TemplateField[]> {
+  if (args.pass1Fields.length === 0) return args.pass1Fields;
+
+  const descriptors = buildAuditDescriptors(
+    args.pass1Fields,
+    args.rawByFieldId,
+    args.pageSizes
+  );
+
+  const result = await runGeminiRoundTrip({
+    pdfBytes: args.pdfBytes,
+    model: args.model,
+    systemPrompt: buildQualityControlSystemPrompt(),
+    userPrompt: buildQualityControlUserPrompt(args.pageSizes, args.filename, descriptors),
+    responseSchema: QC_RESPONSE_SCHEMA,
+    // The audit response is much smaller than Pass 1 (one record per
+    // input field, no bbox unless action=fix). 16k is comfortable for
+    // ~150 fields and keeps us well below the model's 65k output cap.
+    maxOutputTokens: 16384,
+    temperature: 0.0,
+    onStatus: args.onStatus,
+    phase: "qc",
+    twoPass: true,
+  });
+
+  console.log(
+    `[Typeset Gemini QC] model=${args.model} stop=${result.finishReason} usage=${JSON.stringify(result.usage)}`
+  );
+
+  const parsed = parseStructuredResponse<CorrectionResponse>(
+    result.text,
+    result.finishReason,
+    "Pass 2 (QC)"
+  );
+
+  const corrections = Array.isArray(parsed.corrections) ? parsed.corrections : [];
+  const correctionsById = new Map<string, FieldCorrection>();
+  for (const c of corrections) {
+    if (typeof c.id === "string") correctionsById.set(c.id, c);
   }
-  const deduped = dedupeFields(mapped);
-  onStatus?.(`Gemini detected ${deduped.length} field(s).`, 1);
+
+  args.onStatus?.("Applying verification corrections…", 0.95);
+
+  const corrected: TemplateField[] = [];
+  let kept = 0;
+  let fixed = 0;
+  let dropped = 0;
+
+  for (let i = 0; i < args.pass1Fields.length; i += 1) {
+    const field = args.pass1Fields[i];
+    const correction = correctionsById.get(field.id);
+    const raw = args.rawByFieldId.get(field.id);
+    if (!correction || !raw) {
+      // Model didn't return a correction for this field (or we don't
+      // have the raw to re-map against) — keep it as-is rather than
+      // silently dropping.
+      corrected.push(field);
+      kept += 1;
+      continue;
+    }
+    const action = (correction.action ?? "keep").toLowerCase();
+    const reason = (correction.reason ?? "").trim();
+
+    if (action === "drop") {
+      console.log(
+        `[Typeset Gemini QC] Dropped ${field.id} (${field.canonicalFieldId ?? "—"}, ${field.label}): ${
+          reason || "no reason given"
+        }`
+      );
+      dropped += 1;
+      continue;
+    }
+
+    if (action === "fix") {
+      const next = applyCorrectionToField(field, raw, correction, i, args.pageSizes);
+      if (!next) {
+        console.log(
+          `[Typeset Gemini QC] Fix → drop ${field.id} (${field.canonicalFieldId ?? "—"}, ${field.label}): ${
+            reason || "fix produced no rect"
+          }`
+        );
+        dropped += 1;
+        continue;
+      }
+      const changedBbox =
+        Math.abs(next.x - field.x) > 0.5 ||
+        Math.abs(next.y - field.y) > 0.5 ||
+        Math.abs(next.width - field.width) > 0.5 ||
+        Math.abs(next.height - field.height) > 0.5;
+      const changedType = next.fieldType !== field.fieldType;
+      const changedCanonical = next.canonicalFieldId !== field.canonicalFieldId;
+      console.log(
+        `[Typeset Gemini QC] Fixed ${field.id} (${field.canonicalFieldId ?? "—"} → ${
+          next.canonicalFieldId ?? "—"
+        }, ${field.fieldType ?? "—"} → ${next.fieldType ?? "—"}, bbox-changed=${changedBbox}): ${
+          reason || "no reason given"
+        }`
+      );
+      if (changedBbox || changedType || changedCanonical) fixed += 1;
+      else kept += 1;
+      corrected.push(next);
+      continue;
+    }
+
+    // Default: keep.
+    corrected.push(field);
+    kept += 1;
+  }
+
+  // Re-run dedup so any newly-overlapping fixed rects collapse the way
+  // Pass 1 would have collapsed them.
+  const deduped = dedupeFields(corrected);
+  const dedupedDropped = corrected.length - deduped.length;
+
+  console.log(
+    `[Typeset Gemini QC] Summary: kept=${kept} fixed=${fixed} dropped=${dropped} dedup-dropped=${dedupedDropped} (input=${args.pass1Fields.length}, output=${deduped.length})`
+  );
+
   return deduped;
 }
 

@@ -7,10 +7,15 @@ import {
   GeminiNotConfiguredError,
 } from "@/services/geminiClient";
 import {
+  ACCURACY_OPTIONS,
+  DEFAULT_ACCURACY_MODE,
   DEFAULT_MODEL,
   MODEL_PRESETS,
+  getAccuracyMode,
   getModelPreference,
+  setAccuracyMode,
   setModelPreference,
+  type AccuracyMode,
 } from "@/services/geminiSettings";
 import styles from "./SettingsModal.module.css";
 
@@ -33,6 +38,8 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
   const [keyConfigured, setKeyConfigured] = useState(false);
   const [presetSelection, setPresetSelection] = useState<string>(DEFAULT_MODEL);
   const [customModelId, setCustomModelId] = useState("");
+  const [accuracySelection, setAccuracySelection] =
+    useState<AccuracyMode>(DEFAULT_ACCURACY_MODE);
   const [testStatus, setTestStatus] = useState<TestStatus>({ kind: "idle" });
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -55,6 +62,7 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
         setPresetSelection(CUSTOM_OPTION_VALUE);
         setCustomModelId(stored);
       }
+      setAccuracySelection(getAccuracyMode());
       setTestStatus({ kind: "idle" });
       setSaveError(null);
     })();
@@ -79,6 +87,7 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
         setKeyInput("");
       }
       setModelPreference(effectiveModel);
+      setAccuracyMode(accuracySelection);
       onSaved?.();
       onClose();
     } catch (err) {
@@ -88,7 +97,7 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
     } finally {
       setSaving(false);
     }
-  }, [keyInput, effectiveModel, onSaved, onClose]);
+  }, [keyInput, effectiveModel, accuracySelection, onSaved, onClose]);
 
   const handleClear = useCallback(async () => {
     setSaving(true);
@@ -208,6 +217,30 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
                 {MODEL_PRESETS.find((p) => p.id === presetSelection)?.description}
               </p>
             )}
+          </div>
+
+          <div className={styles.section}>
+            <span className={styles.label}>Accuracy</span>
+            <div className={styles.radioGroup} role="radiogroup" aria-label="Accuracy mode">
+              {ACCURACY_OPTIONS.map((option) => {
+                const active = accuracySelection === option.id;
+                return (
+                  <button
+                    key={option.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={active}
+                    className={`${styles.radioOption} ${active ? styles.radioOptionActive : ""}`}
+                    onClick={() => setAccuracySelection(option.id)}
+                  >
+                    <span className={styles.radioOptionLabel}>{option.label}</span>
+                    <span className={styles.radioOptionDescription}>
+                      {option.description}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
           <div className={styles.section}>

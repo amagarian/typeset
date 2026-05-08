@@ -6,6 +6,7 @@
  */
 
 const MODEL_PREF_KEY = "typeset.gemini.model.v1";
+const ACCURACY_PREF_KEY = "typeset.gemini.accuracy.v1";
 
 /**
  * Default Gemini model.
@@ -110,7 +111,72 @@ export function clearModelPreference(): void {
   }
 }
 
+/**
+ * Accuracy mode for the Gemini detection pipeline.
+ *
+ * - `"maximum"` runs Pass 1 (existing single-pass detection) followed by
+ *   a second Gemini call that audits Pass 1's output against the same
+ *   PDF and returns keep/drop/fix corrections. ~12s typical, dramatically
+ *   more accurate on dense forms — every misclassification gets a second
+ *   look. Default for new users.
+ * - `"fast"` is the single-pass behaviour (Pass 1 only). ~6s typical.
+ *
+ * The persisted value is exposed only on the renderer side; the Rust
+ * backend doesn't care how many passes the renderer chooses to run.
+ */
+export type AccuracyMode = "maximum" | "fast";
+
+export const DEFAULT_ACCURACY_MODE: AccuracyMode = "maximum";
+
+export interface AccuracyOption {
+  id: AccuracyMode;
+  label: string;
+  description: string;
+}
+
+export const ACCURACY_OPTIONS: AccuracyOption[] = [
+  {
+    id: "maximum",
+    label: "Maximum (recommended)",
+    description:
+      "Runs a verification pass over Pass 1's output to catch misclassified fields, tight bboxes, and stray duplicates. ~12s typical.",
+  },
+  {
+    id: "fast",
+    label: "Fast",
+    description:
+      "Single Gemini round-trip with no audit. ~6s typical — good for batches where speed matters more than catching every edge case.",
+  },
+];
+
+function isAccuracyMode(value: unknown): value is AccuracyMode {
+  return value === "maximum" || value === "fast";
+}
+
+export function getAccuracyMode(): AccuracyMode {
+  if (!canUseStorage()) return DEFAULT_ACCURACY_MODE;
+  try {
+    const raw = window.localStorage.getItem(ACCURACY_PREF_KEY);
+    const value = raw?.trim();
+    if (!value) return DEFAULT_ACCURACY_MODE;
+    if (isAccuracyMode(value)) return value;
+    return DEFAULT_ACCURACY_MODE;
+  } catch {
+    return DEFAULT_ACCURACY_MODE;
+  }
+}
+
+export function setAccuracyMode(mode: AccuracyMode): void {
+  if (!canUseStorage()) return;
+  try {
+    window.localStorage.setItem(ACCURACY_PREF_KEY, mode);
+  } catch (error) {
+    console.warn("Failed to persist accuracy mode", error);
+  }
+}
+
 const MODEL_MIGRATION_FLAG = "typeset.gemini.model.migrated.v2";
+const ACCURACY_MIGRATION_FLAG = "typeset.gemini.accuracy.migrated.v1";
 
 /**
  * Migrate any pre-Gemini model preferences eagerly, plus run a one-
@@ -136,6 +202,30 @@ export function migrateLegacyModelPreference(): void {
       window.localStorage.setItem(MODEL_PREF_KEY, DEFAULT_MODEL);
     }
     window.localStorage.setItem(MODEL_MIGRATION_FLAG, "1");
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Bring users to the new "Maximum" accuracy default introduced in
+ * v0.4.7. Runs once per install — if the user later flips themselves
+ * back to "fast" we don't bounce them back. Idempotent.
+ *
+ * Why opt-in by default? The user accepted the 6s → 12s speed trade for
+ * dramatically better CVV / card-type / bbox-tightness accuracy. Pass 2
+ * catches the misclassifications that the deterministic post-processing
+ * can't reach (because they manifest before our type guards see them).
+ */
+export function migrateLegacyAccuracyPreference(): void {
+  if (!canUseStorage()) return;
+  try {
+    if (window.localStorage.getItem(ACCURACY_MIGRATION_FLAG)) return;
+    const current = window.localStorage.getItem(ACCURACY_PREF_KEY);
+    if (!current) {
+      window.localStorage.setItem(ACCURACY_PREF_KEY, DEFAULT_ACCURACY_MODE);
+    }
+    window.localStorage.setItem(ACCURACY_MIGRATION_FLAG, "1");
   } catch {
     /* ignore */
   }

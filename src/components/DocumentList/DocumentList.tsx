@@ -1,5 +1,6 @@
 import { useState, useEffect } from "react";
 import type { ProjectDocument } from "@/types";
+import { getAccuracyMode } from "@/services/geminiSettings";
 import styles from "./DocumentList.module.css";
 
 interface DocumentListProps {
@@ -11,11 +12,15 @@ interface DocumentListProps {
   onRemove: (docId: string) => void;
 }
 
-// Calibrated against measured timings on Opus 4.7 (~60-90s end-to-end).
-// Sonnet 4.6 runs 200-400s but we still cap the time-based curve at 90s
-// — once the phase floor takes over (tool_executing → writing → done),
-// it drives the bar to completion regardless of clock drift.
-const ESTIMATED_DURATION_MS = 90_000;
+// Calibrated against measured Gemini timings:
+//   - Single-pass (Fast):    5-10s on Pro, ~6s typical → 90s curve.
+//   - Two-pass (Maximum):   10-15s on Pro, ~12s typical → 120s curve.
+// The wider curve on Maximum keeps the time-based bar from sprinting past
+// where the phase-floor actually is during Pass 2. The phase floor (set
+// by `processingProgress` from the detector) still drives final
+// completion regardless of clock drift.
+const ESTIMATED_DURATION_MS_FAST = 90_000;
+const ESTIMATED_DURATION_MS_MAXIMUM = 120_000;
 
 function ProcessingRow({ doc, onRemove }: { doc: ProjectDocument; onRemove: (id: string) => void }) {
   // `timeProgress` is the smooth elapsed-time curve (asymptotic to ~95%).
@@ -29,10 +34,17 @@ function ProcessingRow({ doc, onRemove }: { doc: ProjectDocument; onRemove: (id:
 
   useEffect(() => {
     const startTime = new Date(doc.createdAt).getTime();
+    // Read accuracy mode at row mount; users rarely toggle it mid-run
+    // and a stale value just means a slightly off curve, not a wrong
+    // bar.
+    const duration =
+      getAccuracyMode() === "maximum"
+        ? ESTIMATED_DURATION_MS_MAXIMUM
+        : ESTIMATED_DURATION_MS_FAST;
 
     const tick = () => {
       const elapsed = Date.now() - startTime;
-      const raw = elapsed / ESTIMATED_DURATION_MS;
+      const raw = elapsed / duration;
       // 1 - exp(-2.5) ≈ 0.918 at the estimated duration; cap at 0.95
       // so we never show 100% before the detector actually finishes.
       const pct = Math.min(0.95, 1 - Math.exp(-2.5 * raw));
