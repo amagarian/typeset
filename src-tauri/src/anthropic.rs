@@ -338,16 +338,23 @@ pub async fn analyze_pdf_agentic(
         filename,
     } = request;
 
-    let filename = filename
+    // Always upload as `document.pdf` regardless of the original filename.
+    // Anthropic mounts container_upload files at /mnt/user-data/uploads/<filename>
+    // — using a constant name lets the extraction script use a deterministic
+    // path lookup (`/mnt/user-data/uploads/document.pdf`) instead of having
+    // Claude run probe scripts to discover the filename, which was a major
+    // source of the "endless loop" behaviour in v0.3.7.
+    let display_name = filename
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("document.pdf")
         .to_owned();
+    let upload_filename = "document.pdf";
 
-    emit_progress(&app, "uploading_file", Some(&filename), None, None);
+    emit_progress(&app, "uploading_file", Some(&display_name), None, None);
     let file_id =
-        upload_pdf_to_files_api(&client, &api_key, pdf_bytes, &filename).await?;
+        upload_pdf_to_files_api(&client, &api_key, pdf_bytes, upload_filename).await?;
     emit_progress(&app, "file_uploaded", Some(&file_id), None, None);
 
     let result = run_agentic_messages_streaming(

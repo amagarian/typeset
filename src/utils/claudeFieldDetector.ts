@@ -15,7 +15,7 @@ import {
   type AgenticProgress,
   type ClaudeEffort,
 } from "@/services/claudeClient";
-import { effectiveEffort, getModelPreference } from "@/services/anthropicSettings";
+import { getModelPreference } from "@/services/anthropicSettings";
 import { CANONICAL_FIELD_DEFINITIONS } from "@/utils/fieldCatalog";
 import { normalizeCardType } from "@/utils/fill";
 
@@ -111,20 +111,6 @@ const CREDIT_CARD_CHECKBOX_IDS = new Set<CanonicalFieldId>([
   "creditCardTypeAmex",
 ]);
 
-/**
- * Picks an adaptive-thinking effort level for a given model, honoring
- * the user's `Detection effort` preference from Settings.
- *
- * - Haiku doesn't support adaptive thinking → undefined to omit the
- *   `thinking` / `output_config` parameters entirely.
- * - All other models: use the persisted preference, capped to model
- *   capabilities (xhigh → high on non-Opus-4.7).
- */
-function effortForModel(model: string): ClaudeEffort | undefined {
-  if (model.toLowerCase().includes("haiku")) return undefined;
-  return effectiveEffort(model);
-}
-
 async function getPageSizes(pdfBytes: Uint8Array): Promise<PdfPageSize[]> {
   const bytesCopy = new Uint8Array(pdfBytes);
   const pdf = await pdfjsLib.getDocument({ data: bytesCopy }).promise;
@@ -151,75 +137,203 @@ function buildSchemaSummary(): string {
   }).join("\n");
 }
 
+/**
+ * The complete, deterministic Python script we ask Claude to execute
+ * exactly once via `code_execution`. Prior prompt iterations let Claude
+ * author its own extraction logic, which (with adaptive thinking on)
+ * led to >20-script loops when the model wanted to "improve" its
+ * approach. Shipping a fully-formed script collapses the agent to a
+ * single tool use: run -> read JSON -> compose answer.
+ */
+const EXTRACTION_SCRIPT = `
+import os, glob, json, sys, traceback
+import pypdf
+import pdfplumber
+
+def find_pdf():
+    for pattern in (
+        "/mnt/user-data/uploads/*.pdf",
+        "/mnt/user-data/*.pdf",
+        "/tmp/*.pdf",
+        "./*.pdf",
+    ):
+        hits = sorted(glob.glob(pattern))
+        if hits:
+            return hits[0]
+    raise SystemExit("PDF not found in sandbox")
+
+PATH = find_pdf()
+
+# --- AcroForm widgets (interactive PDFs) ---------------------------------
+acroform = []
+try:
+    reader = pypdf.PdfReader(PATH)
+    for page_idx, page in enumerate(reader.pages, 1):
+        annots = page.get("/Annots") or []
+        ph = float(page.mediabox.height)
+        for annot in annots:
+            obj = annot.get_object()
+            if obj.get("/Subtype") != "/Widget":
+                continue
+            r = obj.get("/Rect")
+            if not r or len(r) != 4:
+                continue
+            x0, y0, x1, y1 = float(r[0]), float(r[1]), float(r[2]), float(r[3])
+            acroform.append({
+                "page": page_idx,
+                "x": round(x0, 2),
+                "y": round(ph - y1, 2),
+                "w": round(x1 - x0, 2),
+                "h": round(y1 - y0, 2),
+                "name": str(obj.get("/T") or "").strip(),
+                "ft": str(obj.get("/FT") or "").strip(),
+            })
+    n_pages = len(reader.pages)
+except Exception:
+    traceback.print_exc(file=sys.stderr)
+    n_pages = 0
+
+# --- Structural fallback (printed forms with __ or drawn lines) ----------
+candidates = []
+try:
+    with pdfplumber.open(PATH) as pdf:
+        if not n_pages:
+            n_pages = len(pdf.pages)
+        for pi, page in enumerate(pdf.pages, 1):
+            chars = sorted(page.chars, key=lambda c: (round(c["top"], 1), c["x0"]))
+            run, last = [], None
+            def flush():
+                if len(run) < 3:
+                    return
+                x0 = min(r["x0"] for r in run)
+                x1 = max(r["x1"] for r in run)
+                bot = max(r["bottom"] for r in run)
+                candidates.append({
+                    "page": pi,
+                    "kind": "u",
+                    "x": round(x0, 2),
+                    "y": round(bot - 16, 2),
+                    "w": round(x1 - x0, 2),
+                    "h": 16,
+                    "context": "",
+                })
+            for c in chars:
+                is_u = c["text"] == "_"
+                if is_u and last is not None and abs(c["top"] - last["top"]) < 1.0 and abs(c["x0"] - last["x1"]) < 2.0:
+                    run.append(c)
+                else:
+                    flush()
+                    run = [c] if is_u else []
+                last = c if is_u else None
+            flush()
+
+            for ln in page.lines:
+                if ln.get("height", 99) < 1.5 and ln.get("width", 0) > 30:
+                    candidates.append({
+                        "page": pi,
+                        "kind": "ln",
+                        "x": round(ln["x0"], 2),
+                        "y": round(ln["top"] - 14, 2),
+                        "w": round(ln["width"], 2),
+                        "h": 16,
+                        "context": "",
+                    })
+
+            for rect in page.rects:
+                w, h = rect.get("width", 0), rect.get("height", 0)
+                if 7 < w < 18 and 7 < h < 18:
+                    candidates.append({
+                        "page": pi,
+                        "kind": "rect",
+                        "x": round(rect["x0"], 2),
+                        "y": round(rect["top"], 2),
+                        "w": round(w, 2),
+                        "h": round(h, 2),
+                        "context": "",
+                    })
+
+            try:
+                words = page.extract_words(use_text_flow=False)
+            except Exception:
+                words = []
+            for cand in [c for c in candidates if c["page"] == pi and not c["context"]]:
+                cy = cand["y"] + cand["h"] / 2
+                cx = cand["x"]
+                best, best_d = None, 9999
+                for w in words:
+                    wy = (w["top"] + w["bottom"]) / 2
+                    if abs(wy - cy) > 14:
+                        continue
+                    if w["x1"] > cx + 6:
+                        continue
+                    d = cx - w["x1"]
+                    if d < best_d:
+                        best_d = d
+                        best = w["text"]
+                cand["context"] = best or ""
+except Exception:
+    traceback.print_exc(file=sys.stderr)
+
+print(json.dumps({
+    "path": PATH,
+    "n_pages": n_pages,
+    "acroform": acroform,
+    "candidates": candidates,
+}))
+`.trim();
+
 function buildAgenticSystemPrompt(): string {
   return [
-    "You analyze film/production paperwork (vendor agreements, credit-card authorizations, deal memos, W-9s, COIs, etc.) and locate every fillable field with pixel-accurate bounding boxes.",
+    "You analyze production paperwork PDFs (vendor agreements, credit-card authorizations, deal memos, W-9s, COIs) and emit JSON describing every fillable field.",
     "",
-    "ENVIRONMENT",
-    "- A `code_execution` Python sandbox is available with pdfplumber, pypdf, pikepdf, Pillow pre-installed.",
-    "- The user's PDF was attached via `container_upload`. Find it under `/mnt/user-data/uploads`, `/tmp`, or cwd; the first `.pdf` you see is the one.",
+    "## PROCESS — exactly one tool call",
+    "1. Use `code_execution` to run the SCRIPT below VERBATIM. Do not edit it.",
+    "2. Read its JSON output (`acroform` and `candidates` arrays).",
+    "3. Compose your final assistant message: ONLY the answer JSON, no prose.",
+    "Do NOT run a second script. Do NOT render verification images. Do NOT iterate. The script is correct; the only work left is mapping its output to canonical field ids.",
     "",
-    "STRICT BUDGET",
-    "Use AT MOST 2 sandbox scripts. Do NOT render annotated images for visual verification; the structural extraction below is accurate when followed correctly. Iterating with rendered debug pages is wasted time and dramatically increases latency without improving accuracy.",
+    "## SCRIPT",
+    "```python",
+    EXTRACTION_SCRIPT,
+    "```",
     "",
-    "WORKFLOW",
-    "Script 1 (mandatory) — extract structure:",
-    "  a. Open with `pypdf.PdfReader`. If `reader.get_form_text_fields()` (or `/AcroForm` widgets via `reader.trailer['/Root']['/AcroForm']`) returns interactive fields, those widget rectangles ARE the answer — convert from bottom-up to top-down y and emit. You're done.",
-    "  b. Otherwise open the same PDF with `pdfplumber`. For each page collect:",
-    "     - `page.chars` → contiguous runs of `_` characters → text-input candidates.",
-    "     - `page.lines` → long horizontal strokes (height < 1.5pt, width > 30pt) near a label → text-input candidates.",
-    "     - `page.rects` → small ≈8-18pt squares near label words like Visa/Mastercard/Amex/Discover or near ☐ ☑ ◯ glyphs → checkbox candidates.",
-    "  c. Group label-words with the nearest input candidate to the right or below.",
-    "  d. Print a compact summary (one line per candidate with x/y/w/h/label) so you can sanity-check before composing JSON.",
-    "Script 2 (optional, ONLY if Script 1 found < 3 fields) — fallback to a denser pass: re-walk page.chars to find labels followed by colons + whitespace + drawn line graphics, OR run pytesseract on a 200dpi render to locate stray hand-drawn fields. Do not run more than this.",
-    "Then compose JSON in your final assistant message. No third script.",
+    "## TURNING SCRIPT OUTPUT INTO FIELDS",
+    "- If `acroform` is non-empty, those rectangles ARE the answer. The coordinates are already top-down PDF points. Use the widget's `name` to pick a canonical_field_id when obvious; otherwise null.",
+    "- Otherwise use `candidates`:",
+    "  - `kind: \"u\"` (underscore run) and `kind: \"ln\"` (drawn line) → `field_type: \"text\"`. Width/height/x/y are already final.",
+    "  - `kind: \"rect\"` → `field_type: \"checkbox\"`. When 4 small squares appear in a row near label words containing Visa / Mastercard / Discover / Amex, emit them as a checkbox-group with `group_id: \"creditCardType\"` and `checkbox_value` of `visa | mastercard | discover | amex` respectively. Card rows ALWAYS have all four — never stop at three.",
+    "  - The `context` string is the nearest label word to the left of the candidate. Use it to pick a canonical_field_id and a human label. If you cannot map confidently, set canonical_field_id to null.",
     "",
-    "COORDINATES",
-    "All output in PDF points, TOP-LEFT origin (y grows downward). pdfplumber's `top` and `bottom` are already top-down. pypdf widget rects are bottom-up — convert with `top_y = page_height - bottom_up_y_max`, `height = bottom_up_y_max - bottom_up_y_min`. Boxes must fit inside the page.",
+    "## RULES",
+    "- Coordinates are PDF points, top-left origin (y grows downward). Do NOT recompute them.",
+    "- Skip headers, footers, page numbers, instructions, and pre-printed values.",
+    "- Repeat a canonical_field_id only when the form legitimately duplicates it (e.g. signature top AND bottom).",
+    "- field_kind: text | multiline | date | signature | boolean-checkbox | checkbox-group.",
+    "- Standalone checkboxes: `field_kind: \"boolean-checkbox\"`, `checkbox_value: \"yes\"`.",
     "",
-    "UNDERSCORE BBOX RULE (the secret sauce — read carefully)",
-    "An underscore character's `top` is the row's ascender, NOT the visible underline. The underline is at the underscore's `bottom`. So:",
-    "  underline_y = max(c.bottom for c in underscore_run)",
-    "  font_size   = body_font_size_estimate                # 11-13pt on most production forms",
-    "  height      = round(font_size * 1.3)                 # ≈ 15-18pt",
-    "  y           = underline_y - height + 2               # bottom of box ~2pt below underline",
-    "  x           = min(c.x0 for c in run)",
-    "  width       = max(c.x1 for c in run) - x",
-    "For drawn lines from `page.lines`, use the line's y as `underline_y` directly. For checkboxes, the bbox IS the square.",
-    "",
-    "FIELD KINDS",
-    "- `text` — single-line input",
-    "- `multiline` — input spans 2+ rows (addresses, notes)",
-    "- `date` — date field",
-    "- `signature` — signature line",
-    "- `boolean-checkbox` — standalone checkbox; `checkbox_value: 'yes'`",
-    "- `checkbox-group` — card-type rows (Visa/Mastercard/Amex/Discover); `group_id: 'creditCardType'`, `checkbox_value: 'visa' | 'mastercard' | 'discover' | 'amex'`. Card rows ALWAYS have all four — don't stop at three.",
-    "",
-    "Body-text underscores inside running prose (`I, ______, authorize…`) are fillable; bound the box tightly to the underline only. Skip headers, footers, instructions, page numbers, and pre-printed values. Conditional sections still count — set `optional: true`. A canonical id repeats only when the form legitimately has duplicates (e.g. signature at top AND bottom).",
-    "",
-    "CANONICAL FIELD CATALOG (set `canonical_field_id` when confident, otherwise null):",
+    "## CANONICAL FIELD CATALOG (set `canonical_field_id` when confident, otherwise null):",
     buildSchemaSummary(),
     "",
-    "OUTPUT — your FINAL assistant message must contain ONLY this JSON object, no prose, no markdown fences:",
-    "interface Response {",
-    "  page_count: number;",
-    "  form_type?: string;        // e.g. 'credit card authorization'",
-    "  detected_via?: 'acroform' | 'pdfplumber' | 'mixed';",
-    "  fields: Array<{",
-    "    canonical_field_id: string | null;",
-    "    label: string;",
-    "    field_type: 'text' | 'checkbox';",
-    "    field_kind: 'text' | 'multiline' | 'date' | 'signature' | 'boolean-checkbox' | 'checkbox-group';",
-    "    page_number: number;     // 1-indexed",
-    "    x: number; y: number; width: number; height: number;",
-    "    checkbox_value?: string | null;",
-    "    group_id?: string | null;",
-    "    estimated_font_size?: number | null;",
-    "    optional?: boolean;",
+    "## OUTPUT — your final assistant message must be ONLY this JSON object (no markdown fences, no prose):",
+    "{",
+    "  \"page_count\": number,",
+    "  \"form_type\"?: string,",
+    "  \"detected_via\"?: \"acroform\" | \"pdfplumber\" | \"mixed\",",
+    "  \"fields\": Array<{",
+    "    canonical_field_id: string | null,",
+    "    label: string,",
+    "    field_type: \"text\" | \"checkbox\",",
+    "    field_kind: \"text\" | \"multiline\" | \"date\" | \"signature\" | \"boolean-checkbox\" | \"checkbox-group\",",
+    "    page_number: number,",
+    "    x: number, y: number, width: number, height: number,",
+    "    checkbox_value?: string | null,",
+    "    group_id?: string | null,",
+    "    estimated_font_size?: number | null,",
+    "    optional?: boolean",
     "  }>",
     "}",
     "",
-    "If no fields found: `{ page_count, fields: [] }`.",
+    "If the script returns no acroform widgets and no candidates: `{ \"page_count\": N, \"fields\": [] }`.",
   ].join("\n");
 }
 
@@ -233,22 +347,20 @@ function buildAgenticUserPrompt(
   const projectBlock = project
     ? [
         "",
-        "Sample project context (only a hint for picking canonical_field_id; do NOT inline these values into your response):",
+        "Project context (use only as a hint for picking canonical_field_id; do NOT inline these values):",
         "```json",
         JSON.stringify(project, null, 2),
         "```",
       ].join("\n")
     : "";
   return [
-    "Analyze the attached PDF using your code_execution sandbox and emit the JSON object from the system prompt.",
+    "Run the extraction script in your system prompt EXACTLY ONCE via code_execution, then return the final JSON object.",
     "",
     "Page sizes (PDF points, top-left origin):",
     pageBlock,
-    "",
-    "Run AT MOST two sandbox scripts: one to extract structure (AcroForm widgets first, pdfplumber chars/lines/rects otherwise), an optional second only if the first found fewer than 3 candidates. Do NOT render annotated debug images. Then return the JSON.",
     projectBlock,
     "",
-    "Your final assistant message must contain ONLY the JSON object — no commentary, no markdown fences.",
+    "Final assistant message: JSON only.",
   ]
     .filter(Boolean)
     .join("\n");
@@ -448,10 +560,18 @@ export async function detectFieldsWithClaude(
   options: DetectFieldsOptions = {}
 ): Promise<TemplateField[]> {
   const model = options.model ?? getModelPreference();
+  // Adaptive thinking is intentionally off for the agentic flow. The
+  // extraction script in `buildAgenticSystemPrompt` is fully deterministic;
+  // Claude's only remaining job is mapping the script's `candidates` /
+  // `acroform` arrays onto canonical field ids — no reasoning loop needed.
+  // Leaving thinking on with code_execution caused the model to second-guess
+  // the script and run dozens of "verification" passes (the v0.3.7 endless
+  // loop). The Settings "Detection effort" preference still applies to the
+  // vision-only single-shot path used by `extractProjectFromPdfWithClaude`.
   const effort: ClaudeEffort | undefined =
-    options.effort === null
-      ? undefined
-      : (options.effort ?? effortForModel(model));
+    options.effort && options.effort !== null
+      ? options.effort
+      : undefined;
 
   onStatus?.("Reading PDF metadata…");
   const pageSizes = await getPageSizes(pdfBytes);
@@ -488,7 +608,11 @@ export async function detectFieldsWithClaude(
         pageSizes,
         options.projectHint ?? null
       ),
-      maxTokens: effort ? 32768 : 16384,
+      // 12k is plenty: a 30-field form serialises to ~4k tokens. A tight cap
+      // is the second line of defence against a runaway loop — even if
+      // Claude ignored the "one script" directive, it would hit max_tokens
+      // long before burning 5+ minutes on script writing.
+      maxTokens: 12288,
       effort,
       filename: options.filename,
     });
