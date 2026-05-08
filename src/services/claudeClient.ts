@@ -1,4 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
+import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
 /**
  * Thrown when the Anthropic API key has not been configured (or when the
@@ -57,6 +58,65 @@ export interface AnalyzePdfResult {
    * and surfacing "Claude ran N scripts" to the user.
    */
   toolCalls: unknown[];
+}
+
+/**
+ * Streaming progress event emitted by the Rust backend during an agentic
+ * `analyze_pdf_agentic` call. The Rust side parses Anthropic's SSE
+ * response and re-emits the high-level phase changes over the
+ * `anthropic-progress` Tauri channel. Subscribe via
+ * `subscribeAgenticProgress` before invoking the command.
+ */
+export interface AgenticProgress {
+  /**
+   * Current high-level phase. One of:
+   * - `"uploading_file"`     PDF being POSTed to Anthropic Files API
+   * - `"file_uploaded"`      File API returned a file_id
+   * - `"request_sent"`       Messages API stream opened
+   * - `"thinking"`           Claude entered an extended-thinking block
+   * - `"tool_start"`         Claude started a code-execution tool call
+   * - `"tool_executing"`     Tool input has streamed; sandbox is running it
+   * - `"tool_done"`          Sandbox returned a result block
+   * - `"writing"`            Claude started emitting the final text/JSON
+   * - `"done"`               Stream terminated successfully
+   * - `"error"`              Stream terminated with an error (see `detail`)
+   */
+  phase: string;
+  detail: string | null;
+  toolIndex: number | null;
+  toolCount: number | null;
+}
+
+interface AgenticProgressRaw {
+  phase: string;
+  detail: string | null;
+  tool_index: number | null;
+  tool_count: number | null;
+}
+
+function normalizeProgress(raw: AgenticProgressRaw): AgenticProgress {
+  return {
+    phase: raw.phase,
+    detail: raw.detail,
+    toolIndex: raw.tool_index,
+    toolCount: raw.tool_count,
+  };
+}
+
+/**
+ * Subscribes to streaming progress events from `analyze_pdf_agentic`.
+ * Returns an `unsubscribe` function the caller MUST call once the
+ * agentic call resolves (use try/finally). Safe to call from web-only
+ * mode: when Tauri isn't available we return a no-op unsubscriber so
+ * the caller's finally-block stays simple.
+ */
+export async function subscribeAgenticProgress(
+  callback: (progress: AgenticProgress) => void
+): Promise<UnlistenFn> {
+  if (!isTauriAvailable()) return () => {};
+  return await listen<AgenticProgressRaw>("anthropic-progress", (event) => {
+    callback(normalizeProgress(event.payload));
+  });
 }
 
 export interface AnalyzePdfAgenticOptions {

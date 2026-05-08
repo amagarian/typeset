@@ -11,6 +11,8 @@ import {
   analyzePdfWithClaude,
   ClaudeApiError,
   ClaudeNotConfiguredError,
+  subscribeAgenticProgress,
+  type AgenticProgress,
   type ClaudeEffort,
 } from "@/services/claudeClient";
 import { getModelPreference } from "@/services/anthropicSettings";
@@ -18,6 +20,44 @@ import { CANONICAL_FIELD_DEFINITIONS } from "@/utils/fieldCatalog";
 import { normalizeCardType } from "@/utils/fill";
 
 export { ClaudeNotConfiguredError, ClaudeApiError };
+
+/**
+ * Translates a streaming agentic-progress event into a one-line status
+ * suitable for the UI's "what is Claude doing" indicator. Phases come
+ * straight from the Rust side (see anthropic.rs#AgenticProgress).
+ */
+function progressToStatus(progress: AgenticProgress, elapsedSec: number): string {
+  const elapsed = elapsedSec > 0 ? ` (${elapsedSec}s)` : "";
+  const idx = progress.toolIndex ?? 0;
+  switch (progress.phase) {
+    case "uploading_file":
+      return `Uploading PDF to Claude${elapsed}…`;
+    case "file_uploaded":
+      return `PDF uploaded — starting Claude${elapsed}…`;
+    case "request_sent":
+      return `Claude is reading your form${elapsed}…`;
+    case "thinking":
+      return idx > 0
+        ? `Claude is thinking after script ${idx}${elapsed}…`
+        : `Claude is thinking${elapsed}…`;
+    case "tool_start":
+      return `Running Python script ${idx}${elapsed}…`;
+    case "tool_executing":
+      return `Script ${idx} executing in sandbox${elapsed}…`;
+    case "tool_done":
+      return `Script ${idx} complete — Claude is analyzing the result${elapsed}…`;
+    case "writing":
+      return `Claude is writing the field map${elapsed}…`;
+    case "done":
+      return `Done${elapsed}.`;
+    case "error":
+      return progress.detail
+        ? `Claude error: ${progress.detail}`
+        : `Claude failed.`;
+    default:
+      return `Claude${elapsed}…`;
+  }
+}
 
 if (typeof window !== "undefined" && !pdfjsLib.GlobalWorkerOptions.workerSrc) {
   pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
@@ -441,20 +481,47 @@ export async function detectFieldsWithClaude(
   onStatus?.("Reading PDF metadata…");
   const pageSizes = await getPageSizes(pdfBytes);
 
-  onStatus?.("Uploading PDF to Claude…");
+  // Live progress feed: Rust streams Anthropic's SSE events and emits
+  // `anthropic-progress` Tauri events; we translate them into onStatus
+  // strings. A heartbeat re-renders the same status with the elapsed
+  // wall-clock time every second so the UI doesn't look frozen during
+  // long sandbox calls.
+  const startedAt = Date.now();
+  let lastProgress: AgenticProgress = {
+    phase: "uploading_file",
+    detail: options.filename ?? null,
+    toolIndex: null,
+    toolCount: null,
+  };
+  const elapsedSec = () => Math.round((Date.now() - startedAt) / 1000);
+  const pushStatus = () =>
+    onStatus?.(progressToStatus(lastProgress, elapsedSec()));
 
-  const result = await analyzePdfAgentic(pdfBytes, {
-    model,
-    systemPrompt: buildAgenticSystemPrompt(),
-    userPrompt: buildAgenticUserPrompt(pageSizes, options.projectHint ?? null),
-    maxTokens: effort ? 32768 : 16384,
-    effort,
-    filename: options.filename,
+  pushStatus();
+  const heartbeat = window.setInterval(pushStatus, 1000);
+  const unsubscribe = await subscribeAgenticProgress((progress) => {
+    lastProgress = progress;
+    pushStatus();
   });
 
-  // The renderer can't easily show progress while Claude is in its sandbox
-  // loop — we only get the final response. Surface the count of tool calls
-  // it made for transparency in the post-call status.
+  let result;
+  try {
+    result = await analyzePdfAgentic(pdfBytes, {
+      model,
+      systemPrompt: buildAgenticSystemPrompt(),
+      userPrompt: buildAgenticUserPrompt(
+        pageSizes,
+        options.projectHint ?? null
+      ),
+      maxTokens: effort ? 32768 : 16384,
+      effort,
+      filename: options.filename,
+    });
+  } finally {
+    window.clearInterval(heartbeat);
+    unsubscribe();
+  }
+
   const toolCallCount = result.toolCalls.length;
   onStatus?.(
     toolCallCount > 0

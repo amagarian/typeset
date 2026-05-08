@@ -20,11 +20,30 @@
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tauri::{AppHandle, Emitter};
 
 use crate::keychain;
+
+/// Event emitted to the renderer over the `anthropic-progress` channel
+/// while the agentic flow is running. The frontend listens before invoking
+/// the command and translates phases into user-facing status text.
+#[derive(Clone, Debug, Serialize)]
+pub struct AgenticProgress {
+    /// One of: "uploading_file" | "file_uploaded" | "request_sent" |
+    /// "thinking" | "tool_start" | "tool_executing" | "tool_done" |
+    /// "writing" | "done" | "error"
+    pub phase: String,
+    /// Free-form human-readable detail (e.g. file id, tool name, error msg).
+    pub detail: Option<String>,
+    /// Sequential index of the current code-execution invocation (1-based).
+    pub tool_index: Option<u32>,
+    /// Cumulative count of code-execution invocations seen so far.
+    pub tool_count: Option<u32>,
+}
 
 const ANTHROPIC_API_BASE: &str = "https://api.anthropic.com";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -285,11 +304,13 @@ pub async fn analyze_pdf_with_claude(
 
 /// Agentic flow: upload the PDF to the Files API, ask Claude to use
 /// `code_execution_20250825` (Anthropic's hosted Python sandbox) to extract
-/// fields structurally, and return the final text content. Anthropic loops
-/// tool calls server-side; we make a single request and receive the full
-/// trace + final answer in one response.
+/// fields structurally, and stream the response back. Anthropic loops tool
+/// calls server-side; we stream SSE events from `/v1/messages` and emit
+/// `anthropic-progress` Tauri events as each phase begins so the renderer
+/// can show a live feed of what Claude is doing.
 #[tauri::command]
 pub async fn analyze_pdf_agentic(
+    app: AppHandle,
     request: AnalyzePdfAgenticRequest,
 ) -> Result<AnalyzePdfResponse, String> {
     let api_key = require_key()?;
@@ -324,10 +345,13 @@ pub async fn analyze_pdf_agentic(
         .unwrap_or("document.pdf")
         .to_owned();
 
+    emit_progress(&app, "uploading_file", Some(&filename), None, None);
     let file_id =
         upload_pdf_to_files_api(&client, &api_key, pdf_bytes, &filename).await?;
+    emit_progress(&app, "file_uploaded", Some(&file_id), None, None);
 
-    let result = run_agentic_messages(
+    let result = run_agentic_messages_streaming(
+        &app,
         &client,
         &api_key,
         &file_id,
@@ -341,13 +365,43 @@ pub async fn analyze_pdf_agentic(
 
     delete_file(&client, &api_key, &file_id).await;
 
-    let mut response = result?;
-    response.file_id = Some(file_id);
-    Ok(response)
+    match result {
+        Ok(mut response) => {
+            response.file_id = Some(file_id);
+            emit_progress(&app, "done", None, None, None);
+            Ok(response)
+        }
+        Err(err) => {
+            emit_progress(&app, "error", Some(&err), None, None);
+            Err(err)
+        }
+    }
 }
 
+fn emit_progress(
+    app: &AppHandle,
+    phase: &str,
+    detail: Option<&str>,
+    tool_index: Option<u32>,
+    tool_count: Option<u32>,
+) {
+    let payload = AgenticProgress {
+        phase: phase.to_string(),
+        detail: detail.map(str::to_owned),
+        tool_index,
+        tool_count,
+    };
+    let _ = app.emit("anthropic-progress", payload);
+}
+
+/// Streams the Messages API response with `stream: true` and parses SSE
+/// events on the fly. Emits an `anthropic-progress` event whenever a new
+/// content block (thinking / server_tool_use / tool_result / text) starts
+/// or stops, so the renderer can surface live status. Accumulates the
+/// final assistant content into `AnalyzePdfResponse`.
 #[allow(clippy::too_many_arguments)]
-async fn run_agentic_messages(
+async fn run_agentic_messages_streaming(
+    app: &AppHandle,
     client: &reqwest::Client,
     api_key: &str,
     file_id: &str,
@@ -388,6 +442,7 @@ async fn run_agentic_messages(
         "model": model,
         "max_tokens": resolved_max,
         "system": system_prompt,
+        "stream": true,
         "messages": [
             { "role": "user", "content": content_blocks }
         ],
@@ -406,6 +461,7 @@ async fn run_agentic_messages(
         .header("x-api-key", api_key)
         .header("anthropic-version", ANTHROPIC_VERSION)
         .header("anthropic-beta", FILES_API_BETA)
+        .header("accept", "text/event-stream")
         .header("content-type", "application/json")
         .json(&body)
         .send()
@@ -413,39 +469,194 @@ async fn run_agentic_messages(
         .map_err(|e| format!("Anthropic request failed: {e}"))?;
 
     let status = response.status();
-    let raw = response
-        .text()
-        .await
-        .map_err(|e| format!("Failed to read Anthropic response body: {e}"))?;
-
     if !status.is_success() {
+        let raw = response.text().await.unwrap_or_default();
         return Err(format_api_error(status.as_u16(), &raw));
     }
 
-    let parsed: Value = serde_json::from_str(&raw)
-        .map_err(|e| format!("Anthropic returned non-JSON success body: {e}"))?;
+    emit_progress(app, "request_sent", None, None, None);
 
-    let text = collect_text_blocks(&parsed);
-    if text.is_empty() {
-        return Err(format!(
-            "Claude returned no text content. Raw payload: {}",
-            truncate_for_log(&raw, 1500)
-        ));
+    // Per-block accumulators keyed by block index. Anthropic streams blocks
+    // by integer index; deltas reference the index they belong to.
+    let mut block_types: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
+    let mut text_chunks: std::collections::HashMap<u64, String> =
+        std::collections::HashMap::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    let mut tool_count: u32 = 0;
+    let mut stop_reason: Option<String> = None;
+    let mut usage: Option<Value> = None;
+
+    let mut stream = response.bytes_stream();
+    let mut buffer = String::new();
+
+    while let Some(chunk_result) = stream.next().await {
+        let chunk = chunk_result.map_err(|e| format!("Stream error: {e}"))?;
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+
+        // SSE events are separated by blank lines (\n\n).
+        while let Some(idx) = buffer.find("\n\n") {
+            let event_block: String = buffer.drain(..idx + 2).collect();
+            let mut data_payload = String::new();
+            for line in event_block.lines() {
+                if let Some(rest) = line.strip_prefix("data:") {
+                    if !data_payload.is_empty() {
+                        data_payload.push('\n');
+                    }
+                    data_payload.push_str(rest.trim_start());
+                }
+            }
+            if data_payload.is_empty() {
+                continue;
+            }
+            let value: Value = match serde_json::from_str(&data_payload) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            handle_sse_event(
+                app,
+                &value,
+                &mut block_types,
+                &mut text_chunks,
+                &mut tool_calls,
+                &mut tool_count,
+                &mut stop_reason,
+                &mut usage,
+            );
+        }
     }
 
-    let tool_calls = collect_tool_calls(&parsed);
+    let mut indices: Vec<u64> = text_chunks.keys().copied().collect();
+    indices.sort_unstable();
+    let text: String = indices
+        .into_iter()
+        .filter_map(|i| text_chunks.remove(&i))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if text.is_empty() {
+        return Err(
+            "Claude returned no text content (stream completed with empty assistant message)."
+                .to_string(),
+        );
+    }
 
     Ok(AnalyzePdfResponse {
         text,
-        stop_reason: parsed
-            .get("stop_reason")
-            .and_then(|s| s.as_str())
-            .map(str::to_owned),
-        usage: parsed.get("usage").cloned(),
+        stop_reason,
+        usage,
         thinking_mode: thinking_mode.to_string(),
         file_id: None,
         tool_calls,
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn handle_sse_event(
+    app: &AppHandle,
+    value: &Value,
+    block_types: &mut std::collections::HashMap<u64, String>,
+    text_chunks: &mut std::collections::HashMap<u64, String>,
+    tool_calls: &mut Vec<Value>,
+    tool_count: &mut u32,
+    stop_reason: &mut Option<String>,
+    usage: &mut Option<Value>,
+) {
+    let event_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+    match event_type {
+        "content_block_start" => {
+            let index = value.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+            let block = value.get("content_block").cloned().unwrap_or(Value::Null);
+            let block_type = block
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+            block_types.insert(index, block_type.clone());
+
+            match block_type.as_str() {
+                "thinking" => {
+                    emit_progress(app, "thinking", None, None, Some(*tool_count));
+                }
+                "server_tool_use" => {
+                    *tool_count += 1;
+                    let name = block.get("name").and_then(|n| n.as_str()).unwrap_or("tool");
+                    emit_progress(
+                        app,
+                        "tool_start",
+                        Some(name),
+                        Some(*tool_count),
+                        Some(*tool_count),
+                    );
+                    tool_calls.push(block.clone());
+                }
+                "code_execution_tool_result"
+                | "bash_code_execution_tool_result"
+                | "text_editor_code_execution_tool_result" => {
+                    emit_progress(
+                        app,
+                        "tool_done",
+                        Some(&block_type),
+                        Some(*tool_count),
+                        Some(*tool_count),
+                    );
+                    tool_calls.push(block.clone());
+                }
+                "text" => {
+                    emit_progress(app, "writing", None, None, Some(*tool_count));
+                    text_chunks.entry(index).or_default();
+                }
+                _ => {}
+            }
+        }
+        "content_block_delta" => {
+            let index = value.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+            let delta = value.get("delta").cloned().unwrap_or(Value::Null);
+            let delta_type = delta
+                .get("type")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if delta_type == "text_delta" {
+                if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                    text_chunks
+                        .entry(index)
+                        .or_default()
+                        .push_str(t);
+                }
+            }
+            // input_json_delta (for tool_use blocks) and thinking_delta
+            // are intentionally not surfaced here — the start event is
+            // enough for the live feed and we keep the raw tool_use block
+            // captured at content_block_start in `tool_calls`.
+        }
+        "content_block_stop" => {
+            let index = value.get("index").and_then(|i| i.as_u64()).unwrap_or(0);
+            if let Some(bt) = block_types.get(&index) {
+                if bt == "server_tool_use" {
+                    emit_progress(
+                        app,
+                        "tool_executing",
+                        None,
+                        Some(*tool_count),
+                        Some(*tool_count),
+                    );
+                }
+            }
+        }
+        "message_delta" => {
+            if let Some(reason) = value
+                .get("delta")
+                .and_then(|d| d.get("stop_reason"))
+                .and_then(|r| r.as_str())
+            {
+                *stop_reason = Some(reason.to_string());
+            }
+            if let Some(u) = value.get("usage") {
+                *usage = Some(u.clone());
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Lightweight ping used by the Settings "Test connection" button.
@@ -498,31 +709,6 @@ fn collect_text_blocks(parsed: &Value) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
-        })
-        .unwrap_or_default()
-}
-
-/// Pulls every server_tool_use / *_tool_result block out of the response
-/// for diagnostics. The renderer logs a count so users can see Claude's
-/// tool usage.
-fn collect_tool_calls(parsed: &Value) -> Vec<Value> {
-    parsed
-        .get("content")
-        .and_then(|c| c.as_array())
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter(|block| {
-                    matches!(
-                        block.get("type").and_then(|t| t.as_str()),
-                        Some("server_tool_use")
-                            | Some("code_execution_tool_result")
-                            | Some("bash_code_execution_tool_result")
-                            | Some("text_editor_code_execution_tool_result")
-                    )
-                })
-                .cloned()
-                .collect::<Vec<_>>()
         })
         .unwrap_or_default()
 }
