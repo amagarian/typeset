@@ -83,12 +83,20 @@ interface RawClaudeField {
   group_id?: string | null;
   estimated_font_size?: number | null;
   optional?: boolean;
+  /** Up to 6 words to the LEFT of the blank on the same row. Passed through from the script. */
+  context?: string;
+  /** Up to 6 words to the RIGHT of the blank on the same row. Passed through from the script. */
+  after?: string;
 }
 
 interface RawClaudeResponse {
   page_count?: number;
   form_type?: string;
   fields?: RawClaudeField[];
+  /** Optional pass-through from the script: full text per page, used as a
+   * fallback haystack for canonical-id alias matching when the row's
+   * context/after strings are too short. */
+  page_texts?: string[];
 }
 
 const VALID_CANONICAL_IDS = new Set<string>(
@@ -126,15 +134,6 @@ async function getPageSizes(pdfBytes: Uint8Array): Promise<PdfPageSize[]> {
   }
   pdf.destroy();
   return sizes;
-}
-
-function buildSchemaSummary(): string {
-  return CANONICAL_FIELD_DEFINITIONS.map((def) => {
-    const aliases = def.aliases.length > 0 ? ` aliases: [${def.aliases.join(", ")}]` : "";
-    const checkbox = def.checkboxValue ? ` checkboxValue: ${def.checkboxValue}` : "";
-    const group = def.groupId ? ` group: ${def.groupId}` : "";
-    return `- ${def.id} (${def.fieldKind}) — "${def.label}".${aliases}${checkbox}${group}`;
-  }).join("\n");
 }
 
 /**
@@ -335,53 +334,48 @@ function buildAgenticSystemPrompt(): string {
     "```",
     "",
     "## TURNING SCRIPT OUTPUT INTO FIELDS",
-    "- If `acroform` is non-empty, those rectangles ARE the answer. The coordinates are already top-down PDF points. Use the widget's `name` to pick a canonical_field_id when obvious; otherwise null.",
-    "- Otherwise use `candidates`. For each candidate the script gives you:",
-    "  - `context` — up to 6 words immediately to the LEFT of the blank on the same row.",
-    "  - `after`   — up to 6 words immediately to the RIGHT of the blank on the same row.",
-    "  - `kind` — `\"u\"` underscore run, `\"ln\"` drawn line, `\"rect\"` checkbox square.",
-    "  - `x/y/w/h` — final top-down PDF points, already correctly sized. DO NOT recompute them.",
-    "- `page_texts` is the extracted body text per page. Use it to disambiguate body-text blanks where `context` and `after` alone aren't enough (e.g. distinguishing the cardholder-name blank from the date blank inside a single paragraph).",
-    "- Mapping logic:",
-    "  - `kind: \"u\"` and `kind: \"ln\"` → `field_type: \"text\"`. Pick `field_kind` based on label semantics: `date` when the label or surrounding text mentions date/exp/MM/YY, `signature` when it mentions signature, `multiline` when it's an address-like field that visibly spans multiple lines, otherwise `text`.",
-    "  - `kind: \"rect\"` → `field_type: \"checkbox\"`. When 4 small squares appear on a row near label words containing Visa / Mastercard / Discover / Amex, emit them as a checkbox-group with `group_id: \"creditCardType\"` and `checkbox_value` of `visa | mastercard | discover | amex` respectively. Card rows ALWAYS have all four — never stop at three.",
-    "- Labelling guidance for body-text blanks (`context` is short or generic like \"I,\" / \"on\" / \"of\"):",
-    "  - Read the full sentence in `page_texts` that contains the blank.",
-    "  - \"I, _______, authorize my credit card to be charged...\" → cardholder name (creditCardHolder).",
-    "  - \"...my booking at Beam Studios on _______ (date)...\" → authorizationDate.",
-    "  - \"...charged up to $_______\" → set canonical_field_id to null with a label like \"Maximum amount\". When in doubt, null is better than a wrong canonical id.",
-    "- If a candidate's `context` clearly maps to a canonical field, use it. If not, set canonical_field_id to null and copy the meaningful label words verbatim.",
+    "Your job is mostly mechanical: convert each `acroform` widget and each `candidate` into a field entry, preserving the script's coordinates AND its `context`/`after` strings VERBATIM. The downstream code does its own canonical-id matching from the context strings — DO NOT try to be clever about which canonical id to pick; just copy `context` and `after` through.",
+    "",
+    "Per-candidate translation:",
+    "- `kind: \"u\"` (underscore run) and `kind: \"ln\"` (drawn line) → `field_type: \"text\"`. Pick `field_kind`:",
+    "  - `date` when `context` or `after` mentions date / exp / MM/YY / expiration / authorization date",
+    "  - `signature` when `context` or `after` mentions signature / sign / authorized",
+    "  - `multiline` when the label is address-like AND the candidate is wider than ~250pt OR a similar candidate on the row directly below has the same x and width",
+    "  - otherwise `text`",
+    "- `kind: \"rect\"` → `field_type: \"checkbox\"`. When 4 small squares appear on a row near Visa / Mastercard / Discover / Amex, emit them as a checkbox-group with `group_id: \"creditCardType\"` and `checkbox_value` of `visa | mastercard | discover | amex` respectively. Card rows ALWAYS have all four — never stop at three.",
+    "",
+    "For each acroform widget: `field_type: \"text\"` (or `\"checkbox\"` if `ft == \"/Btn\"`), `field_kind: \"text\"`. Set `context` to the widget's `name` field; leave `after` empty.",
     "",
     "## RULES",
-    "- Coordinates are PDF points, top-left origin (y grows downward). Do NOT recompute them.",
-    "- Skip headers, footers, page numbers, instructions, and pre-printed values.",
-    "- IMPORTANT: production paperwork routinely repeats the same logical field across the document — cardholder name often appears in body text AND in the signature block, dates appear at the top AND the bottom, signatures appear top AND bottom, etc. Emit EVERY occurrence as its own field with the SAME canonical_field_id. The downstream filler will fill each occurrence with the same value. Do NOT collapse repeats; do NOT skip later instances because you already emitted an earlier one.",
-    "- field_kind: text | multiline | date | signature | boolean-checkbox | checkbox-group.",
-    "- Standalone checkboxes: `field_kind: \"boolean-checkbox\"`, `checkbox_value: \"yes\"`.",
-    "",
-    "## CANONICAL FIELD CATALOG (set `canonical_field_id` when confident, otherwise null):",
-    buildSchemaSummary(),
+    "- Coordinates are PDF points, top-left origin. DO NOT recompute them. Pass `x`, `y`, `w`, `h` through verbatim from the script (rename `w`→`width`, `h`→`height`).",
+    "- Pass `context` and `after` through VERBATIM. Do not paraphrase, do not clean them up, do not translate them.",
+    "- Set `canonical_field_id` to `null` for every field. Downstream code handles canonical matching deterministically using the alias catalog; your guesses would only conflict with it.",
+    "- `label`: the cleaned context string (strip trailing colons, drop leading prepositions like \"on\"/\"of\"/\"to\"). For body-text blanks where context is just \"I,\" or \"on\", use a short descriptive label like \"Body field 1\".",
+    "- Repeat fields are kept: production paperwork routinely repeats the same blank across body text and signature blocks. Emit every occurrence; do not collapse.",
+    "- Skip ONLY: headers, footers, page numbers, pre-printed values that obviously aren't fillable.",
+    "- Pass `page_texts` through verbatim as a top-level field of the response.",
     "",
     "## OUTPUT — your final assistant message must be ONLY this JSON object (no markdown fences, no prose):",
     "{",
     "  \"page_count\": number,",
     "  \"form_type\"?: string,",
     "  \"detected_via\"?: \"acroform\" | \"pdfplumber\" | \"mixed\",",
+    "  \"page_texts\": string[],",
     "  \"fields\": Array<{",
-    "    canonical_field_id: string | null,",
+    "    canonical_field_id: null,",
     "    label: string,",
     "    field_type: \"text\" | \"checkbox\",",
     "    field_kind: \"text\" | \"multiline\" | \"date\" | \"signature\" | \"boolean-checkbox\" | \"checkbox-group\",",
     "    page_number: number,",
     "    x: number, y: number, width: number, height: number,",
+    "    context: string,",
+    "    after: string,",
     "    checkbox_value?: string | null,",
-    "    group_id?: string | null,",
-    "    estimated_font_size?: number | null,",
-    "    optional?: boolean",
+    "    group_id?: string | null",
     "  }>",
     "}",
     "",
-    "If the script returns no acroform widgets and no candidates: `{ \"page_count\": N, \"fields\": [] }`.",
+    "If the script returns no acroform widgets and no candidates: `{ \"page_count\": N, \"page_texts\": [...], \"fields\": [] }`.",
   ].join("\n");
 }
 
@@ -458,10 +452,93 @@ function normalizeFieldKind(
   return fieldType === "checkbox" ? "boolean-checkbox" : "text";
 }
 
+/**
+ * Pre-computed [aliasLowercase, canonicalId] pairs sorted by alias length
+ * descending so we always match the most specific alias first
+ * (e.g. "credit card number" wins over "number" / "card").
+ */
+const ALIAS_INDEX: ReadonlyArray<{ alias: string; id: CanonicalFieldId }> =
+  CANONICAL_FIELD_DEFINITIONS.flatMap((def) =>
+    def.aliases.map((alias) => ({
+      alias: alias.toLowerCase().trim(),
+      id: def.id,
+    }))
+  ).sort((a, b) => b.alias.length - a.alias.length);
+
+/**
+ * Deterministic canonical_field_id matching from the script-provided
+ * context/after strings. We do this on the TS side instead of trusting
+ * Claude's `canonical_field_id` output because Claude (especially Sonnet)
+ * tends to force-fit candidates onto canonical ids that don't actually
+ * appear in the form — e.g. assigning `billingCity`/`billingState` to
+ * the Credit Card Number / Expiration Date rows of a CC auth form that
+ * has no separate city/state fields. Alias-based matching against the
+ * actual context strings is far more reliable.
+ *
+ * Returns `undefined` if no alias matches; the caller can then leave the
+ * field unmapped for the user to assign manually.
+ */
+function inferCanonicalId(
+  context: string | undefined,
+  after: string | undefined,
+  fieldType: "text" | "checkbox",
+  pageText: string | undefined
+): CanonicalFieldId | undefined {
+  const ctx = (context ?? "").toLowerCase();
+  const aft = (after ?? "").toLowerCase();
+
+  // Checkboxes: the card-type label sits to the RIGHT of the box.
+  if (fieldType === "checkbox") {
+    if (/\bvisa\b/.test(aft) || /\bvisa\b/.test(ctx)) return "creditCardTypeVisa";
+    if (/\bmaster\s?card\b|\bmc\b/.test(aft) || /\bmaster\s?card\b|\bmc\b/.test(ctx))
+      return "creditCardTypeMastercard";
+    if (/\bamex\b|\bamerican\s?express\b/.test(aft) || /\bamex\b|\bamerican\s?express\b/.test(ctx))
+      return "creditCardTypeAmex";
+    if (/\bdiscover\b/.test(aft) || /\bdiscover\b/.test(ctx))
+      return "creditCardTypeDiscover";
+    return undefined;
+  }
+
+  // Text fields: try context (left of blank) first — that's usually the
+  // explicit field label like "Cardholder Name:". Fall back to the full
+  // row + nearby page text for body-text blanks where context is short.
+  const haystacks = [
+    ctx,
+    aft,
+    `${ctx} ${aft}`.trim(),
+    (pageText ?? "").toLowerCase(),
+  ];
+  for (const { alias, id } of ALIAS_INDEX) {
+    if (alias.length < 3) continue;
+    for (const haystack of haystacks) {
+      if (haystack.includes(alias)) {
+        return id;
+      }
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Cleans up a raw context string into a presentable label.
+ * Strips trailing punctuation/colons, removes leading prepositions, and
+ * caps length.
+ */
+function cleanLabel(context: string | undefined, fallback: string): string {
+  const raw = (context ?? "").trim();
+  if (!raw) return fallback;
+  let cleaned = raw.replace(/[:.,;]+\s*$/g, "").trim();
+  cleaned = cleaned.replace(/^(the|a|an|to|on|for|of|in|at)\s+/i, "");
+  if (cleaned.length === 0) return fallback;
+  if (cleaned.length > 60) return cleaned.slice(0, 57) + "...";
+  return cleaned;
+}
+
 function mapToTemplateField(
   raw: RawClaudeField,
   index: number,
-  pageSizes: PdfPageSize[]
+  pageSizes: PdfPageSize[],
+  pageTexts: string[]
 ): TemplateField | null {
   if (!raw || typeof raw !== "object") return null;
 
@@ -484,10 +561,18 @@ function mapToTemplateField(
   const rawWidth = clampNumber(raw.width ?? minDim, minDim, pageSize.width - x);
   const rawHeight = clampNumber(raw.height ?? minDim, minDim, pageSize.height - y);
 
-  const canonicalId =
+  // Deterministic canonical-id matching from the row context. We prefer
+  // this over Claude's `canonical_field_id` because Claude tends to
+  // force-fit candidates onto canonical ids that don't actually appear
+  // in the form. Only fall back to Claude's value when our matcher can't
+  // find any alias hit.
+  const pageText = pageTexts[pageNumber - 1] ?? "";
+  const inferredId = inferCanonicalId(raw.context, raw.after, fieldType, pageText);
+  const claudeId =
     raw.canonical_field_id && VALID_CANONICAL_IDS.has(raw.canonical_field_id)
       ? (raw.canonical_field_id as CanonicalFieldId)
       : undefined;
+  const canonicalId: CanonicalFieldId | undefined = inferredId ?? claudeId;
 
   const canonicalDef = canonicalId
     ? CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === canonicalId)
@@ -497,7 +582,9 @@ function mapToTemplateField(
   const isBooleanCheckbox = fieldType === "checkbox" && !isCardCheckbox;
 
   const catalogKey = canonicalDef?.mappedProjectKey ?? "";
-  const fieldLabel = (raw.label && raw.label.trim()) || canonicalDef?.label || `Field ${index + 1}`;
+  const fieldLabel =
+    canonicalDef?.label ??
+    cleanLabel(raw.context, (raw.label && raw.label.trim()) || `Field ${index + 1}`);
 
   const isUnmappedText = !isBooleanCheckbox && !isCardCheckbox && !catalogKey;
   const mappedKey: TemplateMappedProjectKey =
@@ -685,8 +772,9 @@ export async function detectFieldsWithClaude(
     return [];
   }
 
+  const pageTexts = Array.isArray(parsed.page_texts) ? parsed.page_texts : [];
   const templateFields = rawFields
-    .map((raw, index) => mapToTemplateField(raw, index, pageSizes))
+    .map((raw, index) => mapToTemplateField(raw, index, pageSizes, pageTexts))
     .filter((field): field is TemplateField => field !== null);
 
   const deduped = dedupeFields(templateFields);
