@@ -44,13 +44,13 @@ export const MODEL_PRESETS: ModelOption[] = [
     id: "gemini-3-flash-preview",
     label: "Gemini 3 Flash (faster)",
     description:
-      "~12-18s per detection. Slightly less precise on dense forms but huge speed win on simple ones.",
+      "~12-18s per detection. Frontier 3.0-line throughput. Slightly less precise than 3.1 Pro on dense forms but a big speed win on simple ones.",
   },
   {
-    id: "gemini-2.5-pro",
-    label: "Gemini 2.5 Pro (legacy)",
+    id: "gemini-3.1-flash-lite",
+    label: "Gemini 3.1 Flash-Lite (cheapest)",
     description:
-      "Older generation. Kept for compatibility — bbox accuracy is significantly weaker than 3.1.",
+      "~10-15s per detection. Cost-efficient general-use tier — best for simple AcroForm or short single-page documents.",
   },
 ];
 
