@@ -236,6 +236,7 @@ function buildSystemPrompt(): string {
     "Tightness check before emitting each field: imagine cropping the page to your bbox. The crop should show empty space (or a drawn underline), nothing else. If you would see ANY printed letters in the crop, the bbox is too wide — shrink it.",
     "",
     "## Field-type rules (deterministic, do NOT deviate)",
+    "  - If a field's surrounding text contains 'CVV', 'CVV2', 'CVC', 'security code', 'verification code', '3 digit', or '4 digit', the field is **always** `text` and `canonical_field_id: 'ccv'`. Do NOT classify it as a credit-card-type checkbox even if 'AMEX' or 'Visa' appears nearby — those words are part of the CVV instructional sentence.",
     "  - CVV / CVV2 / security code / `3 digit number` / `4 digits on front` → always `text`, NEVER `checkbox`. The blank may be drawn with a box outline, but the user types digits in it.",
     "  - Card number, expiration date, signature, name, address, phone, email → always `text`.",
     "  - Visa / MasterCard / Discover / AMEX selector boxes → `checkbox`.",
@@ -420,6 +421,41 @@ function inferCanonicalId(
   const aft = (after ?? "").toLowerCase();
 
   if (fieldType === "checkbox") {
+    // CVV/CVV2/security-code rows are sometimes drawn as a small box
+    // and Gemini misclassifies them as a checkbox. We MUST catch them
+    // BEFORE the visa/mastercard/amex/discover branches: the CVV
+    // instructional sentence often reads "...3 digit number on back of
+    // Visa/MC, 4 digits on front of AMEX...", so context_after for the
+    // CVV row contains "AMEX" and the AMEX branch below would
+    // otherwise hijack it into `creditCardTypeAmex`.
+    //
+    // Returning "ccv" here puts the field into a text-typed canonical
+    // id (fieldKind: "text"), which lets the downstream type-guard in
+    // `mapToTemplateField` coerce the field back from checkbox to
+    // text deterministically.
+    const cvvIndicators = [
+      "cvv2",
+      "cvv",
+      "cvc2",
+      "cvc",
+      "ccv",
+      "security code",
+      "verification code",
+      "card identification",
+      "3 digit",
+      "3-digit",
+      "3 digits",
+      "3-digits",
+      "4 digit",
+      "4-digit",
+      "4 digits",
+      "4-digits",
+    ];
+    const cvvHaystack = `${ctx} ${aft}`;
+    for (const indicator of cvvIndicators) {
+      if (cvvHaystack.includes(indicator)) return "ccv";
+    }
+
     // Card-type label sits to the RIGHT of the box on standard layouts.
     // CRITICAL: do NOT fall back to `context` for the Visa check —
     // every box from Mastercard onwards has "Visa" in its left context,
@@ -448,7 +484,12 @@ function inferCanonicalId(
       if (/\bamex\b|\bamerican\s?express\b/.test(ctx)) return "creditCardTypeAmex";
       if (/\bdiscover\b/.test(ctx)) return "creditCardTypeDiscover";
     }
-    return undefined;
+    // CVV is handled explicitly above the card-type branch — see the
+    // cvvIndicators preflight at the top of this block. We still allow
+    // anything else mistakenly tagged as a checkbox to fall through to
+    // the text-alias matcher below; the type-guard in
+    // `mapToTemplateField` will coerce a text-typed canonical id back
+    // to a text field.
   }
 
   const haystack = `${ctx} ${aft}`.trim();
