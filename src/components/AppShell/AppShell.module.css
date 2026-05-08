@@ -3,6 +3,11 @@
   height: 100%;
   min-height: 0;
   position: relative;
+  /*
+   * Body is transparent (so the dropzone webview can have transparent
+   * corners). The main window paints its surface here.
+   */
+  background: var(--bg-app);
 }
 
 .dragRegion {

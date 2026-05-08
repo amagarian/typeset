@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Caveat:wght@400;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Caveat:wght@400;600&display=swap');
 
 :root {
   --bg-app: #f2f2f0;
@@ -13,11 +13,14 @@
   --radius: 8px;
   --radius-sm: 4px;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
-  --font-sans: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  /* Kept the `--font-sans` name so every existing component picks the
+     new family up automatically; semantically it's now the project's
+     primary monospace stack. */
+  --font-sans: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, "Courier New", monospace;
   --sidebar-width: 200px;
   --header-uppercase: 600;
-  --letter-wide: 0.08em;
-  --letter-normal: 0.02em;
+  --letter-wide: 0.05em;
+  --letter-normal: 0;
   --font-signature: "Caveat", cursive;
 }
 
@@ -30,12 +33,21 @@ html, body, #root {
   margin: 0;
 }
 
+/*
+ * Body must be transparent because the dropzone webview shares this
+ * stylesheet and is hosted in a `transparent: true` Tauri window — any
+ * solid bg here paints the rectangular window corners and breaks the
+ * floating-popover illusion. AppShell (`.shell`) paints the main
+ * window bg explicitly so the standard webview still has its surface.
+ */
 body {
   font-family: var(--font-sans);
-  font-size: 13px;
+  font-size: 12px;
+  font-feature-settings: "calt" 1, "ss01" 1;
   color: var(--text);
-  background: var(--bg-app);
+  background: transparent;
   -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
 }
 
 button {
