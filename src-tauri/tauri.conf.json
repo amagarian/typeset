@@ -1,6 +1,6 @@
 {
   "productName": "Typeset",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "identifier": "com.typeset.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -34,13 +34,7 @@
         "transparent": true,
         "alwaysOnTop": true,
         "visible": false,
-        "skipTaskbar": true,
-        "shadow": false,
-        "windowEffects": {
-          "effects": ["popover"],
-          "state": "active",
-          "radius": 12.0
-        }
+        "skipTaskbar": true
       }
     ],
     "security": {

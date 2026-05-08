@@ -4,6 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Typeset</title>
+    <!--
+      Inline so the webview paints transparent from the very first frame.
+      AppShell.module.css paints the main window's bg explicitly; the
+      tray dropzone webview keeps the transparency end-to-end.
+    -->
+    <style>
+      html, body, #root { background: transparent; }
+    </style>
   </head>
   <body>
     <div id="root"></div>

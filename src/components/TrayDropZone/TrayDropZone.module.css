@@ -1,10 +1,7 @@
 /*
- * The Tauri dropzone window is created with windowEffects: ["popover"]
- * (NSVisualEffectView, macOS popover material) and a 12pt corner
- * radius. The OS paints frosted glass — every surface in here should
- * stay translucent so the blur is the visible "background." Anything
- * we tint solid white here defeats the liquid-glass look the same way
- * the previous opaque card did.
+ * Menu-bar dropzone. The Tauri window is created with transparent: true
+ * so anything outside the .container card is invisible. The card itself
+ * is fully opaque for readability against arbitrary wallpapers.
  */
 
 .wrapper {
@@ -13,6 +10,7 @@
   display: flex;
   flex-direction: column;
   background: transparent;
+  padding: 4px;
 }
 
 .container {
@@ -20,28 +18,21 @@
   flex: 1;
   display: flex;
   flex-direction: column;
-  background: transparent;
-  /*
-   * Match the windowEffects.radius value in tauri.conf.json so the
-   * inner content clips to the same shape the glass material
-   * already has. Border-radius here is mostly defensive — the OS
-   * material handles the visible rounding.
-   */
+  background: var(--bg-panel);
   border-radius: 12px;
   overflow: hidden;
+  border: 1px solid var(--border);
+  box-shadow:
+    0 12px 36px rgba(0, 0, 0, 0.18),
+    0 4px 12px rgba(0, 0, 0, 0.10),
+    0 1px 2px rgba(0, 0, 0, 0.05);
   user-select: none;
-  /* Subtle hairline that reads as a bezel against bright wallpapers
-   * and gives the glass a defined edge in dark mode. */
-  border: 1px solid rgba(255, 255, 255, 0.5);
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6);
 }
 
 .header {
-  padding: 9px 10px 8px;
-  border-bottom: 1px solid rgba(0, 0, 0, 0.06);
-  background: rgba(255, 255, 255, 0.18);
-  -webkit-backdrop-filter: saturate(140%);
-  backdrop-filter: saturate(140%);
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-app);
 }
 
 .jobSelect {
@@ -52,8 +43,8 @@
   font-family: inherit;
   letter-spacing: var(--letter-normal);
   color: var(--text);
-  background: rgba(255, 255, 255, 0.6);
-  border: 1px solid rgba(0, 0, 0, 0.1);
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   outline: none;
   cursor: pointer;
@@ -66,8 +57,7 @@
 }
 
 .jobSelect:focus {
-  border-color: rgba(0, 0, 0, 0.25);
-  background-color: rgba(255, 255, 255, 0.78);
+  border-color: var(--border-focus);
 }
 
 .dropArea {
@@ -82,14 +72,13 @@
 }
 
 .dropArea.dragOver {
-  background: rgba(66, 133, 244, 0.16);
+  background: rgba(66, 133, 244, 0.10);
 }
 
 .dropIcon {
   font-size: 24px;
   font-weight: 300;
-  color: var(--text);
-  opacity: 0.55;
+  color: var(--text-muted);
   line-height: 1;
 }
 
@@ -97,8 +86,7 @@
   font-size: 11px;
   letter-spacing: var(--letter-wide);
   text-transform: uppercase;
-  color: var(--text);
-  opacity: 0.55;
+  color: var(--text-label);
   text-align: center;
 }
 
@@ -114,7 +102,7 @@
 .spinner {
   width: 18px;
   height: 18px;
-  border: 2px solid rgba(0, 0, 0, 0.18);
+  border: 2px solid var(--border);
   border-top-color: var(--text);
   border-radius: 50%;
   animation: processingSpinner 0.6s linear infinite;
@@ -123,39 +111,4 @@
 .successIcon {
   font-size: 22px;
   color: #1f7a3a;
-}
-
-/* Dark menu bars / dark wallpapers: NSVisualEffectView popover
- * material darkens significantly. Lift text/icon contrast and
- * reverse the bezel so the glass keeps its defined edge. */
-@media (prefers-color-scheme: dark) {
-  .container {
-    border-color: rgba(255, 255, 255, 0.12);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.08);
-  }
-  .header {
-    background: rgba(0, 0, 0, 0.18);
-    border-bottom-color: rgba(255, 255, 255, 0.08);
-  }
-  .jobSelect {
-    background: rgba(255, 255, 255, 0.08);
-    border-color: rgba(255, 255, 255, 0.18);
-    color: #f5f5f3;
-  }
-  .jobSelect:focus {
-    background: rgba(255, 255, 255, 0.14);
-    border-color: rgba(255, 255, 255, 0.3);
-  }
-  .dropIcon,
-  .dropText {
-    color: #f5f5f3;
-    opacity: 0.7;
-  }
-  .statusText {
-    color: #f5f5f3;
-  }
-  .spinner {
-    border-color: rgba(255, 255, 255, 0.18);
-    border-top-color: #f5f5f3;
-  }
 }
