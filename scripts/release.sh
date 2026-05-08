@@ -1,9 +1,31 @@
 #!/usr/bin/env bash
+#
+# Builds TYPESET, code-signs the .app (Developer ID if available, ad-hoc
+# otherwise), wraps it for the Tauri auto-updater, and publishes a tagged
+# release on GitHub via the gh CLI.
+#
+# Prerequisites (one-time):
+#   1. Tauri minisign signing key at ~/.tauri/typeset.key (no password):
+#        npx tauri signer generate -p "" -w ~/.tauri/typeset.key
+#      The matching pubkey must already be in src-tauri/tauri.conf.json.
+#   2. gh CLI authenticated:
+#        brew install gh && gh auth login
+#   3. Optional: Developer ID Application cert imported into the login
+#      keychain (otherwise the app is ad-hoc signed — fine for personal
+#      installs, not Gatekeeper-distributable to other Macs).
+#
+# Per-release steps:
+#   - Bump `version` in src-tauri/tauri.conf.json + package.json + run
+#     `npm install --package-lock-only` to update the lockfile.
+#   - Run this script: `bash scripts/release.sh`
+#
+# The script tags off the version string in tauri.conf.json — make sure
+# you've committed the version bump so the tag points at a real commit.
+
 set -euo pipefail
 
 REPO="amagarian/typeset"
 KEY_PATH="$HOME/.tauri/typeset.key"
-SIGNING_IDENTITY="Developer ID Application: Aiden Magarian (NF6D29P3HJ)"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
 
@@ -14,10 +36,12 @@ TAG="v${VERSION}"
 
 echo "==> Releasing TYPESET ${TAG}"
 
+# --- Tauri updater signing key ---
 if [ ! -f "$KEY_PATH" ]; then
-  echo "ERROR: Signing key not found at $KEY_PATH"
-  echo "Run: npm run tauri signer generate -- -w $KEY_PATH"
-  echo "(or move your existing key: mv ~/.tauri/wrapkit.key $KEY_PATH)"
+  echo "ERROR: Tauri signing key not found at $KEY_PATH"
+  echo "Generate one with: npx tauri signer generate -p '' -w $KEY_PATH"
+  echo "Then update tauri.conf.json's plugins.updater.pubkey to the contents of"
+  echo "$KEY_PATH.pub before re-running this script."
   exit 1
 fi
 
@@ -25,29 +49,36 @@ export TAURI_SIGNING_PRIVATE_KEY
 TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY_PATH")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
 
-# Temporarily disable code signing in tauri.conf.json (macOS provenance xattrs break codesign)
-python3 -c "
-import json
-c = json.load(open('src-tauri/tauri.conf.json'))
-c['bundle']['macOS']['signingIdentity'] = None
-json.dump(c, open('src-tauri/tauri.conf.json','w'), indent=2)
-"
+# --- Apple code-signing identity (auto-detected) ---
+# Override with `TYPESET_APPLE_SIGNING_IDENTITY="..."` when you want to force
+# a specific identity (e.g. on a CI runner with multiple certs installed).
+APPLE_SIGNING_IDENTITY="${TYPESET_APPLE_SIGNING_IDENTITY:-}"
+if [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+  APPLE_SIGNING_IDENTITY=$(security find-identity -p codesigning -v 2>/dev/null \
+    | grep "Developer ID Application" \
+    | head -1 \
+    | sed -E 's/.*"(.+)".*/\1/' \
+    || true)
+fi
 
-# Eject any stale DMG volumes
+if [ -n "$APPLE_SIGNING_IDENTITY" ]; then
+  echo "==> Apple code-signing with: $APPLE_SIGNING_IDENTITY"
+  CODESIGN_TARGET="$APPLE_SIGNING_IDENTITY"
+else
+  echo "==> No 'Developer ID Application' cert found — using ad-hoc signing."
+  echo "    The app will install on your Mac (right-click → Open the first time"
+  echo "    to clear Gatekeeper) but isn't distributable to other Macs without"
+  echo "    a Developer ID + notarization."
+  CODESIGN_TARGET="-"
+fi
+
+# Eject any stale DMG volumes from prior runs
 for vol in /Volumes/dmg.*; do
   [ -d "$vol" ] && hdiutil detach "$vol" 2>/dev/null || true
 done
 
-echo "==> Building (without Tauri signing)..."
+echo "==> Building (npx tauri build)…"
 env -u CI npx tauri build
-
-# Restore signing identity
-python3 -c "
-import json
-c = json.load(open('src-tauri/tauri.conf.json'))
-c['bundle']['macOS']['signingIdentity'] = '${SIGNING_IDENTITY}'
-json.dump(c, open('src-tauri/tauri.conf.json','w'), indent=2)
-"
 
 BUNDLE_DIR="$PROJECT_DIR/src-tauri/target/release/bundle"
 APP_DIR="$BUNDLE_DIR/macos/TYPESET.app"
@@ -58,19 +89,24 @@ if [ ! -d "$APP_DIR" ]; then
   exit 1
 fi
 
-echo "==> Stripping macOS extended attributes & signing..."
-xattr -d com.apple.FinderInfo "$APP_DIR" 2>/dev/null || true
-xattr -d "com.apple.fileprovider.fpfs#P" "$APP_DIR" 2>/dev/null || true
-codesign --force --deep --sign "$SIGNING_IDENTITY" "$APP_DIR"
-echo "==> Code signing succeeded"
+echo "==> Stripping macOS extended attributes & signing…"
+# `xattr -cr` clears every extended attribute recursively. tauri's bundler
+# leaves provenance xattrs that break codesign, so this scrub is required.
+xattr -cr "$APP_DIR"
+codesign --force --deep --sign "$CODESIGN_TARGET" "$APP_DIR"
+codesign --verify --deep --strict --verbose=2 "$APP_DIR" || {
+  echo "ERROR: codesign verify failed."
+  exit 1
+}
+echo "==> Code-signing OK"
 
 # Recreate the updater tar.gz from the freshly signed app
-echo "==> Creating updater archive..."
+echo "==> Creating updater archive…"
 cd "$BUNDLE_DIR/macos"
 COPYFILE_DISABLE=1 tar czf TYPESET.app.tar.gz TYPESET.app
 cd "$PROJECT_DIR"
 
-# Sign the updater archive
+# Tauri-sign the updater archive (produces .sig alongside)
 npx tauri signer sign "$BUNDLE_DIR/macos/TYPESET.app.tar.gz"
 
 APP_TAR_GZ="$BUNDLE_DIR/macos/TYPESET.app.tar.gz"
@@ -111,7 +147,7 @@ cat /tmp/latest.json
 
 cp "$DMG" /tmp/TYPESET.dmg
 
-echo "==> Creating GitHub release ${TAG}..."
+echo "==> Creating GitHub release ${TAG}…"
 gh release create "$TAG" \
   --repo "$REPO" \
   --title "TYPESET ${TAG}" \
