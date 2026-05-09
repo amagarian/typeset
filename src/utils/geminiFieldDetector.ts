@@ -15,14 +15,33 @@
  *      viewport).
  *   3. Send the resulting PNG bytes to Gemini as `image/png`
  *      `inlineData` parts (one part per page) plus the system+user
- *      prompt and the responseSchema.
- *   4. Parse the strict-JSON response (responseSchema guarantees it
- *      parses).
+ *      prompt. As of v0.4.10, NO `responseSchema` is supplied for
+ *      Pass 1 / Pass 2 — see the "free-form thinking output" note
+ *      below.
+ *   4. Extract the canonical JSON block from the response (trailing
+ *      ```json``` fence preferred; falls back to "last balanced top-
+ *      level object" + the v0.4.1 truncated-JSON salvager).
  *   5. Map Gemini's 0-1000 normalized bboxes → image-pixel space →
  *      PDF user-space using the captured per-page render scale.
  *      Coord system is fully deterministic.
  *   6. Resolve canonical ids (alias → pattern → model semantic),
  *      clean up labels, dedupe, and return as `TemplateField[]`.
+ *
+ * Free-form thinking output (v0.4.10+):
+ *   Older versions forced strict-JSON output via Gemini's
+ *   `responseSchema` mechanism, which has the side effect of
+ *   effectively turning thinking OFF — the model can't reason step
+ *   by step before committing to its answer. As of v0.4.10 we drop
+ *   `responseSchema` for Pass 1 + Pass 2 and pass
+ *   `thinkingConfig.thinkingBudget = -1` (unbounded) on every call.
+ *   The system prompt instructs the model to think through the form
+ *   first and then emit a single fenced ```json``` block at the end
+ *   of its response containing the same field shape we used before.
+ *   `extractJsonFromText` pulls that block out. This mirrors the way
+ *   Gemini's web app behaves on the same forms and subsumes most of
+ *   the bug-by-bug post-processing we accreted across v0.4.6-0.4.9
+ *   (CVV-as-checkbox, label-below-line, duplicate fields). The
+ *   post-processing guards stay in as a safety net.
  *
  * Two-pass mode (v0.4.7+, default = "maximum"):
  *   When the user picks the "Maximum" accuracy preset, we run a second
@@ -31,7 +50,8 @@
  *   returns keep/drop/fix corrections per field. The corrections are
  *   applied deterministically and re-run through `mapToTemplateField`
  *   so the v0.4.5/v0.4.6 type-guard (CVV-as-checkbox → text) cannot
- *   be weakened by a Pass-2 mistake.
+ *   be weakened by a Pass-2 mistake. As of v0.4.10 Pass 2 also runs
+ *   with thinking enabled and free-form JSON output.
  *
  * Coordinate-system contract with Gemini (v0.4.9+):
  *   - Gemini returns `[y_min, x_min, y_max, x_max]` as integers in the
@@ -292,16 +312,31 @@ function buildCatalogSummary(): string {
 }
 
 /**
- * The single system prompt. Designed to mirror Gemini's desktop-client
- * behaviour: ask for a clean structured-JSON response, not for the
- * model to "show its work" or run any tool. The input is one or more
- * page IMAGES (rendered from the underlying PDF client-side), which
- * removes any ambiguity in the bbox→pixel coordinate mapping.
+ * The single system prompt for Pass 1. As of v0.4.10 we drop the
+ * `responseSchema` constraint and let the model think freely (with
+ * `thinkingBudget: -1`) before emitting its answer in a fenced
+ * ```json``` block at the end of the response. This mirrors Gemini's
+ * web-app behaviour on the same forms.
+ *
+ * The input is one or more page IMAGES (rendered from the underlying
+ * PDF client-side), which removes any ambiguity in the bbox→pixel
+ * coordinate mapping.
  */
 function buildSystemPrompt(): string {
   return [
     "You are extracting fillable form fields from one or more page IMAGES of a paper/PDF form for a film-production assistant. Each image is a single page of the form, in page order.",
-    "Return ONLY a JSON object that conforms to the supplied responseSchema. No prose, no markdown fences.",
+    "",
+    "## How to think (your internal reasoning order)",
+    "Before you answer, work through the form in this order. This thinking is for YOU — none of it appears in your final answer; only the JSON block at the very end is read by the system. You have an UNBOUNDED thinking budget — take as long as you need; we are not time-constrained.",
+    "  1. Read every visible row of every page image, top to bottom.",
+    "  2. Identify each writable area (underline blank, drawn box, empty band) and the printed text immediately surrounding it (label, sentence context).",
+    "  3. Decide each field's type: `text` for blanks the user writes into (including CVV / security-code rectangles — those are ALWAYS text, never checkboxes); `checkbox` only for actual selector glyphs.",
+    "  4. Decide each field's canonical id from the catalog below — set it ONLY when the surrounding sentence unambiguously identifies the field; null is better than a wrong id.",
+    "  5. Verify each bbox hugs ONLY the writable area, never the printed label. If a horizontal scan line through your bbox would cross any printed letters, the bbox is wrong — shrink it.",
+    "",
+    "## How to answer",
+    "After thinking, emit a single JSON code block in triple backticks with the language tag `json`, containing your final response. The JSON object MUST have the shape `{ \"page_count\": number, \"form_type\": string, \"fields\": [ ... ] }` where each field has the properties documented under \"Output shape\" below.",
+    "Do NOT emit JSON inline elsewhere in the response. Do NOT emit multiple JSON blocks. The JSON block MUST appear at the very end of your response, after any reasoning. Any reasoning you do emit (e.g. summary notes) appears BEFORE the JSON block — but you can also emit just the JSON block with no preamble at all.",
     "",
     "## What to find",
     "Every blank, underscore-line, drawn box, or checkbox that a human would fill in. This includes:",
@@ -313,7 +348,8 @@ function buildSystemPrompt(): string {
     "  - Date lines",
     "Skip pre-filled values, decorative lines, table borders, and column dividers.",
     "",
-    "## Output schema notes",
+    "## Output shape",
+    "Each entry in `fields` is an object with these properties:",
     "  - `bbox` MUST be `[y_min, x_min, y_max, x_max]` integers in the normalized 0-1000 range, computed against the dimensions of the image that contains the field. Y-first ordering is mandatory. (0,0) is the TOP-LEFT corner of the image; y increases downward.",
     "  - `page_number` is 1-based and corresponds to the position of the page image in the parts list (page_number=1 → first image, page_number=2 → second image, etc.).",
     "  - `field_type` is `text` or `checkbox`.",
@@ -387,85 +423,18 @@ function buildUserPrompt(
       )
       .join("\n"),
     "",
-    "Extract every fillable field per the system prompt's instructions and return the JSON object.",
+    "Extract every fillable field per the system prompt's instructions and emit the final JSON block at the end of your response (in a triple-backtick fence with the `json` language tag).",
   ].join("\n");
 }
 
-/**
- * Gemini's responseSchema dialect. Mirrors `RawGeminiField` 1:1.
- *
- * Gemini's structured-output engine accepts a subset of JSON Schema —
- * see https://ai.google.dev/api/generate-content#FIELDS.response_schema
- * for the full list. We stick to the supported keywords (`type`,
- * `properties`, `items`, `required`, `enum`, `description`,
- * `propertyOrdering`).
- */
-const RESPONSE_SCHEMA: Record<string, unknown> = {
-  type: "object",
-  required: ["fields"],
-  propertyOrdering: ["page_count", "form_type", "fields"],
-  properties: {
-    page_count: { type: "integer" },
-    form_type: { type: "string" },
-    fields: {
-      type: "array",
-      items: {
-        type: "object",
-        propertyOrdering: [
-          "page_number",
-          "bbox",
-          "field_type",
-          "field_kind",
-          "label",
-          "canonical_field_id",
-          "context_before",
-          "context_after",
-          "checkbox_value",
-          "group_id",
-          "optional",
-          "estimated_font_size",
-        ],
-        required: ["page_number", "bbox", "field_type", "label"],
-        properties: {
-          page_number: { type: "integer", minimum: 1 },
-          bbox: {
-            type: "array",
-            description:
-              "[y_min, x_min, y_max, x_max], integers in normalized 0-1000 range per page. Y-first.",
-            items: { type: "integer", minimum: 0, maximum: 1000 },
-            minItems: 4,
-            maxItems: 4,
-          },
-          field_type: { type: "string", enum: ["text", "checkbox"] },
-          field_kind: {
-            type: "string",
-            enum: [
-              "text",
-              "multiline",
-              "date",
-              "signature",
-              "checkbox-group",
-              "boolean-checkbox",
-            ],
-          },
-          label: { type: "string" },
-          canonical_field_id: {
-            type: "string",
-            nullable: true,
-            description:
-              "One of the canonical ids listed in the system prompt, or null if uncertain.",
-          },
-          context_before: { type: "string" },
-          context_after: { type: "string" },
-          checkbox_value: { type: "string", nullable: true },
-          group_id: { type: "string", nullable: true },
-          optional: { type: "boolean" },
-          estimated_font_size: { type: "number", nullable: true },
-        },
-      },
-    },
-  },
-};
+// As of v0.4.10 we no longer pass a `responseSchema` to Pass 1 / Pass 2
+// — the model thinks freely (with `thinkingBudget: -1`) and emits a
+// fenced JSON block at the end of its response. The shape it produces
+// is documented by `RawGeminiField` / `RawGeminiResponse` above and by
+// the system prompt; the renderer pulls the block out via
+// `extractJsonFromText`. The legacy strict-schema constant lived here
+// in v0.4.5-v0.4.9; reach back into git history if you need to
+// reinstate it.
 
 // ---------------------------------------------------------------------------
 // Post-processing — ported from the Claude flow because these patterns
@@ -1055,6 +1024,149 @@ function progressToFraction(
 }
 
 // ---------------------------------------------------------------------------
+// Free-form response JSON extraction (v0.4.10+)
+// ---------------------------------------------------------------------------
+
+/**
+ * Where in the model's free-form response the JSON came from. Logged
+ * via `[Typeset Diag]` so we can see at a glance whether the model
+ * is wrapping its answer in a fenced block (preferred) or just
+ * dumping JSON at the end of free-form text.
+ */
+export type JsonBlockSource = "fenced" | "trailing" | "raw" | "none";
+
+export interface ExtractedJsonBlock {
+  /** Raw JSON text, ready to feed to JSON.parse. Whitespace-trimmed. */
+  json: string;
+  /** Where it came from in the response. */
+  source: JsonBlockSource;
+}
+
+/**
+ * Pull the canonical JSON block out of a Gemini free-form response.
+ *
+ * Resolution order (the system prompt asks for #1 explicitly):
+ *
+ *   1. The LAST ```json``` (or plain ``` if the language tag is
+ *      missing) fenced code block. The model is told to put its final
+ *      answer here, so this is the strong canonical form.
+ *   2. The LAST top-level balanced JSON object/array followed by EOF
+ *      or whitespace only. Catches cases where the model emits the
+ *      JSON without a fence (we sometimes see this on short answers).
+ *   3. The whole trimmed payload, if it parses as JSON cleanly. This
+ *      is the v0.4.5-v0.4.9 default — kept as a safety net for any
+ *      response that does come back schema-strict.
+ *
+ * Returns `{ source: "none" }` and an empty string when no extraction
+ * is possible. The caller is expected to log the raw response and
+ * surface a useful error to the user.
+ */
+export function extractJsonFromText(text: string): ExtractedJsonBlock {
+  if (!text) return { json: "", source: "none" };
+  // Strip BOM, normalise outer whitespace.
+  const stripped = text.replace(/^\uFEFF/, "");
+  const trimmed = stripped.trim();
+  if (!trimmed) return { json: "", source: "none" };
+
+  // 1. Last ```json ... ``` fenced block.
+  // We accept both ```json and ``` (no language tag) in case the model
+  // omits the tag. The pattern uses `[\s\S]*?` so it can span
+  // newlines without enabling the `s` flag (which is fine but cheaper
+  // to spell explicitly).
+  const fenceRe = /```(?:json|JSON)?\s*\n?([\s\S]*?)```/g;
+  let lastFence: string | null = null;
+  let m: RegExpExecArray | null;
+  while ((m = fenceRe.exec(trimmed)) !== null) {
+    const candidate = (m[1] ?? "").trim();
+    // Heuristic: only treat it as a JSON fence if it starts with `{`
+    // or `[`. Skip code fences that contain non-JSON content (rare,
+    // but the model occasionally embeds a snippet of the form text
+    // inside ``` for visual quoting).
+    if (candidate.startsWith("{") || candidate.startsWith("[")) {
+      lastFence = candidate;
+    }
+  }
+  if (lastFence !== null) return { json: lastFence, source: "fenced" };
+
+  // 2. Last top-level balanced JSON object/array at EOF.
+  const trailing = findLastTrailingTopLevelJson(trimmed);
+  if (trailing) return { json: trailing, source: "trailing" };
+
+  // 3. Whole-payload fallback — only when it actually starts with `{`
+  // or `[`. This catches the schema-strict case where the model returns
+  // pure JSON without any preamble.
+  if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+    return { json: trimmed, source: "raw" };
+  }
+
+  return { json: "", source: "none" };
+}
+
+/**
+ * Find the LAST balanced top-level JSON object or array in `text`
+ * such that everything after it (up to EOF) is whitespace.
+ *
+ * We scan forward from each `{` / `[` and track depth, accounting for
+ * string literals and escapes. The last match that ends at EOF (after
+ * whitespace) wins.
+ *
+ * Worst case is O(n × k) where k is the number of candidate openings,
+ * but typical responses are < 50KB and only have a handful of `{`/`[`
+ * at depth 0, so this is fast in practice.
+ */
+function findLastTrailingTopLevelJson(text: string): string | null {
+  let bestStart = -1;
+  let bestEnd = -1;
+
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch !== "{" && ch !== "[") continue;
+    const open = ch;
+    const close = open === "{" ? "}" : "]";
+
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let j = i; j < text.length; j += 1) {
+      const c = text[j];
+      if (escape) {
+        escape = false;
+        continue;
+      }
+      if (c === "\\") {
+        escape = true;
+        continue;
+      }
+      if (c === '"') {
+        inString = !inString;
+        continue;
+      }
+      if (inString) continue;
+      if (c === open) depth += 1;
+      else if (c === close) {
+        depth -= 1;
+        if (depth === 0) {
+          // We found a balanced block at [i..j]. Accept it only if
+          // everything after `j` is whitespace, so we genuinely have
+          // a trailing top-level JSON.
+          const tail = text.slice(j + 1);
+          if (tail.trim().length === 0) {
+            bestStart = i;
+            bestEnd = j;
+          }
+          break;
+        }
+      }
+    }
+  }
+
+  if (bestStart >= 0 && bestEnd > bestStart) {
+    return text.slice(bestStart, bestEnd + 1).trim();
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
 // Truncated-JSON salvage
 // ---------------------------------------------------------------------------
 
@@ -1200,7 +1312,11 @@ async function runGeminiRoundTrip(args: {
   model: string;
   systemPrompt: string;
   userPrompt: string;
-  responseSchema: Record<string, unknown>;
+  /** Optional as of v0.4.10 — when omitted the model returns free-form
+   *  text and the renderer extracts the JSON block. Pass 1 / Pass 2
+   *  both omit this; the legacy project-import path still passes a
+   *  schema. */
+  responseSchema: Record<string, unknown> | undefined;
   maxOutputTokens: number;
   temperature: number;
   onStatus?: (status: string, progress?: number) => void;
@@ -1259,8 +1375,17 @@ async function runGeminiRoundTrip(args: {
 }
 
 /**
- * Parse a Gemini structured-output response, with the same salvager
- * fallbacks the original Pass 1 used. Shared by Pass 1 and Pass 2.
+ * Parse a Gemini free-form response (v0.4.10+) into the expected
+ * shape. Pull the canonical JSON block out via `extractJsonFromText`,
+ * then `JSON.parse` it. Falls back to the v0.4.1 truncated-JSON
+ * salvager if the block was clipped by the output-token cap. Shared
+ * by Pass 1 and Pass 2.
+ *
+ * Always logs a `[Typeset Diag]` line summarising the response length,
+ * which extraction strategy fired, and the parsed payload size, so we
+ * can spot at a glance whether the model is wrapping its answer
+ * cleanly. On failure we log the head + tail of the raw response so
+ * the user can paste it back for diagnosis.
  */
 function parseStructuredResponse<T>(
   text: string,
@@ -1268,25 +1393,77 @@ function parseStructuredResponse<T>(
   context: string
 ): T {
   const truncated = finishReason === "MAX_TOKENS";
-  try {
-    return JSON.parse(text) as T;
-  } catch (err) {
-    const salvaged = salvageTruncatedJson(text);
-    if (salvaged) {
-      console.warn(
-        `[Typeset Gemini] Recovered ${context} from truncated/malformed response (finishReason=${finishReason}).`
-      );
-      return salvaged as T;
+  const length = text?.length ?? 0;
+  const extracted = extractJsonFromText(text);
+
+  const fieldsOf = (parsed: unknown): number => {
+    if (!parsed || typeof parsed !== "object") return 0;
+    const obj = parsed as Record<string, unknown>;
+    if (Array.isArray(obj.fields)) return obj.fields.length;
+    if (Array.isArray(obj.corrections)) return obj.corrections.length;
+    return 0;
+  };
+
+  const tryParse = (raw: string): T | null => {
+    if (!raw) return null;
+    try {
+      return JSON.parse(raw) as T;
+    } catch {
+      const salvaged = salvageTruncatedJson(raw);
+      return (salvaged as T | null) ?? null;
     }
-    const hint = truncated
-      ? " The response was truncated by the token limit — try a denser form on Pro instead of Flash, or split the form into fewer pages."
-      : "";
-    throw new GeminiApiError(
-      `Gemini returned non-JSON content during ${context}.${hint} (parse error: ${
-        err instanceof Error ? err.message : String(err)
-      })`
-    );
+  };
+
+  if (extracted.source !== "none") {
+    const parsed = tryParse(extracted.json);
+    if (parsed !== null) {
+      console.log(
+        `[Typeset Diag] ${context} raw response length: ${length} chars, JSON block found: ${extracted.source}, parsed ${fieldsOf(parsed)} entries`
+      );
+      if (extracted.source === "trailing" || extracted.source === "raw") {
+        // Log a soft warning when the model didn't wrap its output in
+        // the expected fenced block. Not an error — the trailing /
+        // raw paths still work — but if this fires consistently the
+        // prompt may need tightening.
+        console.log(
+          `[Typeset Gemini] ${context} response did not use a \`\`\`json fence (extracted via "${extracted.source}"). Prompt may need a nudge.`
+        );
+      }
+      return parsed;
+    }
   }
+
+  // Extraction or parse failed. Log the raw text head + tail so the
+  // user can copy it back for a follow-up. We bound the slices because
+  // a runaway response can be hundreds of KB.
+  const head = (text ?? "").slice(0, 500);
+  const tail = (text ?? "").slice(-500);
+  console.error(
+    `[Typeset Diag] Failed to extract JSON during ${context}. raw length=${length}, finishReason=${finishReason}, source=${extracted.source}. Raw head: ${head}\n...Raw tail: ${tail}`
+  );
+
+  const sourceHint = (() => {
+    switch (extracted.source) {
+      case "fenced":
+        return " The model emitted a ```json fence but its contents didn't parse — likely truncated mid-block.";
+      case "trailing":
+        return " The model emitted JSON at the end of the response but it was malformed.";
+      case "raw":
+        return " The whole response looked like JSON but didn't parse.";
+      case "none":
+        return " The model didn't emit a JSON code block at all. Prompt may need tightening.";
+      default:
+        return "";
+    }
+  })();
+
+  const truncatedHint = truncated
+    ? " The response was also truncated by the output-token limit — try Pro instead of Flash, or split the form into fewer pages."
+    : "";
+
+  throw new GeminiApiError(
+    `Gemini didn't return parseable JSON during ${context}.${sourceHint}${truncatedHint} See the console for the raw response head/tail.`
+  );
 }
 
 interface Pass1Result {
@@ -1311,15 +1488,19 @@ async function runPass1(
     model,
     systemPrompt: buildSystemPrompt(),
     userPrompt: buildUserPrompt(pages, filename),
-    responseSchema: RESPONSE_SCHEMA,
-    // Empirical: a typical CCAUTH form with 20-30 fields, each
-    // carrying a ~6-word context snippet + 4-element bbox + canonical
-    // id, runs ~150-220 output tokens per field. Multi-page vendor
-    // packets push past 25 fields. 4096 truncates mid-array on every
-    // dense form (manifests as "Expected ']' " parse errors). 32k
-    // gives ~3-4x headroom against the worst form we've seen and is
-    // well within the 65k output budget on Gemini 2.5/3.x Pro.
-    maxOutputTokens: 32768,
+    // v0.4.10: no responseSchema — the model thinks freely and emits
+    // a fenced JSON block at the end of its response. The renderer
+    // pulls it out via `extractJsonFromText`.
+    responseSchema: undefined,
+    // v0.4.10: bumped from 32768 → 65536 to give the free-form
+    // response more headroom now that the model is also emitting
+    // (optional) reasoning preamble alongside the JSON. Thinking
+    // tokens are a SEPARATE budget on Gemini 2.5/3.x (governed by
+    // `thinkingConfig.thinkingBudget`) and don't count against
+    // `maxOutputTokens`, so this only affects the visible response
+    // size. 65536 is the documented per-response cap on Gemini
+    // 2.5/3.x Pro.
+    maxOutputTokens: 65536,
     temperature: 0.0,
     onStatus,
     phase: "pass1",
@@ -1463,66 +1644,44 @@ interface CorrectionResponse {
   corrections?: FieldCorrection[];
 }
 
-const QC_RESPONSE_SCHEMA: Record<string, unknown> = {
-  type: "object",
-  required: ["corrections"],
-  properties: {
-    corrections: {
-      type: "array",
-      items: {
-        type: "object",
-        required: ["id", "action"],
-        propertyOrdering: [
-          "id",
-          "action",
-          "fixed_bbox",
-          "fixed_field_type",
-          "fixed_canonical_field_id",
-          "reason",
-        ],
-        properties: {
-          id: { type: "string" },
-          action: { type: "string", enum: ["keep", "drop", "fix"] },
-          fixed_bbox: {
-            type: "array",
-            description:
-              "[y_min, x_min, y_max, x_max], integers in normalized 0-1000 range. Required only when action=fix and the bbox is wrong.",
-            items: { type: "integer", minimum: 0, maximum: 1000 },
-            minItems: 4,
-            maxItems: 4,
-            nullable: true,
-          },
-          fixed_field_type: {
-            type: "string",
-            enum: ["text", "checkbox"],
-            nullable: true,
-          },
-          fixed_canonical_field_id: {
-            type: "string",
-            nullable: true,
-            description:
-              "One of the canonical ids listed in the system prompt, or null. Required only when the field's canonical id is wrong.",
-          },
-          reason: { type: "string" },
-        },
-      },
-    },
-  },
-};
+// QC (Pass 2) responseSchema removed in v0.4.10 along with Pass 1's.
+// Pass 2 runs in the same free-form thinking mode as Pass 1; the
+// extractor picks up its trailing ```json``` block and parses it.
+// The corrections shape is documented in `CorrectionResponse` /
+// `FieldCorrection` above and reinforced in the system prompt.
 
 function buildQualityControlSystemPrompt(): string {
   return [
     "You are auditing field detection on a paper/PDF form. You have been sent one IMAGE per page (in page order). A previous pass produced a list of detected fields; for each one, decide whether it is correctly placed and typed given the actual page images.",
     "",
-    "Return ONLY a JSON object that conforms to the supplied responseSchema. No prose, no markdown fences.",
+    "## How to think (your internal reasoning order)",
+    "Before you answer, work through the audit in this order. This thinking is for YOU — none of it appears in your final answer; only the JSON block at the very end is read by the system. You have an UNBOUNDED thinking budget — take as long as you need; we are not time-constrained.",
+    "  1. For each input field, locate the corresponding region on the page image — use the bbox + label + context_before/after to anchor it.",
+    "  2. Inspect what's actually drawn at that location: is there a writable line, drawn box, or empty fillable band? If so, does the bbox tightly hug it (no printed letters inside)?",
+    "  3. Decide the type — `text` for blanks the user writes into (CVV / security-code rectangles ALWAYS qualify); `checkbox` only for actual selector glyphs in a row of card-type or yes/no options.",
+    "  4. Decide the canonical id from the catalog — only if the surrounding sentence unambiguously identifies the field; null is better than wrong.",
+    "  5. Decide the action: `keep` (correct as-is), `fix` (one or more properties wrong but the field is real), `drop` (no writable area exists OR the field duplicates another with the SAME canonical id at IoU > 0.5).",
+    "  6. When in doubt — KEEP. False drops are worse than false keeps. The user can manually delete an unwanted field; a dropped field is lost silently.",
+    "",
+    "## How to answer",
+    "After thinking, emit a single JSON code block in triple backticks with the language tag `json`, containing your final response. The JSON object MUST have the shape `{ \"corrections\": [ ... ] }` with one entry per input field, keyed by the original `id`.",
+    "Do NOT emit JSON inline elsewhere in the response. Do NOT emit multiple JSON blocks. The JSON block MUST appear at the very end of your response, after any reasoning. Any reasoning you do emit appears BEFORE the JSON block — but you can also emit just the JSON block with no preamble at all.",
     "",
     "## Coordinate system",
     "Bounding boxes use the SAME native system as Pass 1: `[y_min, x_min, y_max, x_max]` integers in the normalized 0-1000 range, computed against the dimensions of the page image that contains the field. Y-first ordering is mandatory; (0,0) is the TOP-LEFT corner of the image, y increasing downward.",
     "",
     "## Output shape",
-    "For every input field, emit exactly one entry in `corrections` keyed by its `id`. Use:",
+    "For every input field, emit exactly one entry in `corrections` keyed by its `id`. Each entry has:",
+    "  - `id` — the original field id, unchanged.",
+    "  - `action` — one of `\"keep\"`, `\"drop\"`, `\"fix\"`.",
+    "  - `fixed_bbox` — `[y_min, x_min, y_max, x_max]` integers in 0-1000 (Y-first), only when `action: \"fix\"` and the bbox needs to change. Otherwise null.",
+    "  - `fixed_field_type` — `\"text\"` or `\"checkbox\"`, only when `action: \"fix\"` and the type needs to change. Otherwise null.",
+    "  - `fixed_canonical_field_id` — one of the canonical ids listed below or null, only when `action: \"fix\"` and the canonical id needs to change. Otherwise null.",
+    "  - `reason` — one short sentence (≤ 15 words) explaining your decision.",
+    "",
+    "Use:",
     "  - `action: \"keep\"` — the field is correct as-is. Set every `fixed_*` to null.",
-    "  - `action: \"drop\"` — there is no writable area at this location, or the field is a duplicate of another. Set every `fixed_*` to null.",
+    "  - `action: \"drop\"` — there is no writable area at this location, or the field is a duplicate of another (per Rule 4 below). Set every `fixed_*` to null.",
     "  - `action: \"fix\"` — at least one of the field's properties is wrong. Set ONLY the `fixed_*` properties that need to change; leave the others null.",
     "",
     "Always include the original `id` exactly as provided. Never invent new fields and never re-key.",
@@ -1587,7 +1746,7 @@ function buildQualityControlUserPrompt(
       )
       .join("\n"),
     "",
-    `Pass 1 detected ${fields.length} field(s). Audit each one and return the corrections JSON.`,
+    `Pass 1 detected ${fields.length} field(s). Audit each one per the system prompt's instructions and emit the final corrections JSON in a triple-backtick \`json\` fence at the end of your response.`,
     "",
     "Detected fields:",
     JSON.stringify(fields, null, 2),
@@ -1715,11 +1874,16 @@ async function runQualityControlPass(args: QcArgs): Promise<TemplateField[]> {
     model: args.model,
     systemPrompt: buildQualityControlSystemPrompt(),
     userPrompt: buildQualityControlUserPrompt(args.pages, args.filename, descriptors),
-    responseSchema: QC_RESPONSE_SCHEMA,
-    // The audit response is much smaller than Pass 1 (one record per
-    // input field, no bbox unless action=fix). 16k is comfortable for
-    // ~150 fields and keeps us well below the model's 65k output cap.
-    maxOutputTokens: 16384,
+    // v0.4.10: free-form thinking response (see Pass 1).
+    responseSchema: undefined,
+    // v0.4.10: bumped from 16384 → 65536. Pass 2's response is small
+    // (one record per Pass-1 field, no bbox unless action=fix), but
+    // the model now also emits free-form reasoning before the JSON
+    // block so the visible-output budget needs more headroom. 65536
+    // is the documented per-response cap on Gemini 2.5/3.x Pro.
+    // Thinking tokens are on a separate budget governed by
+    // `thinkingConfig.thinkingBudget`.
+    maxOutputTokens: 65536,
     temperature: 0.0,
     onStatus: args.onStatus,
     phase: "qc",

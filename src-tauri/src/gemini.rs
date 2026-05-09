@@ -9,9 +9,25 @@
 //!     gives us 20-30s end-to-end detection times vs. the 60-90s we saw
 //!     on Anthropic's code-execution path.
 //!
-//!   * Structured output. We pass a `responseSchema` so Gemini emits
-//!     valid JSON matching our wire schema deterministically — no more
-//!     "extract JSON from markdown fences" parsing dance.
+//!   * Output mode (v0.4.10+). The detection passes used to force
+//!     strict-JSON output via `responseSchema`. As of v0.4.10 we drop
+//!     that constraint for Pass 1 / Pass 2 because forcing the model
+//!     into a one-shot structured response effectively turns thinking
+//!     OFF — the model can't reason step-by-step before committing.
+//!     Instead we ask the model (via the system prompt) to think
+//!     freely and emit a single fenced ```json``` block at the end of
+//!     its response. The renderer extracts the trailing JSON block
+//!     with a robust scanner. The legacy project-import path still
+//!     uses `responseSchema` because it never had a thinking benefit.
+//!
+//!   * Thinking (v0.4.10+). We always pass
+//!     `thinkingConfig: { thinkingBudget: -1, includeThoughts: false }`,
+//!     which lets the model spend an unbounded number of internal
+//!     reasoning tokens before emitting visible output. `-1` is
+//!     Google's "dynamic / unbounded" sentinel for the 2.5 / 3.x
+//!     thinking models. `includeThoughts: false` keeps the thoughts
+//!     server-side so the visible response is just the user-facing
+//!     answer.
 //!
 //!   * Streaming. We use the `:streamGenerateContent?alt=sse` endpoint
 //!     so the renderer's progress bar can move in real time as tokens
@@ -70,14 +86,23 @@ pub struct DetectFieldsRequest {
     pub system_prompt: String,
     pub user_prompt: String,
     /// JSON schema (in the Gemini-supported subset) constraining the
-    /// model's output. Required — we only ever call Gemini with a fixed
-    /// output shape.
-    pub response_schema: Value,
+    /// model's output. Optional as of v0.4.10 — when omitted the model
+    /// returns free-form text and the renderer extracts the JSON
+    /// block. Pass 1 / Pass 2 omit this; the project-import path
+    /// keeps it because that flow has no thinking benefit.
+    pub response_schema: Option<Value>,
     /// Maximum output tokens. Leave None for the model default.
     pub max_output_tokens: Option<u32>,
     /// Sampling temperature, 0.0 - 2.0. Lower = more deterministic.
     /// Defaults to 0.0 server-side when omitted.
     pub temperature: Option<f32>,
+    /// Thinking budget. `-1` (default) = dynamic/unbounded; `0` = off;
+    /// positive integer = explicit cap. Per Gemini 2.5/3.x thinking
+    /// API docs.
+    pub thinking_budget: Option<i32>,
+    /// Whether to include thought summaries in the response. We default
+    /// to false so the visible output is just the answer.
+    pub include_thoughts: Option<bool>,
 }
 
 /// One rendered page, ready to inline as `inlineData` in the request
@@ -102,15 +127,22 @@ pub struct DetectFieldsImagesRequest {
     pub model: String,
     pub system_prompt: String,
     pub user_prompt: String,
-    pub response_schema: Value,
+    /// Optional as of v0.4.10 — see `DetectFieldsRequest::response_schema`.
+    pub response_schema: Option<Value>,
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    pub thinking_budget: Option<i32>,
+    pub include_thoughts: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DetectFieldsResponse {
-    /// Concatenated text from every streamed chunk. The renderer parses
-    /// this as JSON (the responseSchema guarantees it parses cleanly).
+    /// Concatenated text from every streamed chunk. When the caller
+    /// supplied a `response_schema`, this is strict JSON and parses
+    /// directly. When the caller omitted `response_schema` (the
+    /// v0.4.10+ Pass 1 / Pass 2 path), this is free-form text whose
+    /// canonical answer lives inside a trailing fenced ```json``` block
+    /// — the renderer's extractor pulls it out.
     pub text: String,
     /// The `finishReason` of the final candidate (`"STOP"`, `"MAX_TOKENS"`,
     /// `"SAFETY"`, etc.).
@@ -175,9 +207,19 @@ struct StreamArgs {
     user_prompt: String,
     system_prompt: String,
     model: String,
-    response_schema: Value,
+    /// Optional `responseSchema`. When present, we also set
+    /// `responseMimeType: "application/json"` and the model is forced
+    /// into a one-shot strict-JSON answer. When None, the model emits
+    /// free-form text — used by the v0.4.10+ thinking-enabled detector.
+    response_schema: Option<Value>,
     max_output_tokens: Option<u32>,
     temperature: Option<f32>,
+    /// Thinking budget per the Gemini 2.5/3.x thinking API. None →
+    /// `-1` (dynamic/unbounded). `0` disables thinking entirely.
+    thinking_budget: Option<i32>,
+    /// Whether the model should include thought summaries in the
+    /// visible response. Defaults to false (server-side only).
+    include_thoughts: Option<bool>,
     /// Detail string for the initial `uploading_file` progress event.
     upload_detail: String,
 }
@@ -201,10 +243,11 @@ async fn run_gemini_stream(
         },
     );
 
-    let mut generation_config = json!({
-        "responseMimeType": "application/json",
-        "responseSchema": args.response_schema,
-    });
+    let mut generation_config = json!({});
+    if let Some(schema) = args.response_schema.take() {
+        generation_config["responseMimeType"] = json!("application/json");
+        generation_config["responseSchema"] = schema;
+    }
     if let Some(t) = args.temperature {
         generation_config["temperature"] = json!(t);
     } else {
@@ -214,6 +257,17 @@ async fn run_gemini_stream(
     if let Some(m) = args.max_output_tokens {
         generation_config["maxOutputTokens"] = json!(m);
     }
+    // Thinking config (v0.4.10+). Default budget = -1 (dynamic /
+    // unbounded). Setting `includeThoughts: false` keeps the chain-of-
+    // thought server-side; only the final answer comes back over the
+    // wire. The Gemini 2.5/3.x API silently ignores this on legacy
+    // non-thinking models, so it's safe to always emit.
+    let thinking_budget = args.thinking_budget.unwrap_or(-1);
+    let include_thoughts = args.include_thoughts.unwrap_or(false);
+    generation_config["thinkingConfig"] = json!({
+        "thinkingBudget": thinking_budget,
+        "includeThoughts": include_thoughts,
+    });
 
     // Append the user prompt text part to whatever inlineData parts
     // the caller assembled.
@@ -406,6 +460,8 @@ pub async fn gemini_detect_fields(
             response_schema: request.response_schema,
             max_output_tokens: request.max_output_tokens,
             temperature: request.temperature,
+            thinking_budget: request.thinking_budget,
+            include_thoughts: request.include_thoughts,
             upload_detail,
         },
     )
@@ -467,6 +523,8 @@ pub async fn gemini_detect_fields_images(
             response_schema: request.response_schema,
             max_output_tokens: request.max_output_tokens,
             temperature: request.temperature,
+            thinking_budget: request.thinking_budget,
+            include_thoughts: request.include_thoughts,
             upload_detail,
         },
     )
