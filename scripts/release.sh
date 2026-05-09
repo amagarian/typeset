@@ -104,10 +104,55 @@ if [ ! -d "$RAW_APP" ]; then
   exit 1
 fi
 
+# --- Inject macOS Asset Catalog (adaptive light/dark dock icon) ---------
+# `actool` compiles src-tauri/icons/AppIcon.xcassets into a binary
+# Assets.car that ships next to Info.plist. macOS looks up the dock icon
+# via CFBundleIconName=AppIcon and (when supported) chooses the
+# `luminosity: dark` rendition automatically. The Tauri-generated .icns
+# stays in place as a legacy fallback.
+echo "==> Compiling Asset Catalog with actool..."
+ASSETS_STAGE="/tmp/typeset-assets-$$"
+mkdir -p "$ASSETS_STAGE"
+actool --compile "$ASSETS_STAGE" \
+       --platform macosx \
+       --minimum-deployment-target 11.0 \
+       --app-icon AppIcon \
+       --output-partial-info-plist "$ASSETS_STAGE/AppIcon.partial.plist" \
+       --warnings --errors \
+       "$PROJECT_DIR/src-tauri/icons/AppIcon.xcassets" >/dev/null
+
+if [ ! -f "$ASSETS_STAGE/Assets.car" ]; then
+  echo "ERROR: actool did not produce Assets.car"
+  rm -rf "$ASSETS_STAGE"
+  exit 1
+fi
+
+cp "$ASSETS_STAGE/Assets.car" "$RAW_APP/Contents/Resources/Assets.car"
+# `actool` also emits an AppIcon.icns next to Assets.car. Use it to
+# overwrite Tauri's bundled .icns so a single actool-produced icon is the
+# source of truth for both Asset-Catalog-aware and Asset-Catalog-blind
+# contexts.
+if [ -f "$ASSETS_STAGE/AppIcon.icns" ]; then
+  cp "$ASSETS_STAGE/AppIcon.icns" "$RAW_APP/Contents/Resources/icon.icns"
+fi
+
+# Tell macOS to look up the dock icon via the Asset Catalog name. The
+# legacy CFBundleIconFile is left in place pointing at icon.icns so older
+# macOS / non-Asset-Catalog readers still find a usable icon.
+INFO_PLIST="$RAW_APP/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Delete :CFBundleIconName" "$INFO_PLIST" 2>/dev/null || true
+/usr/libexec/PlistBuddy -c "Add :CFBundleIconName string AppIcon" "$INFO_PLIST"
+echo "    CFBundleIconName=AppIcon, Assets.car injected"
+rm -rf "$ASSETS_STAGE"
+
 # --- Sign the .app in /tmp ----------------------------------------------
 # `ditto --noextattr --noacl --norsrc` copies the bundle without any
 # extended attributes, ACLs, or resource forks. Even though the source is
 # already in /tmp this is a belt-and-suspenders move.
+#
+# CRITICAL: signing must happen AFTER injecting Assets.car / patching
+# Info.plist — otherwise Gatekeeper rejects the bundle for tampered
+# resources.
 echo "==> Code-signing in $SIGN_STAGE..."
 SIGNED_APP="$SIGN_STAGE/Typeset.app"
 ditto --noextattr --noacl --norsrc "$RAW_APP" "$SIGNED_APP"
@@ -115,6 +160,19 @@ xattr -cr "$SIGNED_APP"
 codesign --force --deep --options runtime --sign "$CODESIGN_TARGET" "$SIGNED_APP"
 codesign --verify --deep --strict --verbose=2 "$SIGNED_APP" 2>&1 | tail -5
 echo "==> Code-signing OK"
+
+# --- Asset Catalog sanity checks ---------------------------------------
+if [ ! -f "$SIGNED_APP/Contents/Resources/Assets.car" ]; then
+  echo "ERROR: Assets.car missing from signed bundle"
+  exit 1
+fi
+ICON_NAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIconName" \
+  "$SIGNED_APP/Contents/Info.plist" 2>/dev/null || echo "")
+if [ "$ICON_NAME" != "AppIcon" ]; then
+  echo "ERROR: CFBundleIconName not set to AppIcon (got: '$ICON_NAME')"
+  exit 1
+fi
+echo "==> Adaptive icon checks OK (Assets.car present, CFBundleIconName=AppIcon)"
 
 # --- Build the DMG with the signed app ----------------------------------
 # Tauri's own bundle_dmg.sh is skipped via --bundles app above (it breaks
