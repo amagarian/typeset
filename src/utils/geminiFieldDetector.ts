@@ -215,8 +215,18 @@ function buildSystemPrompt(): string {
     "  - `field_type` is `text` or `checkbox`.",
     "  - `field_kind` is one of: text, multiline, date, signature, checkbox-group, boolean-checkbox.",
     "  - `label` is a 2-5 word Title Case description of what belongs in the blank, derived from the surrounding sentence (NOT the literal text after the blank). Example: for `...charged an additional $______ plus a 3.3% fee for my booking...`, the label is `Additional Charge Amount`, not `plus a 3.3% fee`.",
-    "  - `context_before` is up to 8 words IMMEDIATELY before the blank on the same row, AND it MUST include the printed label that precedes the writable area on the same scan line (e.g. for the `CVV2: ___ (3 digit number on back of Visa/MC, 4 digits on front of AMEX)` row, context_before MUST contain `CVV2`). If the row has no on-line label and the context comes from the surrounding sentence, include the closest preceding semantically meaningful tokens. NEVER return an empty string for context_before; if you cannot identify any preceding text, omit the field instead.",
-    "  - `context_after` is up to 8 words IMMEDIATELY after the blank on the same row.",
+    "  - `context_before` is the text IMMEDIATELY preceding the blank — typically the last 30-80 characters of the sentence (or the row leading into the blank). It does NOT need to include a printed label. If the blank is mid-sentence, capture the words that come before the blank inside that sentence. The label may live elsewhere in the sentence (e.g. after the blank, or as a noun-phrase that the blank is filling in for); that is fine.",
+    "  - `context_after` is the text IMMEDIATELY following the blank — typically the next 30-80 characters of the same sentence/row.",
+    "  - Use `context_before` AND `context_after` TOGETHER to capture the meaning of the field. Inline-sentence blanks are valid fields and MUST be detected.",
+    "  - NEVER omit a field just because it doesn't have a column-header label. Underline-only blanks inside a paragraph are still fields. A blank surrounded by ordinary prose (e.g. `I, _____, authorize...`) is just as valid as a labelled column blank (e.g. `Cardholder Name: _____`).",
+    "",
+    "  Concrete examples for inline-sentence blanks:",
+    "    - Form text: `I, ___________________, authorize Hollywood Depot to charge my credit card...`",
+    "      → emit a field with `context_before: \"I,\"`, `context_after: \", authorize Hollywood Depot to charge my credit card...\"`, `label: \"Cardholder Name\"`, `canonical_field_id: \"creditCardHolder\"`, `field_type: \"text\"`.",
+    "    - Form text: `to charge the account indicated below on or after _____ (date) Collectively...`",
+    "      → emit a field with `context_before: \"...to charge the account indicated below on or after\"`, `context_after: \"(date) Collectively...\"`, `label: \"Date\"`, `canonical_field_id: \"authorizationDate\"`, `field_type: \"text\"`.",
+    "    - Form text: `CVV2: ____ (3 digit number on back of Visa/MC, 4 digits on front of AMEX)`",
+    "      → `context_before` should contain `CVV2:` (or end with `CVV2`) so the deterministic CVV detector fires; `context_after` should be `(3 digit number on back of Visa/MC, 4 digits on front of AMEX)`. `field_type: \"text\"`, `canonical_field_id: \"ccv\"`.",
     "  - `checkbox_value` is the literal label text next to the checkbox (e.g. `Visa`, `Mastercard`, `Yes`).",
     "",
     "## Canonical field ids",
@@ -1337,8 +1347,10 @@ function buildQualityControlSystemPrompt(): string {
     "",
     "## Audit rules — apply EVERY rule to EVERY field",
     "",
-    "### 1. Bbox tightness",
-    "The bbox must hug the writable blank only. If a horizontal scan line through your bbox would cross any printed letters of the label, the bbox is wrong — `action: \"fix\"` with a tighter `fixed_bbox` that starts just past the label and covers only empty space (or the drawn underline). If there is no writable area at the location at all, `action: \"drop\"`.",
+    "Overall posture: BIAS TOWARD `keep`. False drops are worse than false keeps — the user can manually delete an unwanted field downstream, but a dropped field is lost silently. Only `drop` when you are highly confident the field is invalid; only `fix` when you are confident the input is wrong AND you can express the correct value.",
+    "",
+    "### 1. Bbox tightness — prefer `fix` over `drop`",
+    "The bbox must hug the writable blank only. If a horizontal scan line through the current bbox would cross printed letters of a label, the bbox is wrong — but PREFER `action: \"fix\"` with a tighter `fixed_bbox` over `action: \"drop\"`. Only choose `drop` when you are CERTAIN there is no writable line, drawn box, or empty fillable area at any reasonable nearby position. If the current bbox is misplaced but a writable area DOES exist within ~40 PDF points (≈ 50 normalized units) of where the bbox sits, choose `fix` and emit a corrected `fixed_bbox` that covers the actual blank. Underline strokes can be subtle in a rasterized view — assume the writable line exists if the surrounding context implies a fillable field, even when the underline isn't crisply visible.",
     "",
     "### 2. Type accuracy — CVV / security code is ALWAYS text",
     "If the surrounding text contains any of: 'CVV', 'CVV2', 'CVC', 'security code', 'verification code', 'card identification', '3 digit', '3-digit', '4 digit', '4-digit', the field MUST be `text` with `canonical_field_id: \"ccv\"` — even if the form draws a small rectangle around it. The 'Visa', 'MC', or 'AMEX' tokens that often appear in CVV instructional text (e.g. '3-digit number on back of Visa/MC, 4 digits on front of AMEX') are NOT card-type checkboxes; they are part of the CVV's instructional sentence. If the input field has any of these properties wrong, `action: \"fix\"` with the corrected values.",
@@ -1350,11 +1362,22 @@ function buildQualityControlSystemPrompt(): string {
     "  (c) the row context does NOT mention CVV / CVC / security / verification code / 'digit'.",
     "If those conditions don't hold, the field is not a card-type checkbox. Fix it accordingly.",
     "",
-    "### 4. Duplicates",
-    "If two fields share the same `canonical_field_id` AND their bboxes overlap by more than 50% of their area, drop the lower-confidence one (`action: \"drop\"`). Different positions on the same form ARE allowed (e.g. two Cardholder Name lines, two date lines) — do NOT drop those.",
+    "### 4. Duplicates — IoU > 0.5 AND same canonical id",
+    "Only treat two fields as duplicates when ALL of the following hold:",
+    "  (a) they share the SAME `canonical_field_id` (different ids → never duplicates), AND",
+    "  (b) their bbox intersection-over-union (IoU) exceeds 0.5.",
+    "Compute IoU as area(intersection) / area(union); use IoU, NOT \"% overlap of either box\". This is intentionally stricter than naive overlap and avoids dropping a small bbox that merely sits near a larger one.",
+    "Two fields with the same canonical id at DIFFERENT positions on the page are LEGITIMATE repeats and BOTH must be kept. Examples that occur in this corpus and MUST survive:",
+    "  - Two `creditCardHolder` (Cardholder Name) lines: one inline-sentence (`I, _____, authorize...`) at the top of the form, plus a column-style `Cardholder Name: _____` mid-form.",
+    "  - Two `expDate` (Expiration Date) columns: e.g. `Card Number: _____ Exp Date: _____` and a second exp-date column elsewhere on the form.",
+    "  - Multiple signature/date pairs on the same form.",
+    "When in doubt about whether two repeats are duplicates, KEEP both.",
     "",
-    "### 5. Default",
-    "When in doubt and the field looks correct, return `action: \"keep\"` with all `fixed_*` null. Do not churn fields that are already right; you should only `fix` or `drop` when you are confident the input is wrong.",
+    "### 5. When uncertain, KEEP",
+    "False drops are worse than false keeps. If you cannot decide between `keep` and `drop`, choose `keep`. If you cannot decide between `keep` and `fix`, choose `keep`. Only `drop` when you are highly confident the field is invalid (no writable area at all anywhere nearby) or a true duplicate per Rule 4. Only `fix` when you are confident the input is wrong AND you can express the corrected value.",
+    "",
+    "### 6. Default",
+    "When the field looks correct, return `action: \"keep\"` with all `fixed_*` null. Do not churn fields that are already right.",
     "",
     "## Canonical field ids",
     "When you set `fixed_canonical_field_id`, it MUST be one of the ids below or null. Inventing ids breaks the downstream mapping:",
@@ -1531,6 +1554,7 @@ async function runQualityControlPass(args: QcArgs): Promise<TemplateField[]> {
   let kept = 0;
   let fixed = 0;
   let dropped = 0;
+  let dropOverrides = 0;
 
   for (let i = 0; i < args.pass1Fields.length; i += 1) {
     const field = args.pass1Fields[i];
@@ -1548,6 +1572,31 @@ async function runQualityControlPass(args: QcArgs): Promise<TemplateField[]> {
     const reason = (correction.reason ?? "").trim();
 
     if (action === "drop") {
+      // Deterministic guardrail: a `drop` action against a field that
+      // already resolved to a known canonical id (i.e. it was
+      // confidently mapped via the alias / pattern / model-semantic
+      // ladder in `mapToTemplateField`) is almost always a false drop
+      // — Pass 2 can't see the underline strokes as well as Pass 1 in
+      // some renderings, and we'd rather keep a confidently-mapped
+      // field than silently delete it. Demote `drop` → `keep` here
+      // and log the override loudly. This protects the v0.4.6 CVV
+      // text-coercion path and the legitimate-repeat detection
+      // (multiple Cardholder Name / Expiration Date instances on the
+      // CC-auth form).
+      if (
+        field.canonicalFieldId &&
+        VALID_CANONICAL_IDS.has(field.canonicalFieldId)
+      ) {
+        console.warn(
+          `[Typeset Gemini QC] Drop overridden → keep for confidently-mapped field ${field.id} (${field.canonicalFieldId}, ${field.label}): ${
+            reason || "no reason given"
+          }`
+        );
+        corrected.push(field);
+        kept += 1;
+        dropOverrides += 1;
+        continue;
+      }
       console.log(
         `[Typeset Gemini QC] Dropped ${field.id} (${field.canonicalFieldId ?? "—"}, ${field.label}): ${
           reason || "no reason given"
@@ -1599,7 +1648,7 @@ async function runQualityControlPass(args: QcArgs): Promise<TemplateField[]> {
   const dedupedDropped = corrected.length - deduped.length;
 
   console.log(
-    `[Typeset Gemini QC] Summary: kept=${kept} fixed=${fixed} dropped=${dropped} dedup-dropped=${dedupedDropped} (input=${args.pass1Fields.length}, output=${deduped.length})`
+    `[Typeset Gemini QC] Summary: kept=${kept} fixed=${fixed} dropped=${dropped} drop-overrides=${dropOverrides} dedup-dropped=${dedupedDropped} (input=${args.pass1Fields.length}, output=${deduped.length})`
   );
 
   return deduped;
