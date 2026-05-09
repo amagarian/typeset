@@ -1,5 +1,5 @@
 /**
- * Vertical-underline snap (v0.5.7).
+ * Vertical-underline snap (v0.5.10).
  *
  * Deterministic post-processor that nudges Gemini-detected text-field
  * bboxes so their CENTER LINE sits on the writable underline stroke
@@ -28,7 +28,7 @@
  *   when (a) the field is already a text field, (b) we find at least
  *   one row within ±searchRangePoints of the bbox center that scores
  *   above the dark-coverage threshold AND passes a vertical-thinness
- *   gate (the rows ~3px above and below are mostly light — text
+ *   gate (the rows ~5px above and below are mostly light — text
  *   glyphs span ~10-25px vertically and fail this check), and
  *   (c) the snap delta is ≤ maxSnapPoints. Otherwise we leave the
  *   field alone.
@@ -38,16 +38,39 @@
  * multiline (whose center is far from any one stroke) would be
  * actively destructive.
  *
- * v0.5.7 — stroke-vs-text discrimination + threshold tuning. v0.5.5
- * counted the longest contiguous dark run on a single row as a
- * fraction of bbox width; on dense forms a row of glyph slices
- * could clear the threshold and either pull the field onto the
- * label text or trigger the ambiguity guard and skip the snap. The
- * vertical-thinness gate (`verticalNeighborMax`) plus the closest-
- * to-center selection (instead of highest-score) fix that. The
- * search range, score, ambiguity gap, and max-snap thresholds are
- * loosened in lockstep — the new gate gives us headroom to widen
- * without false-positiving onto label rows.
+ * v0.5.10 — thinness offset + cap widening. The v0.5.7 thinness gate
+ * sampled rows ±3px from each candidate to verify it was a real
+ * stroke. At our 2048-px long-edge render scale (~2.59 px / PDF pt
+ * on US-Letter), a 1pt-thick underline spans ~2.6px of solid pixels
+ * plus 1-2px of anti-alias blur on each side, for an effective
+ * 5-6px footprint. The ±3px samples were therefore landing INSIDE
+ * the stroke's own blur and occasionally rejecting real strokes as
+ * "text". v0.5.10 moves the offset to ±5px so the sample rows
+ * clear the stroke's own anti-aliasing. With the discriminator now
+ * reliably accepting real strokes, the safety caps loosen too —
+ * search range 18→24pt, max snap 12→18pt, score 0.5→0.45, vertical
+ * neighbour max 0.3→0.4. The 18pt cap still rejects wildly-wrong
+ * field jumps (typical line-to-line spacing on US-Letter forms is
+ * 24-30pt).
+ *
+ * Threshold rationale (v0.5.10 shipped values):
+ *   | name                      | value | why                                                 |
+ *   |---------------------------|-------|-----------------------------------------------------|
+ *   | searchRangePoints         | 24 pt | one full line on dense forms, w/ thinness gate      |
+ *   | scoreThreshold            | 0.45  | thinness gate compensates for permissive coverage   |
+ *   | darkLuminance             | 80    | catches near-black strokes, ignores grey shading    |
+ *   | verticalNeighborMax       | 0.4   | label glyph rows still well above this; strokes <<  |
+ *   | THINNESS_NEIGHBOR_OFFSET  | 5 px  | clears stroke's own blur at 2048-px render scale    |
+ *   | ambiguityGapPoints        | 8 pt  | only matters for genuinely equidistant pairs        |
+ *   | maxSnapPoints             | 18 pt | < typical line spacing (24-30pt); never crosses row |
+ *
+ * v0.5.7 — stroke-vs-text discrimination via the vertical-thinness
+ * gate (`verticalNeighborMax`) plus closest-to-center candidate
+ * selection (instead of highest-score). v0.5.5 counted the longest
+ * contiguous dark run on a single row as a fraction of bbox width;
+ * on dense forms a row of glyph slices could clear the threshold
+ * and either pull the field onto the label text or trigger the
+ * ambiguity guard and skip the snap. The thinness gate fixes that.
  *
  * All thresholds (search range, dark luminance, score, vertical
  * neighbor max, ambiguity gap, max snap) are tunable per-call via
@@ -85,36 +108,40 @@ export interface SnapOptions {
    * stroke is found further than this from the bbox center, we take
    * that as evidence the model found a totally different field and
    * leave the bbox alone rather than dragging it across line
-   * boundaries. Default: 12pt.
+   * boundaries. Default: 18pt.
    *
-   * v0.5.7 raised this from 8pt to 12pt to accommodate the 5–12pt
-   * offsets observed on dense forms (e.g. THERUBYCCAUTHFORM2024).
-   * The vertical-thinness gate keeps the snap from chasing label
-   * rows even at the wider cap.
+   * v0.5.10 raised this from 12pt to 18pt: the v0.5.7 cap was clipping
+   * legitimate snaps in the 13–18pt range observed on the top section
+   * of THERUBYCCAUTHFORM2024 (NAME OF CARDHOLDER → STYLIST/DESIGNER
+   * NAME). 18pt is still well below the 24–30pt line spacing typical
+   * on US-Letter forms, so the cap continues to reject wildly-wrong
+   * cross-line jumps.
    */
   maxSnapPoints?: number;
   /**
    * Half-height of the search band, in PDF points, scanned above
-   * AND below the bbox center for an underline stroke. ~18pt is one
+   * AND below the bbox center for an underline stroke. ~24pt is one
    * generous line height — wide enough to find strokes offset by up
    * to a full line on dense forms, narrow enough not to cross-jump
-   * past more than one line boundary. Default: 18pt.
+   * past more than one line boundary. Default: 24pt.
    *
-   * v0.5.7 raised this from 12pt to 18pt now that the vertical-
-   * thinness gate filters out label rows that fall inside the band.
+   * v0.5.10 raised this from 18pt to 24pt in lockstep with the wider
+   * snap cap; the v0.5.7 thinness gate (now sampling at ±5px, see
+   * `THINNESS_NEIGHBOR_OFFSET_PX`) reliably filters label rows even
+   * with the larger band.
    */
   searchRangePoints?: number;
   /**
    * Minimum stroke score (longest contiguous dark-pixel run divided
    * by bbox width) for a row to qualify as the underline. Default:
-   * 0.5 — a stroke must cover at least 50 % of the bbox width to
+   * 0.45 — a stroke must cover at least 45 % of the bbox width to
    * count.
    *
-   * v0.5.7 lowered this from 0.6 to 0.5 because the vertical-
-   * thinness gate compensates for the extra row-coverage candidates
-   * a permissive score lets through. A real underline is still
-   * cheap to recognise (thin + wide); a label row is filtered by
-   * thickness rather than score.
+   * v0.5.10 lowered this from 0.5 to 0.45 because the corrected
+   * thinness offset (±5px) lets us tolerate slightly fainter or
+   * partially-broken strokes without false-positiving onto label
+   * rows. Label glyph rows are filtered by the thinness gate
+   * regardless of how high they score on coverage.
    */
   scoreThreshold?: number;
   /**
@@ -125,13 +152,20 @@ export interface SnapOptions {
    */
   darkLuminance?: number;
   /**
-   * Maximum stroke score allowed on the rows ~3px above AND below a
+   * Maximum stroke score allowed on the rows ~5px above AND below a
    * candidate row for the candidate to be treated as a real
-   * horizontal underline. Real strokes are 1-3 image pixels tall,
-   * so the rows immediately around them are mostly light pixels.
-   * Text glyph rows are ~10-25 px tall, so the rows around them
-   * also contain dark pixels and exceed this threshold.
-   * Default: 0.3 — neighbours must be < 30% dark to qualify.
+   * horizontal underline. Real strokes are 1-3 image pixels tall
+   * (plus 1-2px of anti-alias blur on each side), so the rows
+   * ±5px around them are mostly light pixels. Text glyph rows are
+   * ~10-25px tall, so the rows around them also contain dark
+   * pixels and exceed this threshold.
+   * Default: 0.4 — neighbours must be < 40% dark to qualify.
+   *
+   * v0.5.10 raised this from 0.3 to 0.4 once the offset moved out
+   * to ±5px (clear of the stroke's own blur). At ±5px the neighbour
+   * row of a real stroke is genuinely background-dominated, so we
+   * can afford a more permissive threshold without admitting glyph
+   * rows (which still score ≫ 0.4 even 5px from their centre).
    *
    * Introduced in v0.5.7 to discriminate strokes from label-text
    * rows that happened to score above `scoreThreshold` because
@@ -151,6 +185,7 @@ export interface SnapOptions {
    * equidistant test. With the vertical-thinness gate every
    * qualifying row is a real stroke; if one is clearly closer to
    * the model's bbox center, that's the one the model meant.
+   * (Unchanged in v0.5.10.)
    */
   ambiguityGapPoints?: number;
   /**
@@ -163,11 +198,11 @@ export interface SnapOptions {
 }
 
 const DEFAULT_OPTIONS: Required<SnapOptions> = {
-  maxSnapPoints: 12,
-  searchRangePoints: 18,
-  scoreThreshold: 0.5,
+  maxSnapPoints: 18,
+  searchRangePoints: 24,
+  scoreThreshold: 0.45,
   darkLuminance: 80,
-  verticalNeighborMax: 0.3,
+  verticalNeighborMax: 0.4,
   ambiguityGapPoints: 8,
   verbose: false,
 };
@@ -183,11 +218,19 @@ const DEFAULT_OPTIONS: Required<SnapOptions> = {
 const AMBIGUITY_DISTANCE_TOLERANCE_PT = 1;
 
 /** Vertical pixel offset checked above/below a candidate row for the
- *  thinness gate. Three pixels is large enough to clear stroke anti-
- *  aliasing (real strokes are 1-3 px tall) yet still well inside any
- *  glyph row (~10-25 px tall), so it cleanly separates strokes from
- *  label text without any per-DPI tuning. */
-const THINNESS_NEIGHBOR_OFFSET_PX = 3;
+ *  thinness gate. Five pixels clears the stroke's own anti-aliased
+ *  blur at our 2048-px long-edge render scale: a US-Letter page
+ *  (792 PDF pt tall) renders at ~2.59 px/pt, so a 1pt-thick underline
+ *  spans ~2.6px of solid pixels plus ~1-2px of anti-alias blur on
+ *  each side — an effective 5-6px footprint. Sampling at ±5px lands
+ *  outside that footprint (the neighbour row is genuinely background)
+ *  while still being well inside any label glyph row (~10-25px tall),
+ *  so it cleanly separates strokes from text without per-DPI tuning.
+ *
+ *  v0.5.10 raised this from 3 to 5: at ±3px the sample rows could
+ *  fall INSIDE the stroke's own blur and report a non-trivial
+ *  neighbour score, occasionally rejecting real strokes as text. */
+const THINNESS_NEIGHBOR_OFFSET_PX = 5;
 
 /**
  * Aggregate counters for one snap pass — surfaced via the
@@ -387,13 +430,15 @@ function snapOneField(
 
   // Step 5: scan every row in the band and collect candidates that
   // pass BOTH the score threshold AND the vertical-thinness gate.
-  // The thinness gate is the v0.5.7 fix: a real horizontal stroke
-  // is 1-3 image pixels tall, so the rows ±3 px around it are
-  // mostly light. Glyph rows belonging to label text span ~10-25
-  // px vertically, so their ±3-px neighbours are also dark and
-  // they're rejected here. `rowStrokeScore` already returns 0 for
-  // out-of-bounds rows, so neighbour rows that fall off the page
-  // edge automatically pass (a missing neighbour is "light").
+  // The thinness gate is the v0.5.7 fix, sharpened in v0.5.10: a
+  // real horizontal stroke is 1-3 image pixels tall plus 1-2 px of
+  // anti-alias blur on each side, so the rows ±5 px around it are
+  // mostly light (background) pixels. Glyph rows belonging to label
+  // text span ~10-25 px vertically, so their ±5-px neighbours are
+  // also dark and they're rejected here. `rowStrokeScore` already
+  // returns 0 for out-of-bounds rows, so neighbour rows that fall
+  // off the page edge automatically pass (a missing neighbour is
+  // "light").
   const candidates: StrokeCandidate[] = [];
   let highestScore = 0;
   for (let row = minRow; row <= maxRow; row += 1) {
@@ -505,6 +550,19 @@ function snapOneField(
         best.row,
         `(|Δ|=${Math.abs(deltaPt).toFixed(2)}pt > ${opts.maxSnapPoints}pt)`
       );
+      // Near-miss diagnostic (v0.5.10): if a candidate passed the
+      // thinness gate and is rejected for being JUST over the cap
+      // (within 1.25× of `maxSnapPoints`), surface a warning so
+      // future "still not aligned" reports can quickly tell whether
+      // the cap is the bottleneck (warn fires) or the candidate
+      // filter is (no warn). Gated on verbose+DEV like the per-field
+      // logs above.
+      const absDeltaPt = Math.abs(deltaPt);
+      if (absDeltaPt <= opts.maxSnapPoints * 1.25) {
+        console.warn(
+          `[underlineSnap] near-miss: field=${field.id} page=${field.pageNumber} deltaY=${absDeltaPt.toFixed(2)}pt cap=${opts.maxSnapPoints}pt — consider tuning`
+        );
+      }
     }
     return field;
   }
