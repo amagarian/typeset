@@ -40,8 +40,7 @@ import {
   initRegistry,
   isRegistryEnabled,
   findRegistryMatches,
-  publishTemplate,
-  updatePublishedTemplate,
+  publishTemplateAuto,
   type MatchedRegistryTemplate,
 } from "@/services/templateRegistry";
 import { initTray, updateTrayMenu } from "@/utils/trayManager";
@@ -220,10 +219,6 @@ function MainApp() {
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [matchModal, setMatchModal] = useState<PdfMatchResult | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
-  // Mirrors `isRegistryEnabled()` so React re-renders when the user
-  // saves Supabase credentials in Settings. Updated by `initRegistry()`
-  // on startup and by the Settings modal's `onSaved` callback.
-  const [registryReady, setRegistryReady] = useState(false);
 
   const selectedProject = selectedProjectId
     ? projects.find((p) => p.id === selectedProjectId) ?? null
@@ -243,8 +238,10 @@ function MainApp() {
   // Boot the public template registry once, in the background. Failure
   // is non-fatal: the app remains fully usable in local-only mode and
   // every registry call gracefully no-ops when credentials are absent.
+  // The Settings modal calls `reloadRegistry()` directly when the user
+  // saves new credentials, so we don't need a React-state mirror here.
   useEffect(() => {
-    void initRegistry().then((ok) => setRegistryReady(ok));
+    void initRegistry();
   }, []);
 
   const trayInitialized = useRef(false);
@@ -929,11 +926,29 @@ function MainApp() {
     );
   }, [recordTemplateUndoSnapshot, templateModal]);
 
+  /**
+   * Save a template locally and, if the public registry is configured,
+   * publish (or update) it in the same action. Local save NEVER
+   * blocks on the registry: a network failure, RLS rejection, or
+   * missing credentials results in a non-blocking toast — the local
+   * save still succeeds. See `publishTemplateAuto` for the
+   * created/updated/no-op semantics.
+   *
+   * Fingerprint is recomputed from the current fields so any post-
+   * detection edits (re-labelled fields, new manual fields, deletions)
+   * are reflected in the row's anchor terms / canonical ids before
+   * upload.
+   */
   const handleSaveTemplate = useCallback(
-    (template: Template, opts: { promote?: boolean } = {}) => {
+    async (template: Template, opts: { promote?: boolean } = {}) => {
       const now = new Date().toISOString();
+      const fingerprint =
+        template.fields.length > 0
+          ? buildTemplateFingerprintFromTemplate(template)
+          : template.fingerprint;
       const savedTemplate: Template = {
         ...template,
+        fingerprint,
         status: opts.promote ? "local-verified" : template.status,
         source:
           opts.promote && template.source === "local-draft"
@@ -965,77 +980,73 @@ function MainApp() {
         });
       }
 
-      showToast("Saved template locally.", "success");
-    },
-    [activeDocumentId, selectedProjectId, showToast, updateDocumentInProject]
-  );
+      // Local save is done. Now (best-effort) push to the registry.
+      // Skip when the registry isn't configured, when the template
+      // has no fields (nothing useful to share), or when no
+      // fingerprint could be computed.
+      const canAttemptPublish =
+        isRegistryEnabled() && savedTemplate.fields.length > 0 && Boolean(fingerprint);
 
-  /**
-   * Publish (or update) a template to the public Supabase registry.
-   *
-   * The fingerprint is rebuilt from the latest fields so any post-
-   * detection edits (re-mapped labels, new manual fields) are reflected
-   * in the public row. The registry service strips device-specific
-   * data — `id`, `customValue`, `__custom__` mappings — before upload.
-   *
-   * After a successful first publish we stash the returned `registryId`
-   * on the local copy so subsequent edits route through
-   * `updatePublishedTemplate` (RLS scopes that to the original
-   * publisher's device).
-   */
-  const handlePublishTemplate = useCallback(
-    async (template: Template) => {
-      if (!isRegistryEnabled()) {
-        showToast(
-          "Template registry isn't configured. Add Supabase credentials in Settings.",
-          "info"
-        );
-        setSettingsOpen(true);
+      if (!canAttemptPublish) {
+        if (savedTemplate.fields.length === 0) {
+          showToast("Saved template locally.", "success");
+        } else if (!isRegistryEnabled()) {
+          showToast(
+            "Saved locally. Configure Template Registry in Settings to share.",
+            "info"
+          );
+        } else {
+          showToast("Saved template locally.", "success");
+        }
         return;
       }
-      try {
-        // Always recompute the fingerprint from the latest fields so the
-        // anchor terms / canonical ids reflect any post-detection edits.
-        const fingerprint = buildTemplateFingerprintFromTemplate(template);
-        const ready: Template = { ...template, fingerprint };
 
-        if (template.registryId) {
-          await updatePublishedTemplate(template.registryId, ready);
-          const updated: Template = {
-            ...ready,
-            updatedAt: new Date().toISOString(),
-          };
-          upsertLocalTemplate(updated);
-          setEditedTemplates((prev) => ({ ...prev, [updated.id]: updated }));
-          setDraftTemplate((prev) =>
-            prev && prev.id === updated.id ? updated : prev
-          );
-          showToast("Updated your published template.", "success");
-        } else {
-          const { registryId } = await publishTemplate(ready);
-          const updated: Template = {
-            ...ready,
-            registryId,
-            source: "remote-registry",
-            updatedAt: new Date().toISOString(),
-          };
-          upsertLocalTemplate(updated);
-          setEditedTemplates((prev) => ({ ...prev, [updated.id]: updated }));
-          setDraftTemplate((prev) =>
-            prev && prev.id === updated.id ? updated : prev
-          );
+      try {
+        const result = await publishTemplateAuto(savedTemplate);
+        const publishedAt = new Date().toISOString();
+        const withRegistryId: Template = {
+          ...savedTemplate,
+          registryId: result.id,
+          source:
+            savedTemplate.source === "local-draft"
+              ? "remote-registry"
+              : savedTemplate.source ?? "remote-registry",
+          updatedAt: publishedAt,
+        };
+        upsertLocalTemplate(withRegistryId);
+        setEditedTemplates((prev) => ({ ...prev, [withRegistryId.id]: withRegistryId }));
+        setDraftTemplate((prev) =>
+          prev && prev.id === withRegistryId.id ? withRegistryId : prev
+        );
+
+        if (result.created) {
           showToast(
-            "Published. Other users with the same form will see this template.",
+            "Saved & published to the community registry.",
             "success"
+          );
+        } else if (result.updated) {
+          showToast(
+            "Saved & updated your community registry entry.",
+            "success"
+          );
+        } else {
+          showToast(
+            "Saved locally. Already up to date in the registry.",
+            "info"
           );
         }
       } catch (err) {
-        const message = err instanceof Error ? err.message : "Publish failed.";
-        console.warn("[Typeset] Publish failed:", err);
-        showToast(message, "error");
+        // Local save already succeeded; treat the registry failure as
+        // additive. We deliberately keep the toast at "info" rather
+        // than "error" so the user understands their work is safe.
+        console.warn("[Typeset] Registry publish failed:", err);
+        showToast(
+          "Saved locally. Registry publish failed — check Settings → Test connection.",
+          "info"
+        );
       }
     },
-    [showToast]
+    [activeDocumentId, selectedProjectId, showToast, updateDocumentInProject]
   );
 
   const exportFilledPdf = useCallback(
@@ -1435,7 +1446,7 @@ function MainApp() {
             setTemplateModal(null);
           }}
           onConfirm={(template) => {
-            handleSaveTemplate(template, { promote: true });
+            void handleSaveTemplate(template, { promote: true });
             if (activeDocumentId && selectedProjectId) {
               updateDocumentInProject(selectedProjectId, activeDocumentId, {
                 status: "filled",
@@ -1448,8 +1459,9 @@ function MainApp() {
               });
             }
           }}
-          onSaveLocal={(template) => handleSaveTemplate(template, { promote: true })}
-          onPublish={registryReady ? handlePublishTemplate : undefined}
+          onSaveLocal={(template) => {
+            void handleSaveTemplate(template, { promote: true });
+          }}
           onUndo={handleUndoTemplateEdit}
           canUndo={templateUndoStack.length > 0}
           onRedo={handleRedoTemplateEdit}
@@ -1587,7 +1599,6 @@ function MainApp() {
       <SettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
-        onRegistryConfigChanged={(enabled) => setRegistryReady(enabled)}
         onInstallTemplate={(template) => {
           upsertLocalTemplate(template);
           setEditedTemplates((prev) => ({ ...prev, [template.id]: template }));

@@ -1,9 +1,14 @@
 # Typeset template registry — Supabase setup
 
 Typeset's optional public template registry runs on Supabase. The whole
-feature is optional; the desktop app works fully without it. With it,
-dropped PDFs match against community-published templates before falling
-back to Gemini detection, and you can publish your own.
+feature is optional; the desktop app works fully without it. With it
+configured:
+
+- Every template you save is **automatically shared** to the public
+  registry — no separate publish click. (One button: Save.)
+- Dropped PDFs match against community-published templates before
+  falling back to Gemini detection, so other users dropping the same
+  form get your field map for free.
 
 Setup takes ~5 minutes on a fresh project.
 
@@ -55,10 +60,20 @@ only grants the permissions defined by the RLS policies above.
 5. Click **Save credentials** → **Test connection**.
 6. Expect: `OK — 0 templates in registry.`
 
-Done. Drop a PDF and the registry lookup runs after the local cache
-miss, before Gemini detection. After Gemini detects fields on a fresh
-form, click **Publish to registry** in the template review modal to
-share your field map.
+Done. From now on:
+
+- Drop a PDF → Typeset checks your local cache, then the public
+  registry, then falls back to Gemini detection (zero round-trip
+  cost when a community template is a match).
+- After Gemini detects fields on a fresh form, click **Save template**
+  in the review modal. You'll get a single toast confirming local save
+  + registry publish in one step. The first save creates the row;
+  subsequent saves update it (RLS keys publish ownership to your
+  device). If the local fields haven't changed, the registry call
+  is a no-op.
+- If the registry is unreachable (offline, RLS, etc.), the local save
+  still succeeds and you'll see a non-blocking toast — your work is
+  never lost.
 
 ## Resetting
 

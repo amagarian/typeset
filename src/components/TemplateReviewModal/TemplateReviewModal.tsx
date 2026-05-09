@@ -1,5 +1,10 @@
 import { useState, useCallback, useEffect, useRef } from "react";
-import type { Template, TemplateField, Project, TemplateMappedProjectKey } from "@/types";
+import type {
+  Template,
+  TemplateField,
+  Project,
+  TemplateMappedProjectKey,
+} from "@/types";
 import { PdfPageCanvas } from "@/components/PdfPageCanvas/PdfPageCanvas";
 import { DraggableField } from "@/components/DraggableField/DraggableField";
 import { getTemplateFieldValue, normalizeCardType } from "@/utils/fill";
@@ -49,6 +54,12 @@ interface TemplateReviewModalProps {
   pdfBytes?: Uint8Array | null;
   onClose: () => void;
   onConfirm: (template: Template) => void;
+  /**
+   * Save the template locally. As of v0.5.2 this also publishes to
+   * the public registry when the registry is configured — the publish
+   * is fire-and-forget at the App.tsx level. The modal stays unaware
+   * of the registry; it just calls Save.
+   */
   onSaveLocal: (template: Template) => void;
   onUndo: () => void;
   canUndo: boolean;
@@ -61,14 +72,6 @@ interface TemplateReviewModalProps {
   onAddCheckbox: () => void;
   onProjectChange?: (updates: Partial<Project>) => void;
   onRedetect?: () => void;
-  /**
-   * Optional publish-to-public-registry handler. When provided (i.e.
-   * the registry has been configured in Settings), the modal exposes a
-   * "Publish to registry" / "Update published" button next to "Save
-   * template". App-level code is responsible for handling errors and
-   * surfacing toasts.
-   */
-  onPublish?: (template: Template) => Promise<void>;
 }
 
 export function TemplateReviewModal({
@@ -89,26 +92,14 @@ export function TemplateReviewModal({
   onAddCheckbox,
   onProjectChange,
   onRedetect,
-  onPublish,
 }: TemplateReviewModalProps) {
   const [pageDims, setPageDims] = useState<{ width: number; height: number; scale: number } | null>(null);
   const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
-  const [publishState, setPublishState] = useState<"idle" | "publishing">("idle");
   const fieldListRef = useRef<HTMLUListElement>(null);
 
   const handleDimensions = useCallback((dims: { width: number; height: number; scale: number }) => {
     setPageDims(dims);
   }, []);
-
-  const handlePublishClick = useCallback(async () => {
-    if (!onPublish) return;
-    setPublishState("publishing");
-    try {
-      await onPublish(template);
-    } finally {
-      setPublishState("idle");
-    }
-  }, [onPublish, template]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
@@ -366,25 +357,6 @@ export function TemplateReviewModal({
               title="Run fresh AI detection on this document"
             >
               Re-detect fields
-            </button>
-          )}
-          {onPublish && (
-            <button
-              type="button"
-              className={styles.cancelBtn}
-              onClick={handlePublishClick}
-              disabled={publishState === "publishing" || template.fields.length === 0}
-              title={
-                template.registryId
-                  ? "Push your latest edits to the public registry"
-                  : "Share this template publicly so other users can auto-fill the same form"
-              }
-            >
-              {publishState === "publishing"
-                ? "Publishing…"
-                : template.registryId
-                ? "Update published"
-                : "Publish to registry"}
             </button>
           )}
           <button

@@ -266,14 +266,89 @@ export interface PublishResult {
 }
 
 /**
- * Publish a local Template to the public registry. The template must
- * have a fingerprint — generate one with `buildPdfFingerprint` /
- * `buildTemplateFingerprintFromTemplate` before calling.
+ * Outcome of an auto-publish (the v0.5.2 single-button save+publish
+ * action). Lets the caller toast a context-appropriate message:
+ *
+ *   - `created`: a brand-new submission row was inserted.
+ *   - `updated`: an existing row owned by this device was updated
+ *     because its `fields` payload differed from the local copy.
+ *   - neither flag: no-op — the row exists and is byte-equal to the
+ *     local template (deep-equal on the sanitised fields), so we
+ *     skipped the network round-trip.
+ *
+ * The registry id is always returned so callers can stash it on the
+ * local Template (so subsequent edits route through the update path).
  */
-export async function publishTemplate(
+export type AutoPublishOutcome =
+  | { created: true; updated?: never; id: string; registryRow: RegistryTemplate }
+  | { updated: true; created?: never; id: string; registryRow: RegistryTemplate }
+  | { created?: never; updated?: never; id: string; registryRow: RegistryTemplate };
+
+function buildSubmissionPayload(
+  template: Template,
+  fp: NonNullable<Template["fingerprint"]>,
+  options: PublishOptions
+) {
+  const sanitisedFields = template.fields.map(sanitiseField);
+  return {
+    name: (options.name ?? template.name).trim().slice(0, 120),
+    description: options.description?.trim().slice(0, 500) || null,
+    fingerprint_hash: fp.fingerprintHash,
+    fingerprint: fp,
+    page_count: fp.pageCount,
+    anchor_terms: fp.anchorTerms,
+    checkbox_terms: fp.checkboxTerms,
+    file_name_hints: fp.fileNameHints,
+    canonical_field_ids: fp.canonicalFieldIds,
+    fields: sanitisedFields,
+  };
+}
+
+/**
+ * Strip volatile / device-local data from a TemplateField and return a
+ * stable shape suitable for deep-equal comparison against a server
+ * row. Mirrors `sanitiseField` but does NOT regenerate the id (so two
+ * server rows with different per-write uuids still compare equal on
+ * shape alone).
+ */
+function fieldShapeForCompare(field: TemplateField): Omit<TemplateField, "id"> {
+  const { id: _id, customValue: _cv, ...rest } = field;
+  void _id;
+  void _cv;
+  const mappedProjectKey =
+    rest.mappedProjectKey === "__custom__" ? "" : rest.mappedProjectKey;
+  return {
+    ...rest,
+    mappedProjectKey,
+    detectionSource: "gemini",
+  };
+}
+
+function fieldsEqualIgnoringIds(
+  local: TemplateField[],
+  remote: TemplateField[]
+): boolean {
+  if (local.length !== remote.length) return false;
+  const a = local.map(fieldShapeForCompare);
+  const b = remote.map(fieldShapeForCompare);
+  return JSON.stringify(a) === JSON.stringify(b);
+}
+
+/**
+ * Save-and-publish in a single round-trip. Looks up an existing row
+ * for `(publisher_device_id, fingerprint_hash)`; INSERTs if none,
+ * UPDATEs if the local fields differ from the server copy, and is a
+ * no-op otherwise. The shape this returns drives the toast that
+ * `App.tsx` shows after a Save click.
+ *
+ * Local save MUST happen first and MUST NOT depend on this call —
+ * any failure here (network, RLS, schema) is caught and surfaced as a
+ * non-blocking warning. See `handleSaveTemplate` in `App.tsx`.
+ */
+export async function publishTemplateAuto(
   template: Template,
   options: PublishOptions = {}
-): Promise<PublishResult> {
+): Promise<AutoPublishOutcome> {
   const client = getClient();
   if (!client) throw new RegistryDisabledError();
   if (!template.fingerprint) {
@@ -284,71 +359,69 @@ export async function publishTemplate(
   }
 
   const fp = template.fingerprint;
-  const sanitisedFields = template.fields.map(sanitiseField);
-  const payload = {
-    name: (options.name ?? template.name).trim().slice(0, 120),
-    description: options.description?.trim().slice(0, 500) || null,
-    fingerprint_hash: fp.fingerprintHash,
-    fingerprint: fp,
-    page_count: fp.pageCount,
-    anchor_terms: fp.anchorTerms,
-    checkbox_terms: fp.checkboxTerms,
-    file_name_hints: fp.fileNameHints,
-    canonical_field_ids: fp.canonicalFieldIds,
-    fields: sanitisedFields,
-    publisher_device_id: getDeviceId(),
-  };
+  const deviceId = getDeviceId();
+  const payload = buildSubmissionPayload(template, fp, options);
 
+  // Lookup-then-insert/update. Two-step is clearer than upsert here:
+  // the row's primary key is a uuid generated server-side, so we
+  // can't drive the upsert by primary key from the client. The
+  // (publisher_device_id, fingerprint_hash) pair is what gives a
+  // template its identity from this device's perspective.
+  const { data: existingRows, error: lookupError } = await client
+    .from(SUBMISSIONS_TABLE)
+    .select("*")
+    .eq("publisher_device_id", deviceId)
+    .eq("fingerprint_hash", fp.fingerprintHash)
+    .limit(1);
+
+  if (lookupError) {
+    throw new Error(`Registry lookup failed: ${lookupError.message}`);
+  }
+
+  const existing = (existingRows as SubmissionRow[] | null)?.[0] ?? null;
+
+  if (existing) {
+    // Skip the network round-trip when nothing relevant changed.
+    // We compare the field shapes (ignoring ids/customValue) and the
+    // displayed name; description can drift without a reason to
+    // re-publish if the user only renamed locally — but in practice
+    // we treat any name change as worth pushing.
+    const sameFields = fieldsEqualIgnoringIds(
+      template.fields,
+      existing.fields ?? []
+    );
+    const sameName = payload.name === existing.name;
+    if (sameFields && sameName) {
+      return { id: existing.id, registryRow: rowToTemplate(existing) };
+    }
+
+    const updatePayload = {
+      ...payload,
+      updated_at: new Date().toISOString(),
+    };
+    const { data, error } = await client
+      .from(SUBMISSIONS_TABLE)
+      .update(updatePayload)
+      .eq("id", existing.id)
+      .select()
+      .single<SubmissionRow>();
+    if (error) throw new Error(`Update failed: ${error.message}`);
+    if (!data) throw new Error("Update failed: empty response.");
+    return { updated: true, id: data.id, registryRow: rowToTemplate(data) };
+  }
+
+  const insertPayload = {
+    ...payload,
+    publisher_device_id: deviceId,
+  };
   const { data, error } = await client
     .from(SUBMISSIONS_TABLE)
-    .insert(payload)
+    .insert(insertPayload)
     .select()
     .single<SubmissionRow>();
-
   if (error) throw new Error(`Publish failed: ${error.message}`);
   if (!data) throw new Error("Publish failed: empty response.");
-
-  return { registryId: data.id, registryRow: rowToTemplate(data) };
-}
-
-/**
- * Update a template that the current device originally published.
- * Fails (RLS) if `publisher_device_id` doesn't match.
- */
-export async function updatePublishedTemplate(
-  registryId: string,
-  template: Template,
-  options: PublishOptions = {}
-): Promise<RegistryTemplate> {
-  const client = getClient();
-  if (!client) throw new RegistryDisabledError();
-  if (!template.fingerprint) {
-    throw new Error("Template is missing a fingerprint; refusing to update.");
-  }
-  const fp = template.fingerprint;
-  const sanitisedFields = template.fields.map(sanitiseField);
-  const payload = {
-    name: (options.name ?? template.name).trim().slice(0, 120),
-    description: options.description?.trim().slice(0, 500) || null,
-    fingerprint_hash: fp.fingerprintHash,
-    fingerprint: fp,
-    page_count: fp.pageCount,
-    anchor_terms: fp.anchorTerms,
-    checkbox_terms: fp.checkboxTerms,
-    file_name_hints: fp.fileNameHints,
-    canonical_field_ids: fp.canonicalFieldIds,
-    fields: sanitisedFields,
-    updated_at: new Date().toISOString(),
-  };
-  const { data, error } = await client
-    .from(SUBMISSIONS_TABLE)
-    .update(payload)
-    .eq("id", registryId)
-    .select()
-    .single<SubmissionRow>();
-  if (error) throw new Error(`Update failed: ${error.message}`);
-  if (!data) throw new Error("Update failed: empty response.");
-  return rowToTemplate(data);
+  return { created: true, id: data.id, registryRow: rowToTemplate(data) };
 }
 
 /** Delete a template you own. RLS enforces ownership. */

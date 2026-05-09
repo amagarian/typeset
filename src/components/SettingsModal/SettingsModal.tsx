@@ -40,8 +40,6 @@ interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
   onSaved?: () => void;
-  /** Called whenever the registry's enabled state changes (after Save). */
-  onRegistryConfigChanged?: (enabled: boolean) => void;
   /** Called when the user clicks Install on a registry-browser row. */
   onInstallTemplate?: (template: Template) => void;
 }
@@ -72,7 +70,6 @@ export function SettingsModal({
   open,
   onClose,
   onSaved,
-  onRegistryConfigChanged,
   onInstallTemplate,
 }: SettingsModalProps) {
   // -------------------------------------------------------------------------
@@ -240,8 +237,9 @@ export function SettingsModal({
       await setRegistryCredentials(url, key);
       setRegistryConfigured(true);
       setRegistryKeyInput("");
-      const enabled = await reloadRegistry();
-      onRegistryConfigChanged?.(enabled);
+      // Rebuild the in-module Supabase client immediately so the next
+      // Save-template click can publish without a restart.
+      await reloadRegistry();
       setRegistryTestStatus({
         kind: "ok",
         message: "Saved. Use Test connection to verify the migration ran.",
@@ -252,7 +250,7 @@ export function SettingsModal({
     } finally {
       setRegistryBusy(false);
     }
-  }, [registryUrlInput, registryKeyInput, onRegistryConfigChanged]);
+  }, [registryUrlInput, registryKeyInput]);
 
   const handleClearRegistryCreds = useCallback(async () => {
     setRegistryBusy(true);
@@ -262,8 +260,7 @@ export function SettingsModal({
       setRegistryConfigured(false);
       setRegistryUrlInput("");
       setRegistryKeyInput("");
-      const enabled = await reloadRegistry();
-      onRegistryConfigChanged?.(enabled);
+      await reloadRegistry();
       setBrowseResults([]);
     } catch (err) {
       const message = err instanceof Error ? err.message : "Failed to clear credentials.";
@@ -271,7 +268,7 @@ export function SettingsModal({
     } finally {
       setRegistryBusy(false);
     }
-  }, [onRegistryConfigChanged]);
+  }, []);
 
   const handleTestRegistry = useCallback(async () => {
     setRegistryTestStatus({ kind: "running" });
@@ -284,8 +281,7 @@ export function SettingsModal({
         await setRegistryCredentials(url, key);
         setRegistryConfigured(true);
         setRegistryKeyInput("");
-        const enabled = await reloadRegistry();
-        onRegistryConfigChanged?.(enabled);
+        await reloadRegistry();
       }
       const count = await testRegistryConnection();
       setRegistryTestStatus({
@@ -296,7 +292,7 @@ export function SettingsModal({
       const message = err instanceof Error ? err.message : "Connection test failed.";
       setRegistryTestStatus({ kind: "error", message });
     }
-  }, [registryUrlInput, registryKeyInput, onRegistryConfigChanged]);
+  }, [registryUrlInput, registryKeyInput]);
 
   const handleBrowse = useCallback(async () => {
     if (!isRegistryEnabled()) {
@@ -489,10 +485,11 @@ export function SettingsModal({
           <div className={styles.section}>
             <span className={styles.label}>Template registry (Supabase)</span>
             <p className={styles.helpText}>
-              Optional. When configured, Typeset matches dropped PDFs against
-              a public registry of community-published templates before
-              falling back to Gemini detection — and lets you publish your
-              own. Stored in your OS keychain. See{" "}
+              Optional. When configured, every template you save is
+              automatically shared to the public registry — and other
+              users dropping the same form will get your field map
+              instantly, no Gemini call required. Credentials live in
+              your OS keychain (no rebuild required). See{" "}
               <code>supabase/README.md</code> for setup.
             </p>
             <input
