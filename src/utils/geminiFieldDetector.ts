@@ -90,6 +90,10 @@ import {
 } from "@/types";
 import { CANONICAL_FIELD_DEFINITIONS } from "@/utils/fieldCatalog";
 import { normalizeCardType } from "@/utils/fill";
+import {
+  snapFieldsToUnderlines,
+  type PageRender,
+} from "@/utils/underlineSnap";
 
 export {
   GeminiNotConfiguredError as ClaudeNotConfiguredError, // back-compat alias
@@ -118,6 +122,14 @@ interface RenderedPage {
    *  of the app stores on `TemplateField` rectangles). */
   pageWidthPt: number;
   pageHeightPt: number;
+  /**
+   * Raw RGBA pixel buffer captured from the same canvas the PNG was
+   * encoded from. Used by the v0.5.5 vertical-underline snap
+   * post-processor (`snapFieldsToUnderlines`) to measure where the
+   * actual stroke sits. Optional because synthetic placeholder
+   * pages built inside the QC pass don't carry pixels.
+   */
+  imageData?: ImageData;
 }
 
 interface RawGeminiField {
@@ -266,6 +278,24 @@ async function renderPagesToPng(
 
       await page.render({ canvasContext: ctx, viewport }).promise;
 
+      // v0.5.5 — capture the raw RGBA buffer alongside the PNG so the
+      // underline-snap post-processor can scan rows for the actual
+      // stroke positions. Reading from the same canvas avoids a
+      // second render pass (the canvas is about to be discarded
+      // anyway). Wrapped in try/catch because some headless
+      // environments throw `SecurityError` from a tainted canvas;
+      // the snap pass is a no-op when imageData is missing.
+      let imageData: ImageData | undefined;
+      try {
+        imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      } catch (err) {
+        console.warn(
+          `[Typeset Diag] Could not capture ImageData for page ${pageNumber}; underline snap will skip this page. (${
+            err instanceof Error ? err.message : String(err)
+          })`
+        );
+      }
+
       const blob = await new Promise<Blob | null>((resolve) =>
         canvas.toBlob((b) => resolve(b), "image/png")
       );
@@ -283,6 +313,7 @@ async function renderPagesToPng(
         heightPx: canvas.height,
         pageWidthPt: Math.round(baseViewport.width),
         pageHeightPt: Math.round(baseViewport.height),
+        imageData,
       });
     }
   } finally {
@@ -1886,9 +1917,33 @@ async function detectFieldsImpl(
     ? await runPass1TwoStage(pages, filename, model, onStatus)
     : await runPass1Single(pages, filename, model, onStatus);
 
+  // v0.5.5 — build the page-render map ONCE here so both Fast-mode
+  // and Maximum-mode paths can hand it to the underline-snap
+  // post-processor without re-deriving it. PageRender uses
+  // PDF-points-per-pixel because the snap algorithm carries its
+  // bbox math in pixel space and back-converts at the end.
+  const pageRenders: Record<number, PageRender> = {};
+  for (const p of pages) {
+    if (!p.imageData) continue;
+    pageRenders[p.pageNumber] = {
+      imageData: p.imageData,
+      width: p.widthPx,
+      height: p.heightPx,
+      pdfPointsPerPixel: p.pageWidthPt / Math.max(1, p.widthPx),
+    };
+  }
+
   if (!twoPass) {
-    onStatus?.(`Gemini detected ${pass1.fields.length} field(s).`, 1);
-    return pass1.fields;
+    // v0.5.5 snap runs once per detection regardless of accuracy
+    // mode, AFTER mapToTemplateField + dedup but BEFORE we hand the
+    // fields back to the UI. Verbose logging is on so the snap's
+    // per-field decisions land in the diagnostic log next to
+    // Pass 1's bbox dumps.
+    const snapped = snapFieldsToUnderlines(pass1.fields, pageRenders, {
+      verbose: true,
+    });
+    onStatus?.(`Gemini detected ${snapped.length} field(s).`, 1);
+    return snapped;
   }
 
   // ----- Pass 2: quality-control audit ------------------------------------
@@ -1915,18 +1970,26 @@ async function detectFieldsImpl(
         err instanceof Error ? err.message : String(err)
       }`
     );
+    // Snap still runs on the Pass-1 fallback — the v0.5.5 nudge is
+    // model-agnostic and is most useful precisely when QC fails.
+    const snapped = snapFieldsToUnderlines(pass1.fields, pageRenders, {
+      verbose: true,
+    });
     onStatus?.(
-      `Verification failed; using Pass 1 results (${pass1.fields.length} field(s)).`,
+      `Verification failed; using Pass 1 results (${snapped.length} field(s)).`,
       1
     );
-    return pass1.fields;
+    return snapped;
   }
 
+  const snapped = snapFieldsToUnderlines(qcFields, pageRenders, {
+    verbose: true,
+  });
   onStatus?.(
-    `Detection complete — ${qcFields.length} field(s) after verification.`,
+    `Detection complete — ${snapped.length} field(s) after verification.`,
     1
   );
-  return qcFields;
+  return snapped;
 }
 
 // ---------------------------------------------------------------------------
