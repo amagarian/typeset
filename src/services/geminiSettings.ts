@@ -116,15 +116,21 @@ export function clearModelPreference(): void {
  *
  * - `"maximum"` runs Pass 1 (existing single-pass detection) followed by
  *   a second Gemini call that audits Pass 1's output against the same
- *   PDF and returns keep/drop/fix corrections. ~12s typical, dramatically
- *   more accurate on dense forms — every misclassification gets a second
- *   look. Default for new users.
- * - `"fast"` is the single-pass behaviour (Pass 1 only). ~6s typical.
+ *   PDF and returns keep/drop/fix corrections. ~30-50s typical,
+ *   dramatically more accurate on dense forms. Default for new users.
+ * - `"fast"` is the single-pass behaviour (Pass 1 only). ~6-22s typical.
+ * - `"precision"` (v0.4.13) decouples spatial reasoning from the LLM:
+ *   blanks are located deterministically via pdf.js text-layer
+ *   extraction + canvas pixel analysis (underscore lines, horizontal
+ *   underline strokes, small box outlines, empty bands above all-caps
+ *   captions), then a SINGLE Gemini call labels the located blanks.
+ *   Pixel-perfect bboxes; ~5-10s typical. Falls back to Maximum on
+ *   scanned PDFs (no text layer).
  *
  * The persisted value is exposed only on the renderer side; the Rust
  * backend doesn't care how many passes the renderer chooses to run.
  */
-export type AccuracyMode = "maximum" | "fast";
+export type AccuracyMode = "maximum" | "fast" | "precision";
 
 export const DEFAULT_ACCURACY_MODE: AccuracyMode = "maximum";
 
@@ -136,21 +142,27 @@ export interface AccuracyOption {
 
 export const ACCURACY_OPTIONS: AccuracyOption[] = [
   {
-    id: "maximum",
-    label: "Maximum (recommended)",
-    description:
-      "Three-pass review with description-first reasoning (~30-50s, roughly). Best for complex forms with subtle layouts.",
-  },
-  {
     id: "fast",
     label: "Fast",
     description:
-      "Single-pass detection (~6-22s, roughly). Best for simple forms.",
+      "Single-pass detection (~6-22s). Best for simple forms.",
+  },
+  {
+    id: "maximum",
+    label: "Maximum (recommended)",
+    description:
+      "Three-pass review with description-first reasoning (~30-50s). Best for complex forms with subtle layouts.",
+  },
+  {
+    id: "precision",
+    label: "Precision (experimental)",
+    description:
+      "OCR + geometric blank detection + Gemini for labeling only (~5-10s). Pixel-perfect bboxes; falls back to Maximum on scanned PDFs.",
   },
 ];
 
 function isAccuracyMode(value: unknown): value is AccuracyMode {
-  return value === "maximum" || value === "fast";
+  return value === "maximum" || value === "fast" || value === "precision";
 }
 
 export function getAccuracyMode(): AccuracyMode {

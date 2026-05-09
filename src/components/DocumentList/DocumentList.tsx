@@ -18,10 +18,14 @@ interface DocumentListProps {
 //     ~30-50s on Pro for typical CC-auth forms (v0.4.12+). The curve
 //     is widened to 150s so the time-based bar doesn't sprint past
 //     where the phase-floor actually is when the model is mid-stage.
+//   - Precision (v0.4.13):   pdf.js text extract + canvas geometry +
+//     a single Gemini labeling call, ~5-10s. 30s curve gives the
+//     time-based bar a touch of headroom over the phase floor.
 // The phase floor (set by `processingProgress` from the detector)
 // still drives final completion regardless of clock drift.
 const ESTIMATED_DURATION_MS_FAST = 90_000;
 const ESTIMATED_DURATION_MS_MAXIMUM = 150_000;
+const ESTIMATED_DURATION_MS_PRECISION = 30_000;
 
 function ProcessingRow({ doc, onRemove }: { doc: ProjectDocument; onRemove: (id: string) => void }) {
   // `timeProgress` is the smooth elapsed-time curve (asymptotic to ~95%).
@@ -38,10 +42,13 @@ function ProcessingRow({ doc, onRemove }: { doc: ProjectDocument; onRemove: (id:
     // Read accuracy mode at row mount; users rarely toggle it mid-run
     // and a stale value just means a slightly off curve, not a wrong
     // bar.
+    const accuracyMode = getAccuracyMode();
     const duration =
-      getAccuracyMode() === "maximum"
+      accuracyMode === "maximum"
         ? ESTIMATED_DURATION_MS_MAXIMUM
-        : ESTIMATED_DURATION_MS_FAST;
+        : accuracyMode === "precision"
+          ? ESTIMATED_DURATION_MS_PRECISION
+          : ESTIMATED_DURATION_MS_FAST;
 
     const tick = () => {
       const elapsed = Date.now() - startTime;
