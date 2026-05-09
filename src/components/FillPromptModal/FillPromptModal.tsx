@@ -38,8 +38,8 @@ export function FillPromptModal({
   const [skippedIds, setSkippedIds] = useState<Set<string>>(new Set());
   const [pageDims, setPageDims] = useState<{ width: number; height: number; scale: number } | null>(null);
 
-  const handleDimensions = useCallback((dims: { width: number; height: number; scale: number }) => {
-    setPageDims(dims);
+  const handleDimensions = useCallback((dims: { width: number; height: number; scale: number; renderedZoom: number }) => {
+    setPageDims({ width: dims.width, height: dims.height, scale: dims.scale });
   }, []);
 
   const toggleSkipped = useCallback((fieldId: string) => {

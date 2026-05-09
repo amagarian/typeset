@@ -55,6 +55,12 @@ const ZOOM_MIN = 0.5;
 const ZOOM_MAX = 4;
 const ZOOM_STEP = 1.25;
 
+// v0.5.4 — settle delay after the last wheel event before we
+// commit `liveZoom` into `zoomFactor` (which triggers the
+// expensive PDF.js re-rasterization). 200ms feels instant on
+// release but cleanly absorbs every frame of an active pinch.
+const ZOOM_SETTLE_MS = 200;
+
 function clampZoom(z: number): number {
   if (!Number.isFinite(z)) return 1;
   return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z));
@@ -109,37 +115,116 @@ export function TemplateReviewModal({
 }: TemplateReviewModalProps) {
   const [pageDims, setPageDims] = useState<{ width: number; height: number; scale: number } | null>(null);
   const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
+  // v0.5.4 — three zoom values:
+  //   • liveZoom: transient gesture intent. Updates every wheel
+  //     tick. Drives a cheap CSS transform.
+  //   • zoomFactor: committed render target. Only changes on
+  //     settle or via discrete buttons/keyboard. This is what
+  //     PdfPageCanvas re-rasterizes at.
+  //   • lastRenderedZoom: what the canvas has actually finished
+  //     rendering. Updates when onDimensions fires. Divisor for
+  //     the transient transform so the visual scale matches
+  //     intent regardless of where the raster pipeline is.
   const [zoomFactor, setZoomFactor] = useState(1);
+  const [liveZoom, setLiveZoom] = useState(1);
+  const [lastRenderedZoom, setLastRenderedZoom] = useState(1);
   const fieldListRef = useRef<HTMLUListElement>(null);
   const previewAreaRef = useRef<HTMLDivElement>(null);
 
-  const handleDimensions = useCallback((dims: { width: number; height: number; scale: number }) => {
-    setPageDims(dims);
-  }, []);
+  const handleDimensions = useCallback(
+    (dims: { width: number; height: number; scale: number; renderedZoom: number }) => {
+      setPageDims({ width: dims.width, height: dims.height, scale: dims.scale });
+      setLastRenderedZoom(dims.renderedZoom);
+    },
+    [],
+  );
 
+  // v0.5.4 — discrete zoom commits both the live (visual) and the
+  // committed (raster target) zoom synchronously, so a button click
+  // or keyboard shortcut produces a crisp re-rasterized result with
+  // no transient blur. Smooth wheel/pinch zoom takes a different
+  // path that defers the raster commit (see effect below).
+  const liveZoomRef = useRef(1);
+  const commitZoom = useCallback((next: number) => {
+    const clamped = clampZoom(next);
+    liveZoomRef.current = clamped;
+    setLiveZoom(clamped);
+    setZoomFactor(clamped);
+  }, []);
   const zoomIn = useCallback(() => {
-    setZoomFactor((z) => clampZoom(z * ZOOM_STEP));
-  }, []);
+    commitZoom(liveZoomRef.current * ZOOM_STEP);
+  }, [commitZoom]);
   const zoomOut = useCallback(() => {
-    setZoomFactor((z) => clampZoom(z / ZOOM_STEP));
-  }, []);
-  const zoomReset = useCallback(() => setZoomFactor(1), []);
+    commitZoom(liveZoomRef.current / ZOOM_STEP);
+  }, [commitZoom]);
+  const zoomReset = useCallback(() => {
+    commitZoom(1);
+  }, [commitZoom]);
 
-  // v0.5.3 — macOS trackpad pinch arrives as `wheel` events with
-  // `ctrlKey: true`. We need a non-passive listener so we can
-  // `preventDefault()` and stop the browser's default page-zoom.
-  // Attaching via `addEventListener` (not React's onWheel) is the
-  // only way to pass `{ passive: false }`.
+  // v0.5.4 — pinch/wheel zoom is decoupled from the PDF re-raster.
+  // Every wheel tick accumulates a delta in a ref; we apply it once
+  // per animation frame to `liveZoom` (which drives a CSS transform
+  // — GPU-accelerated, instant) and (re)schedule a settle timer
+  // that commits `zoomFactor` 200ms after the last event. Without
+  // this, every wheel tick was triggering PdfPageCanvas's render
+  // effect, which cancels in-flight rasters and queues fresh ones
+  // at 60Hz — i.e. nothing useful was completing during the
+  // gesture.
+  //
+  // macOS trackpad pinch arrives as `wheel` events with
+  // `ctrlKey: true`. We need a non-passive listener to call
+  // preventDefault() and stop the browser's page-zoom; attaching
+  // via addEventListener (not React's onWheel) is the only way to
+  // pass `{ passive: false }`.
   useEffect(() => {
     const node = previewAreaRef.current;
     if (!node) return;
+
+    let pendingDelta = 0;
+    let rafId: number | null = null;
+    let settleId: number | null = null;
+
+    const flush = () => {
+      rafId = null;
+      const d = pendingDelta;
+      pendingDelta = 0;
+      if (d === 0) return;
+      // Composing exp() per-tick is mathematically equivalent to a
+      // single exp() over the summed delta, so accumulating the
+      // raw deltaY is correct.
+      const next = clampZoom(liveZoomRef.current * Math.exp(-d * 0.01));
+      liveZoomRef.current = next;
+      setLiveZoom(next);
+    };
+
     const onWheel = (e: WheelEvent) => {
       if (!e.ctrlKey) return;
       e.preventDefault();
-      setZoomFactor((z) => clampZoom(z * Math.exp(-e.deltaY * 0.01)));
+      pendingDelta += e.deltaY;
+      if (rafId == null) {
+        rafId = requestAnimationFrame(flush);
+      }
+      if (settleId != null) {
+        window.clearTimeout(settleId);
+      }
+      settleId = window.setTimeout(() => {
+        settleId = null;
+        // Flush any unapplied delta first so the committed value
+        // matches what the user is seeing on screen.
+        if (rafId != null) {
+          cancelAnimationFrame(rafId);
+          flush();
+        }
+        setZoomFactor(liveZoomRef.current);
+      }, ZOOM_SETTLE_MS);
     };
+
     node.addEventListener("wheel", onWheel, { passive: false });
-    return () => node.removeEventListener("wheel", onWheel);
+    return () => {
+      node.removeEventListener("wheel", onWheel);
+      if (rafId != null) cancelAnimationFrame(rafId);
+      if (settleId != null) window.clearTimeout(settleId);
+    };
   }, []);
 
   useEffect(() => {
@@ -234,7 +319,7 @@ export function TemplateReviewModal({
               type="button"
               className={styles.zoomBtn}
               onClick={zoomOut}
-              disabled={zoomFactor <= ZOOM_MIN + 1e-3}
+              disabled={liveZoom <= ZOOM_MIN + 1e-3}
               title="Zoom out (⌘−)"
               aria-label="Zoom out"
             >
@@ -245,15 +330,15 @@ export function TemplateReviewModal({
               className={styles.zoomLevel}
               onClick={zoomReset}
               title="Reset zoom (⌘0)"
-              aria-label={`Current zoom ${Math.round(zoomFactor * 100)}%, click to reset`}
+              aria-label={`Current zoom ${Math.round(liveZoom * 100)}%, click to reset`}
             >
-              {Math.round(zoomFactor * 100)}%
+              {Math.round(liveZoom * 100)}%
             </button>
             <button
               type="button"
               className={styles.zoomBtn}
               onClick={zoomIn}
-              disabled={zoomFactor >= ZOOM_MAX - 1e-3}
+              disabled={liveZoom >= ZOOM_MAX - 1e-3}
               title="Zoom in (⌘+)"
               aria-label="Zoom in"
             >
@@ -281,38 +366,83 @@ export function TemplateReviewModal({
             }}
           >
             {pdfBytes ? (
-              <div className={styles.pdfContainer}>
-                <PdfPageCanvas
-                  pdfBytes={pdfBytes}
-                  pageNumber={1}
-                  maxWidth={580}
-                  maxHeight={720}
-                  zoomFactor={zoomFactor}
-                  onDimensions={handleDimensions}
-                />
-                {pageDims && template.fields.filter((f) => f.pageNumber === 1).map((f) => (
-                  <DraggableField
-                    key={f.id}
-                    field={f}
-                    scale={pageDims.scale}
-                    selected={f.id === selectedFieldId}
-                    onSelect={() => setSelectedFieldId(f.id)}
-                    onChangeStart={onBeginFieldEdit}
-                    onChange={(updates) => onFieldChange(f.id, updates)}
-                    projectValue={project ? getTemplateFieldValue(project, f) : undefined}
-                    onCheckboxClick={
-                      f.fieldType === "checkbox" && onProjectChange
-                        ? (value) => {
-                            if (f.mappedProjectKey === "creditCardType") {
-                              const normalized = normalizeCardType(value) || value;
-                              onProjectChange({ creditCardType: normalized as Project["creditCardType"] });
-                            }
-                          }
-                        : undefined
+              // v0.5.4 — transient transform during pinch. While
+              // `liveZoom != lastRenderedZoom`, displayScale != 1
+              // and we apply transform: scale(displayScale) to the
+              // PDF container so it visually tracks the gesture
+              // without forcing a re-raster on every wheel tick.
+              // The outer sizing div gives the parent's
+              // overflow:auto a real layout box (transform doesn't
+              // affect layout-box dimensions) so scrollbars stay
+              // accurate during the gesture.
+              //
+              // Steady state: liveZoom == zoomFactor == lastRenderedZoom
+              //   → displayScale = 1, no transform, no sizing override.
+              // Mid-pinch (or commit-pending): displayScale = liveZoom/lastRenderedZoom.
+              // After re-raster fires onDimensions: lastRenderedZoom updates
+              //   → displayScale snaps back to 1 and the transform falls away.
+              //
+              // Trade-off: a field-drag during an active pinch
+              // would compute against pageDims.scale (the rendered
+              // scale) while the canvas is visually transformed,
+              // so the cursor and field would diverge slightly.
+              // Pinching while dragging isn't a real workflow — we
+              // accept this in exchange for smooth gesture
+              // performance.
+              (() => {
+                const displayScale =
+                  lastRenderedZoom > 0 ? liveZoom / lastRenderedZoom : 1;
+                const isTransformed = Math.abs(displayScale - 1) > 1e-3;
+                const sizingStyle =
+                  isTransformed && pageDims
+                    ? {
+                        width: pageDims.width * displayScale,
+                        height: pageDims.height * displayScale,
+                      }
+                    : undefined;
+                const containerStyle = isTransformed
+                  ? {
+                      transform: `scale(${displayScale})`,
+                      transformOrigin: "0 0" as const,
                     }
-                  />
-                ))}
-              </div>
+                  : undefined;
+                return (
+                  <div className={styles.pdfSizing} style={sizingStyle}>
+                    <div className={styles.pdfContainer} style={containerStyle}>
+                      <PdfPageCanvas
+                        pdfBytes={pdfBytes}
+                        pageNumber={1}
+                        maxWidth={580}
+                        maxHeight={720}
+                        zoomFactor={zoomFactor}
+                        onDimensions={handleDimensions}
+                      />
+                      {pageDims && template.fields.filter((f) => f.pageNumber === 1).map((f) => (
+                        <DraggableField
+                          key={f.id}
+                          field={f}
+                          scale={pageDims.scale}
+                          selected={f.id === selectedFieldId}
+                          onSelect={() => setSelectedFieldId(f.id)}
+                          onChangeStart={onBeginFieldEdit}
+                          onChange={(updates) => onFieldChange(f.id, updates)}
+                          projectValue={project ? getTemplateFieldValue(project, f) : undefined}
+                          onCheckboxClick={
+                            f.fieldType === "checkbox" && onProjectChange
+                              ? (value) => {
+                                  if (f.mappedProjectKey === "creditCardType") {
+                                    const normalized = normalizeCardType(value) || value;
+                                    onProjectChange({ creditCardType: normalized as Project["creditCardType"] });
+                                  }
+                                }
+                              : undefined
+                          }
+                        />
+                      ))}
+                    </div>
+                  </div>
+                );
+              })()
             ) : (
               <div className={styles.pdfPlaceholder}>
                 No PDF loaded. Drop a PDF first to see preview.

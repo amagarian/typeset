@@ -149,6 +149,20 @@
   display: inline-block;
 }
 
+/*
+ * v0.5.4 — sizing wrapper for the transient pinch transform.
+ * `transform: scale()` doesn't affect the layout box, so the
+ * parent's overflow:auto would otherwise see the un-scaled
+ * dimensions and miss scrollbars during the gesture. The wrapper
+ * gets explicit width/height = pageDims * displayScale during
+ * the transient and falls back to natural sizing in the steady
+ * state.
+ */
+.pdfSizing {
+  position: relative;
+  display: inline-block;
+}
+
 .pdfPlaceholder {
   display: flex;
   align-items: center;

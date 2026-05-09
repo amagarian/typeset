@@ -18,7 +18,14 @@ interface PdfPageCanvasProps {
    * automatically.
    */
   zoomFactor?: number;
-  onDimensions?: (dims: { width: number; height: number; scale: number }) => void;
+  /**
+   * Reports the rendered viewport. `renderedZoom` is the
+   * `zoomFactor` value that produced this raster — consumers use it
+   * (v0.5.4) to track whether the canvas has caught up with the
+   * user's intended zoom and apply a transient CSS transform across
+   * the gap so pinch gestures stay smooth.
+   */
+  onDimensions?: (dims: { width: number; height: number; scale: number; renderedZoom: number }) => void;
 }
 
 export function PdfPageCanvas({
@@ -88,7 +95,12 @@ export function PdfPageCanvas({
         if (cancelled) return;
 
         renderTaskRef.current = null;
-        onDimensionsRef.current?.({ width: viewport.width, height: viewport.height, scale });
+        onDimensionsRef.current?.({
+          width: viewport.width,
+          height: viewport.height,
+          scale,
+          renderedZoom: zoomFactor,
+        });
         setLoading(false);
       } catch (err: unknown) {
         if (cancelled) return;
