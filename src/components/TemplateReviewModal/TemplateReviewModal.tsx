@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useLayoutEffect, useRef } from "react";
 import type {
   Template,
   TemplateField,
@@ -131,13 +131,34 @@ export function TemplateReviewModal({
   const fieldListRef = useRef<HTMLUListElement>(null);
   const previewAreaRef = useRef<HTMLDivElement>(null);
 
+  // v0.5.6 — closure-stable mirror of `lastRenderedZoom` so the
+  // wheel handler (set up once in a useEffect) reads the latest value
+  // when computing the cursor anchor's document-space coords.
+  const lastRenderedZoomRef = useRef(1);
   const handleDimensions = useCallback(
     (dims: { width: number; height: number; scale: number; renderedZoom: number }) => {
       setPageDims({ width: dims.width, height: dims.height, scale: dims.scale });
       setLastRenderedZoom(dims.renderedZoom);
+      lastRenderedZoomRef.current = dims.renderedZoom;
     },
     [],
   );
+
+  // v0.5.6 — cursor anchor for zoom-around-cursor behavior. Captured
+  // before each liveZoom mutation: pinch wheel events store the actual
+  // cursor position; discrete +/-/0 zoom stores the viewport center.
+  // A useLayoutEffect on liveZoom reads this anchor and rewrites
+  // previewArea scroll so the recorded document point ends up back
+  // under the cursor after the new transform applies. The anchor is
+  // single-use — cleared after each application — so a stale anchor
+  // can never trigger a phantom scroll on an unrelated re-render
+  // (e.g. when lastRenderedZoom snaps after a re-raster completes).
+  const lastCursorAnchorRef = useRef<{
+    docX: number;
+    docY: number;
+    cursorLocalX: number;
+    cursorLocalY: number;
+  } | null>(null);
 
   // v0.5.4 — discrete zoom commits both the live (visual) and the
   // committed (raster target) zoom synchronously, so a button click
@@ -151,15 +172,35 @@ export function TemplateReviewModal({
     setLiveZoom(clamped);
     setZoomFactor(clamped);
   }, []);
+  // v0.5.6 — discrete zoom (buttons + Cmd+=/Cmd+-/Cmd+0) anchors to
+  // the viewport center: there's no cursor location for a keyboard
+  // shortcut and "center" is the most predictable visual anchor for
+  // a button click.
+  const captureViewportCenterAnchor = useCallback(() => {
+    const previewArea = previewAreaRef.current;
+    if (!previewArea) return;
+    const rect = previewArea.getBoundingClientRect();
+    const oldDisplayScale = liveZoomRef.current / lastRenderedZoomRef.current;
+    if (!Number.isFinite(oldDisplayScale) || oldDisplayScale <= 0) return;
+    lastCursorAnchorRef.current = {
+      docX: (rect.width / 2 + previewArea.scrollLeft) / oldDisplayScale,
+      docY: (rect.height / 2 + previewArea.scrollTop) / oldDisplayScale,
+      cursorLocalX: rect.width / 2,
+      cursorLocalY: rect.height / 2,
+    };
+  }, []);
   const zoomIn = useCallback(() => {
+    captureViewportCenterAnchor();
     commitZoom(liveZoomRef.current * ZOOM_STEP);
-  }, [commitZoom]);
+  }, [commitZoom, captureViewportCenterAnchor]);
   const zoomOut = useCallback(() => {
+    captureViewportCenterAnchor();
     commitZoom(liveZoomRef.current / ZOOM_STEP);
-  }, [commitZoom]);
+  }, [commitZoom, captureViewportCenterAnchor]);
   const zoomReset = useCallback(() => {
+    captureViewportCenterAnchor();
     commitZoom(1);
-  }, [commitZoom]);
+  }, [commitZoom, captureViewportCenterAnchor]);
 
   // v0.5.4 — pinch/wheel zoom is decoupled from the PDF re-raster.
   // Every wheel tick accumulates a delta in a ref; we apply it once
@@ -200,6 +241,27 @@ export function TemplateReviewModal({
     const onWheel = (e: WheelEvent) => {
       if (!e.ctrlKey) return;
       e.preventDefault();
+      // v0.5.6 — capture the cursor anchor BEFORE we accumulate
+      // the delta. The doc-space coords are computed against the
+      // CURRENT (pre-update) liveZoom/lastRenderedZoom, so the
+      // useLayoutEffect that runs after this rAF tick can place
+      // the same document point back under the cursor at the new
+      // zoom. Multiple wheel events in a single frame just
+      // overwrite the anchor with the latest cursor position —
+      // that's the position we want to anchor to.
+      const rect = node.getBoundingClientRect();
+      const cursorLocalX = e.clientX - rect.left;
+      const cursorLocalY = e.clientY - rect.top;
+      const oldDisplayScale =
+        liveZoomRef.current / lastRenderedZoomRef.current;
+      if (Number.isFinite(oldDisplayScale) && oldDisplayScale > 0) {
+        lastCursorAnchorRef.current = {
+          docX: (cursorLocalX + node.scrollLeft) / oldDisplayScale,
+          docY: (cursorLocalY + node.scrollTop) / oldDisplayScale,
+          cursorLocalX,
+          cursorLocalY,
+        };
+      }
       pendingDelta += e.deltaY;
       if (rafId == null) {
         rafId = requestAnimationFrame(flush);
@@ -226,6 +288,43 @@ export function TemplateReviewModal({
       if (settleId != null) window.clearTimeout(settleId);
     };
   }, []);
+
+  // v0.5.6 — cursor-anchored zoom. Runs synchronously after React
+  // mutates the DOM (so .pdfSizing's new width/height is in place
+  // and previewArea's scrollable extent is up-to-date) but before
+  // the browser paints. Re-anchors the recorded document point so
+  // the visual position under the cursor stays put across a zoom
+  // change. transform-origin remains 0 0 — this is mathematically
+  // simpler than a cursor-positioned origin because the visual
+  // extent of .pdfContainer aligns exactly with .pdfSizing's
+  // layout box, so scroll-content coords == pdfSizing coords ==
+  // pdfContainer-natural coords * displayScale.
+  //
+  // The anchor is single-use: cleared after each application so a
+  // re-render that wasn't preceded by a fresh anchor capture
+  // (e.g. lastRenderedZoom snapping after an async re-raster
+  // completes) is a no-op. Without that clear, a stale anchor in
+  // the OLD natural coord space would compute a bogus scroll
+  // position when lastRenderedZoom changes the natural coord
+  // basis underneath us.
+  useLayoutEffect(() => {
+    const anchor = lastCursorAnchorRef.current;
+    if (!anchor) return;
+    const previewArea = previewAreaRef.current;
+    if (!previewArea) return;
+    const newDisplayScale = liveZoom / lastRenderedZoom;
+    if (!Number.isFinite(newDisplayScale) || newDisplayScale <= 0) return;
+    // After scaling, the doc point sits at
+    // (docX * newDisplayScale, docY * newDisplayScale) in
+    // pdfSizing's coord space (== previewArea's scroll content).
+    // To render it at (cursorLocalX, cursorLocalY) inside the
+    // viewport, scrollLeft must be docPoint - cursorLocal.
+    const targetScrollLeft = anchor.docX * newDisplayScale - anchor.cursorLocalX;
+    const targetScrollTop = anchor.docY * newDisplayScale - anchor.cursorLocalY;
+    previewArea.scrollLeft = Math.max(0, targetScrollLeft);
+    previewArea.scrollTop = Math.max(0, targetScrollTop);
+    lastCursorAnchorRef.current = null;
+  }, [liveZoom, lastRenderedZoom]);
 
   useEffect(() => {
     const handleKeyDown = (event: KeyboardEvent) => {
