@@ -340,6 +340,48 @@ function buildSystemPrompt(): string {
     "## Repeats",
     "If the same field type appears multiple times (e.g. cardholder name in two paragraphs), emit one entry per occurrence — each with its own bbox. The downstream system fills repeats with the same value.",
     "",
+    "Caveat for repeats: do NOT split a single writable area into multiple repeats. An empty band at the TOP of a paragraph block belongs to the immediately following labeled blank — not to a separate \"name\" field. If you find yourself emitting 4+ entries for what is plainly the same canonical field on a single page (e.g. five Cardholder Name boxes when the form only has two cardholder-name lines), you are over-detecting. Stop, look at the page again, and emit one entry per *distinct writable area*.",
+    "",
+    "## Label position relative to the writable area — READ FIRST",
+    "Before placing any bbox, decide where the printed label sits relative to the empty writable area. There are three real-world layouts. The bbox ALWAYS covers the empty writable area, NEVER the printed label, in every layout.",
+    "",
+    "### Layout A — label-LEFT (column / row form)",
+    "The label is on the SAME horizontal scan line as the blank, immediately to the LEFT of it.",
+    "  Example: `Cardholder Name: ____________________`",
+    "  → bbox covers ONLY the underscores / empty space to the right of the colon. NEVER covers the label `Cardholder Name:` itself.",
+    "",
+    "### Layout B — label-ABOVE (header style)",
+    "The label sits on the line ABOVE the blank, often centered or left-aligned in the column.",
+    "  Example:",
+    "    Cardholder Name",
+    "    ____________________",
+    "  → bbox covers the BLANK BELOW the label (the empty horizontal band on the row directly under the printed label). NEVER overlaps the label text.",
+    "",
+    "### Layout C — label-BELOW (THIS IS THE COMMON TRIPHAZARD — DO NOT GET IT WRONG)",
+    "The label sits on the line BELOW the writable area, frequently in small-caps or a small font, looking like a caption. Common short captions: `PHONE NUMBER`, `EMAIL ADDRESS`, `EXP DATE`, `CVV#`, `CREDIT CARD NUMBER`, `BILLING ADDRESS`, `ZIP CODE`, `STATE`.",
+    "  Example (the `204 Credit Card Authorization Form 2019` layout uses this):",
+    "    [ empty horizontal band ]",
+    "    PHONE NUMBER",
+    "  → bbox covers the EMPTY BAND IMMEDIATELY ABOVE the printed `PHONE NUMBER` caption. The bbox MUST NOT cover the words `PHONE NUMBER` themselves.",
+    "  → emit `label: \"Phone Number\"`, `canonical_field_id: \"phone\"`, `field_type: \"text\"`, with a bbox whose y-range sits ABOVE the caption's y-range.",
+    "",
+    "Heuristic for detecting Layout C: when you see a short all-caps or small-caps label (≤ 4 words, ≤ 20 characters, looking like a form-field caption such as `EXP DATE` / `CVV#` / `ZIP CODE`) and the row IMMEDIATELY ABOVE it is empty (whitespace, a thin underline, or a drawn rectangle), the empty row IS the writable area. The caption beneath NAMES the field; it does NOT define the bbox.",
+    "",
+    "### Mandatory rule for label-BELOW rows",
+    "When a printed all-caps or small-caps short label appears in the form, do NOT assume the writable area is at the label's coordinates. Look at the row IMMEDIATELY ABOVE the label. If that preceding row is empty (whitespace, a drawn underline, or an empty rectangle), THAT empty row is the writable area and the bbox MUST cover it. The label below names the field; it does NOT define the bbox.",
+    "",
+    "When a row's label is BELOW the writable area, populate the field's `label` from that label (Title Case, e.g. `\"Phone Number\"`, `\"Exp Date\"`, `\"CVV\"`, `\"Zip Code\"`, `\"Credit Card Number\"`). Populate `canonical_field_id` by matching the label text against the canonical alias list (the same way you would for a Layout A or Layout B row). For label-BELOW, `context_before` should still capture the surrounding paragraph or row context BEFORE the writable area, and `context_after` MAY include the label that sits BELOW it.",
+    "",
+    "### Concrete example using the 204 CC-auth form",
+    "Form layout fragment (all-caps captions sit BELOW empty bands — Layout C):",
+    "  ```",
+    "  [ empty band ]              [ empty band ]",
+    "  PHONE NUMBER                EMAIL ADDRESS",
+    "  [ empty band ]              [ empty band ]",
+    "  CREDIT CARD NUMBER          EXP DATE      CVV#",
+    "  ```",
+    "  → emit four (or more) fields, each with its bbox covering the EMPTY BAND ABOVE the corresponding caption. Do NOT place any bbox on the words `PHONE NUMBER`, `EMAIL ADDRESS`, `CREDIT CARD NUMBER`, `EXP DATE`, or `CVV#`.",
+    "",
     "## Be tight — THIS IS THE MOST IMPORTANT RULE",
     "Imagine a user filling the form with a pen. The bbox is the rectangle their handwriting will occupy — and ONLY that rectangle.",
     "",
@@ -634,6 +676,80 @@ function inferCanonicalId(
   return undefined;
 }
 
+/**
+ * Match the field's `label` directly against the canonical alias list.
+ * Used as a third-tier resolver for label-BELOW layouts where the
+ * actual caption ("PHONE NUMBER", "EXP DATE", "CVV#", "ZIP CODE",
+ * etc.) is reported by Gemini as the field's `label` rather than
+ * appearing in `context_before` / `context_after`. The alias index
+ * is the same one `inferCanonicalId` uses, so a label like
+ * `"Phone Number"` resolves the same way `context_before:
+ * "Phone#"` would have.
+ *
+ * Returns `undefined` when the label is empty or no alias matches —
+ * we never want to force-fit; the next tier (pattern → model
+ * semantic) gets a turn instead.
+ */
+function inferByLabel(
+  label: string | undefined,
+  fieldType: "text" | "checkbox",
+  checkboxValue: string | null | undefined
+): CanonicalFieldId | undefined {
+  const lbl = (label ?? "").toLowerCase().trim();
+  if (!lbl) return undefined;
+
+  // CVV preflight on the label itself, mirroring the
+  // `inferCanonicalId` checkbox preflight — handles label-below CVV#
+  // captions that Gemini sends back as a checkbox-typed field.
+  if (
+    /\bcvv2?\b|\bcvc2?\b|\bccv\b|\bcid\b|\bsecurity\s+code\b|\bverification\s+code\b|\bcard\s+identification\b/.test(
+      lbl
+    )
+  ) {
+    return "ccv";
+  }
+
+  // Ignore overly generic or too-short labels (e.g. "Date" alone is
+  // ambiguous; we only return a canonical match when the alias is
+  // specific enough). Use the same min-length guard as
+  // `inferCanonicalId` (alias.length ≥ 3).
+  for (const { alias, id } of ALIAS_INDEX) {
+    if (alias.length < 3) continue;
+    // Word-boundary match: the alias must appear as a complete token
+    // sequence in the label, not just a substring (so "card" inside
+    // "CARDHOLDER NAME" does not hijack into `creditCardNumber`).
+    if (lbl === alias) return id;
+    const re = new RegExp(`\\b${escapeRegex(alias)}\\b`);
+    if (re.test(lbl)) {
+      // For card-type checkboxes ("VISA"), require the field is
+      // actually a checkbox (or the alias itself spans the entire
+      // label) — we don't want a label like "Visa Authorization Date"
+      // to resolve as `creditCardTypeVisa`.
+      if (CREDIT_CARD_CHECKBOX_IDS.has(id)) {
+        if (fieldType === "checkbox" || lbl === alias) return id;
+        continue;
+      }
+      return id;
+    }
+  }
+
+  // No alias hit — but still accept an explicit checkbox_value match
+  // (e.g. label `Visa` with checkbox_value `visa` resolves cleanly).
+  if (fieldType === "checkbox") {
+    const cv = (checkboxValue ?? "").toLowerCase().trim();
+    if (cv === "visa") return "creditCardTypeVisa";
+    if (cv === "mastercard") return "creditCardTypeMastercard";
+    if (cv === "amex" || cv === "american express") return "creditCardTypeAmex";
+    if (cv === "discover") return "creditCardTypeDiscover";
+  }
+
+  return undefined;
+}
+
+function escapeRegex(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
 const TRAILING_PREP_RE = /\s+(on|of|to|for|in|at|by|with|the|a|an)$/i;
 const LEADING_PREP_RE = /^(the|a|an|to|on|for|of|in|at|by|with)\s+/i;
 
@@ -789,23 +905,32 @@ function mapToTemplateField(
     pages.find((p) => p.pageNumber === pageNumber) ?? pages[0];
   if (!page) return null;
 
-  // Three-tier canonical-id resolution:
-  //   1. Alias match — explicit-label rows hit a known alias.
-  //   2. Pattern match — common body-text patterns alias matching can't see.
-  //   3. Model semantic — Gemini's canonical_field_id, last resort.
+  // Four-tier canonical-id resolution:
+  //   1. Alias match (context) — explicit-label rows hit a known
+  //      alias from `context_before` + `context_after`.
+  //   2. Alias match (label) — for label-BELOW layouts (v0.4.10+)
+  //      where the caption sits BELOW the writable area, the label
+  //      Gemini reports (e.g. "Phone Number", "Exp Date", "CVV#",
+  //      "Zip Code") is the actual field name. We run the same alias
+  //      index against it. Catches CVV#, EXP DATE, ZIP CODE,
+  //      CREDIT CARD NUMBER, etc. when the row context misses them.
+  //   3. Pattern match — common body-text patterns alias matching
+  //      can't see (e.g. `I, ___, authorize…`).
+  //   4. Model semantic — Gemini's canonical_field_id, last resort.
   const aliasId = inferCanonicalId(
     raw.context_before,
     raw.context_after,
     rawFieldType,
     raw.checkbox_value
   );
+  const labelId = inferByLabel(raw.label, rawFieldType, raw.checkbox_value);
   const patternId = inferByPattern(raw.context_before, raw.context_after, rawFieldType);
   const geminiId =
     raw.canonical_field_id && VALID_CANONICAL_IDS.has(raw.canonical_field_id)
       ? (raw.canonical_field_id as CanonicalFieldId)
       : undefined;
   const canonicalId: CanonicalFieldId | undefined =
-    aliasId ?? patternId ?? geminiId;
+    aliasId ?? labelId ?? patternId ?? geminiId;
 
   const canonicalDef = canonicalId
     ? CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === canonicalId)
@@ -1527,9 +1652,22 @@ function buildQualityControlSystemPrompt(): string {
     "",
     "Always include the original `id` exactly as provided. Never invent new fields and never re-key.",
     "",
+    "## Label position relative to the writable area",
+    "Before judging any field, identify which of three real-world layouts the form uses for that row, because the bbox ALWAYS covers the empty writable area — NEVER the printed label — regardless of layout:",
+    "  - Layout A (label-LEFT): label on the same horizontal scan line as the blank, e.g. `Cardholder Name: ____`. Bbox covers ONLY the underscores / empty space to the right of the colon.",
+    "  - Layout B (label-ABOVE): label sits on the line above the blank, e.g. `Cardholder Name` printed above an empty line. Bbox covers the EMPTY LINE below the label.",
+    "  - Layout C (label-BELOW): label sits on the line BELOW the blank as a small-caps or all-caps caption, e.g. `[empty band]` over `PHONE NUMBER`. Bbox covers the EMPTY BAND ABOVE the caption — NEVER the caption text itself. Common examples: `PHONE NUMBER`, `EMAIL ADDRESS`, `EXP DATE`, `CVV#`, `CREDIT CARD NUMBER`, `ZIP CODE`, `BILLING ADDRESS`.",
+    "",
     "## Audit rules — apply EVERY rule to EVERY field",
     "",
     "Overall posture: BIAS TOWARD `keep`. False drops are worse than false keeps — the user can manually delete an unwanted field downstream, but a dropped field is lost silently. Only `drop` when you are highly confident the field is invalid; only `fix` when you are confident the input is wrong AND you can express the correct value.",
+    "",
+    "### 0. Label-below-line check — RUN THIS FIRST",
+    "If a field's bbox is placed ON or OVERLAPPING what looks like a printed all-caps or small-caps form-field caption (≤ 4 words, ≤ 20 characters, e.g. `PHONE NUMBER`, `EMAIL ADDRESS`, `EXP DATE`, `CVV#`, `CREDIT CARD NUMBER`, `ZIP CODE`, `STATE`), then the bbox is wrong: that label is NOT the writable area. The writable area is the EMPTY BAND IMMEDIATELY ABOVE the label.",
+    "  - `action: \"fix\"` with a `fixed_bbox` whose y-range sits IMMEDIATELY ABOVE the label's y-range. Match the label's x-range (or extend slightly) and use the local row height for the band's vertical extent.",
+    "  - Do NOT `drop` such a field — the writable area exists, it's just one row above where the previous pass placed the bbox. Re-place it; don't delete it.",
+    "  - Use the printed label text to populate `fixed_canonical_field_id` when it matches the canonical alias list (`PHONE NUMBER` → `phone`, `EXP DATE` → `expDate`, `CVV#` → `ccv`, `CREDIT CARD NUMBER` → `creditCardNumber`, `ZIP CODE` → `billingZipCode`, `EMAIL ADDRESS` → `email`, `BILLING ADDRESS` → `billingAddress`, `CITY` → `billingCity`, `STATE` → `billingState`).",
+    "  - This rule MUST run BEFORE the \"when uncertain, KEEP\" guidance below — confidently-detectable label-below regressions get fixed, not silently kept.",
     "",
     "### 1. Bbox tightness — prefer `fix` over `drop`",
     "The bbox must hug the writable blank only. If a horizontal scan line through the current bbox would cross printed letters of a label, the bbox is wrong — but PREFER `action: \"fix\"` with a tighter `fixed_bbox` over `action: \"drop\"`. Only choose `drop` when you are CERTAIN there is no writable line, drawn box, or empty fillable area at any reasonable nearby position. If the current bbox is misplaced but a writable area DOES exist within ~40 PDF points (≈ 50 normalized units) of where the bbox sits, choose `fix` and emit a corrected `fixed_bbox` that covers the actual blank. Underline strokes can be subtle in a rasterized view — assume the writable line exists if the surrounding context implies a fillable field, even when the underline isn't crisply visible.",
