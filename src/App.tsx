@@ -104,14 +104,52 @@ function templatesToMap(templates: Template[]): Record<string, Template> {
   return Object.fromEntries(templates.map((template) => [template.id, template]));
 }
 
+/**
+ * v0.5.12 — heuristic for spotting legacy "field-based" fingerprints
+ * that were saved before the save-site fix. Pre-fix saves overwrote
+ * the PDF-derived fingerprint (typ. 24-48 anchor terms) with one
+ * derived only from field labels (typ. 5-15). Use a conservative
+ * threshold of <16 — well below the PDF-side `.slice(0, 48)` floor
+ * and above what a tiny PDF would produce.
+ */
+function isLikelyLegacyFieldFingerprint(
+  fingerprint: NonNullable<Template["fingerprint"]>
+): boolean {
+  return fingerprint.anchorTerms.length < 16;
+}
+
+/**
+ * v0.5.12 — for legacy templates whose stored fingerprint is
+ * field-based (and so won't anchor-overlap with a freshly-computed
+ * PDF fingerprint), check whether their `fileNameHints` and
+ * `pageCount` line up with the incoming PDF. If both agree, treat
+ * the template as a "shape match" so the caller can upgrade the
+ * stored fingerprint in place. Strict on both signals to avoid
+ * cross-template aliasing on similar filenames.
+ */
+function isShapeMatchForLegacyUpgrade(
+  incoming: NonNullable<Template["fingerprint"]>,
+  candidate: NonNullable<Template["fingerprint"]>
+): boolean {
+  if (incoming.pageCount !== candidate.pageCount) return false;
+  if (candidate.fileNameHints.length === 0) return false;
+  const incomingHints = new Set(incoming.fileNameHints);
+  const overlap = candidate.fileNameHints.filter((hint) => incomingHints.has(hint)).length;
+  // Require majority overlap on the candidate's hints — a single
+  // shared token isn't enough to safely overwrite a fingerprint.
+  return overlap / candidate.fileNameHints.length >= 0.5;
+}
+
 function findMatchingLocalTemplate(
   templates: Template[],
   fingerprint: NonNullable<Template["fingerprint"]>
-): { template: Template; confidence: number } | null {
-  const ranked = templates
-    .filter((template): template is Template & { fingerprint: NonNullable<Template["fingerprint"]> } =>
+): { template: Template; confidence: number; upgradedFingerprint?: NonNullable<Template["fingerprint"]> } | null {
+  const candidates = templates.filter(
+    (template): template is Template & { fingerprint: NonNullable<Template["fingerprint"]> } =>
       Boolean(template.fingerprint)
-    )
+  );
+
+  const ranked = candidates
     .map((template) => ({
       template,
       confidence: scoreFingerprintMatch(fingerprint, template.fingerprint).total,
@@ -121,6 +159,32 @@ function findMatchingLocalTemplate(
   if (ranked[0] && ranked[0].confidence >= 0.92) {
     return { template: ranked[0].template, confidence: ranked[0].confidence };
   }
+
+  // v0.5.12 — fallback for legacy templates saved before the
+  // save-site fix landed. Their fingerprints are field-derived,
+  // so the anchor-term Jaccard collapses against a fresh PDF
+  // fingerprint and the score never crosses 0.92. If shape
+  // (page count + filename hints) agrees, treat it as a match
+  // and hand back a freshly-stitched fingerprint so the caller
+  // can persist it. One-time per legacy template.
+  const legacyMatch = candidates.find(
+    (template) =>
+      isLikelyLegacyFieldFingerprint(template.fingerprint) &&
+      isShapeMatchForLegacyUpgrade(fingerprint, template.fingerprint)
+  );
+  if (legacyMatch) {
+    const upgradedFingerprint: NonNullable<Template["fingerprint"]> = {
+      ...fingerprint,
+      // Preserve the legacy fingerprint's canonicalFieldIds so
+      // downstream consumers that key off canonical ids stay stable.
+      canonicalFieldIds:
+        legacyMatch.fingerprint.canonicalFieldIds.length > 0
+          ? legacyMatch.fingerprint.canonicalFieldIds
+          : fingerprint.canonicalFieldIds,
+    };
+    return { template: legacyMatch, confidence: 0.92, upgradedFingerprint };
+  }
+
   return null;
 }
 
@@ -389,7 +453,20 @@ function MainApp() {
       // Step 1: try the local template cache first.
       const localMatch = findMatchingLocalTemplate(readLocalTemplates(), fingerprint);
       if (localMatch) {
-        const template = localMatch.template;
+        // v0.5.12 — when the matcher fell back to the legacy
+        // shape-match path, persist the freshly-computed PDF
+        // fingerprint so subsequent drops hit the fast (≥0.92)
+        // path without needing the legacy heuristic again.
+        const template = localMatch.upgradedFingerprint
+          ? {
+              ...localMatch.template,
+              fingerprint: localMatch.upgradedFingerprint,
+              updatedAt: new Date().toISOString(),
+            }
+          : localMatch.template;
+        if (localMatch.upgradedFingerprint) {
+          upsertLocalTemplate(template);
+        }
         setEditedTemplates((prev) => ({ ...prev, [template.id]: template }));
         setDraftTemplate(template);
         const result: PdfMatchResult = {
@@ -934,10 +1011,31 @@ function MainApp() {
   const handleSaveTemplate = useCallback(
     async (template: Template, opts: { promote?: boolean } = {}) => {
       const now = new Date().toISOString();
-      const fingerprint =
-        template.fields.length > 0
-          ? buildTemplateFingerprintFromTemplate(template)
-          : template.fingerprint;
+      // v0.5.12 — preserve the PDF-derived fingerprint that was
+      // attached when the template was first detected. The
+      // field-derived fingerprint produced by
+      // `buildTemplateFingerprintFromTemplate` only tokenizes field
+      // labels (~5-15 anchor terms), which doesn't overlap enough
+      // with the body-copy-derived fingerprint that
+      // `buildPdfFingerprint` produces on re-drop (~30-50 anchor
+      // terms). The Jaccard collapses, the score lands ~0.55, and
+      // neither the local cache nor the registry auto-installs.
+      // Refresh `canonicalFieldIds` only — that's the one
+      // fingerprint dimension that field edits legitimately affect.
+      const fingerprint = template.fingerprint
+        ? {
+            ...template.fingerprint,
+            canonicalFieldIds: Array.from(
+              new Set(
+                template.fields
+                  .map((f) => f.canonicalFieldId)
+                  .filter((id): id is NonNullable<typeof id> => Boolean(id))
+              )
+            ),
+          }
+        : template.fields.length > 0
+        ? buildTemplateFingerprintFromTemplate(template)
+        : undefined;
       const savedTemplate: Template = {
         ...template,
         fingerprint,
