@@ -108,11 +108,14 @@ export interface DetectFieldsOptions {
   systemPrompt: string;
   userPrompt: string;
   /**
-   * Gemini-flavoured JSON schema constraining the output. Required —
-   * we always call Gemini in structured-output mode so the renderer
-   * can `JSON.parse(result.text)` without defensive extraction.
+   * Gemini-flavoured JSON schema constraining the output. Set this for
+   * structured-output mode (the default for the field-detection,
+   * project-import, and QC passes). Pass `null` to opt out of
+   * structured output and ask Gemini for free-form text — used by the
+   * v0.4.12 two-stage Maximum-mode pipeline's Stage 1a
+   * (description-first) call.
    */
-  responseSchema: Record<string, unknown>;
+  responseSchema: Record<string, unknown> | null;
   maxOutputTokens?: number;
   temperature?: number;
 }

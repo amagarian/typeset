@@ -139,13 +139,13 @@ export const ACCURACY_OPTIONS: AccuracyOption[] = [
     id: "maximum",
     label: "Maximum (recommended)",
     description:
-      "Runs a verification pass over Pass 1's output to catch misclassified fields, tight bboxes, and stray duplicates. ~12s typical.",
+      "Three-pass review with description-first reasoning (~30-50s, roughly). Best for complex forms with subtle layouts.",
   },
   {
     id: "fast",
     label: "Fast",
     description:
-      "Single Gemini round-trip with no audit. ~6s typical — good for batches where speed matters more than catching every edge case.",
+      "Single-pass detection (~6-22s, roughly). Best for simple forms.",
   },
 ];
 

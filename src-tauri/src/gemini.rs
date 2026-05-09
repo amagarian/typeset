@@ -70,8 +70,10 @@ pub struct DetectFieldsRequest {
     pub system_prompt: String,
     pub user_prompt: String,
     /// JSON schema (in the Gemini-supported subset) constraining the
-    /// model's output. Required — we only ever call Gemini with a fixed
-    /// output shape.
+    /// model's output. Pass `Value::Null` to disable structured-output
+    /// mode (used by the v0.4.12 Stage-1a free-form description pass);
+    /// any other JSON value is forwarded verbatim as Gemini's
+    /// `responseSchema`.
     pub response_schema: Value,
     /// Maximum output tokens. Leave None for the model default.
     pub max_output_tokens: Option<u32>,
@@ -201,10 +203,22 @@ async fn run_gemini_stream(
         },
     );
 
-    let mut generation_config = json!({
-        "responseMimeType": "application/json",
-        "responseSchema": args.response_schema,
-    });
+    // Structured-output mode is opt-in. When the caller supplies a
+    // non-null `response_schema` we set `responseMimeType: application/json`
+    // + `responseSchema` so Gemini emits strict JSON. When the caller
+    // passes `null` (Stage 1a free-form description in the v0.4.12 two-
+    // stage Maximum-mode pipeline), we omit both keys so Gemini returns
+    // ordinary text. Either path uses the same SSE plumbing and progress
+    // events.
+    let structured = !args.response_schema.is_null();
+    let mut generation_config = if structured {
+        json!({
+            "responseMimeType": "application/json",
+            "responseSchema": args.response_schema,
+        })
+    } else {
+        json!({})
+    };
     if let Some(t) = args.temperature {
         generation_config["temperature"] = json!(t);
     } else {

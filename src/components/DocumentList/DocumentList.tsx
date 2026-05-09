@@ -14,13 +14,14 @@ interface DocumentListProps {
 
 // Calibrated against measured Gemini timings:
 //   - Single-pass (Fast):    5-10s on Pro, ~6s typical → 90s curve.
-//   - Two-pass (Maximum):   10-15s on Pro, ~12s typical → 120s curve.
-// The wider curve on Maximum keeps the time-based bar from sprinting past
-// where the phase-floor actually is during Pass 2. The phase floor (set
-// by `processingProgress` from the detector) still drives final
-// completion regardless of clock drift.
+//   - Three-pass (Maximum):  Stage 1a + Stage 1b + Pass 2 QC, totalling
+//     ~30-50s on Pro for typical CC-auth forms (v0.4.12+). The curve
+//     is widened to 150s so the time-based bar doesn't sprint past
+//     where the phase-floor actually is when the model is mid-stage.
+// The phase floor (set by `processingProgress` from the detector)
+// still drives final completion regardless of clock drift.
 const ESTIMATED_DURATION_MS_FAST = 90_000;
-const ESTIMATED_DURATION_MS_MAXIMUM = 120_000;
+const ESTIMATED_DURATION_MS_MAXIMUM = 150_000;
 
 function ProcessingRow({ doc, onRemove }: { doc: ProjectDocument; onRemove: (id: string) => void }) {
   // `timeProgress` is the smooth elapsed-time curve (asymptotic to ~95%).

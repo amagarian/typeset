@@ -33,6 +33,19 @@
  *   so the v0.4.5/v0.4.6 type-guard (CVV-as-checkbox → text) cannot
  *   be weakened by a Pass-2 mistake.
  *
+ * Two-stage Pass 1 (v0.4.12+, Maximum mode only):
+ *   Pass 1 in Maximum mode is split into two Gemini calls. Stage 1a is
+ *   a free-form-text round-trip with NO `responseSchema` that asks
+ *   Gemini to walk through the form and describe every fillable field
+ *   in plain English (location on the page, what the writable area
+ *   looks like, label position relative to the blank, expected type,
+ *   nuances). Stage 1b is the existing v0.4.11 Pass-1 call (same
+ *   system prompt, same `responseSchema`, same image input) with the
+ *   Stage-1a text inlined into the system prompt as an authoritative
+ *   field-by-field checklist. Pass 2 QC then runs on Stage 1b's
+ *   output exactly as it ran on the old single-stage Pass 1's output.
+ *   Fast mode is unchanged: still a single-shot Pass 1.
+ *
  * Coordinate-system contract with Gemini (v0.4.9+):
  *   - Gemini returns `[y_min, x_min, y_max, x_max]` as integers in the
  *     0-1000 normalized range, per *image*. Y-first ordering.
@@ -292,13 +305,18 @@ function buildCatalogSummary(): string {
 }
 
 /**
- * The single system prompt. Designed to mirror Gemini's desktop-client
- * behaviour: ask for a clean structured-JSON response, not for the
- * model to "show its work" or run any tool. The input is one or more
- * page IMAGES (rendered from the underlying PDF client-side), which
- * removes any ambiguity in the bbox→pixel coordinate mapping.
+ * The shared system-prompt body used by:
+ *   - Fast-mode single-shot Pass 1 (`runPass1Single`).
+ *   - Maximum-mode Stage 1b (`runStage1b`), which prepends a
+ *     description-from-Stage-1a preamble to this body before sending.
+ *
+ * Designed to mirror Gemini's desktop-client behaviour: ask for a clean
+ * structured-JSON response, not for the model to "show its work" or
+ * run any tool. The input is one or more page IMAGES (rendered from
+ * the underlying PDF client-side), which removes any ambiguity in the
+ * bbox→pixel coordinate mapping.
  */
-function buildSystemPrompt(): string {
+function buildPass1SharedSystemPrompt(): string {
   return [
     "You are extracting fillable form fields from one or more page IMAGES of a paper/PDF form for a film-production assistant. Each image is a single page of the form, in page order.",
     "Return ONLY a JSON object that conforms to the supplied responseSchema. No prose, no markdown fences.",
@@ -430,6 +448,92 @@ function buildUserPrompt(
       .join("\n"),
     "",
     "Extract every fillable field per the system prompt's instructions and return the JSON object.",
+  ].join("\n");
+}
+
+/**
+ * v0.4.12 Stage 1a — free-form description pass. Asks Gemini to walk
+ * through the form image-by-image and describe every fillable field
+ * in plain English. Output is plain text (no `responseSchema`), used
+ * only as the "field-by-field checklist" preamble for Stage 1b.
+ *
+ * This pass intentionally does NOT request coordinates, JSON, or
+ * pixel positions — that's Stage 1b's job. Forcing the model to
+ * separate "describe" from "place" appears to mirror how Gemini's
+ * web UI reasons through forms internally and how a human reviewer
+ * walks through the page top-to-bottom.
+ */
+function buildStage1aSystemPrompt(): string {
+  return [
+    "You are reviewing a printed form rendered as page images. Walk through the form top-to-bottom and describe every fillable field you find. For each field, write 1-3 sentences in plain English covering:",
+    "",
+    "  - Where it sits on the page (`top of page 1, just under the title`, `middle of page 2, in the credit card section`, `bottom-right corner of page 1`, etc.)",
+    "  - What the visible writable area looks like (long horizontal underline, short underline, empty horizontal band above an all-caps caption, small box outline, checkbox, etc.)",
+    "  - The full label or surrounding text that identifies what the field is for. Capture both the on-row label (if any) AND the surrounding sentence context for inline-sentence blanks like `I, ___, authorize Hollywood Depot...`.",
+    "  - Layout: is the label LEFT of, ABOVE, or BELOW the writable area? Or is it inline-sentence (the blank is mid-sentence)?",
+    "  - The expected field type (text vs checkbox).",
+    "  - Any nuances: is it part of a checkbox group (Visa/MasterCard/AMEX/Discover)? Is it a CVV/CVV2 row that draws a box outline but is meant for typing digits? Are there multiple instances of the same field on the form (e.g. two cardholder name lines, two date lines)?",
+    "",
+    "DO NOT output JSON, coordinates, or pixel positions. This is a natural-language pass — describe like you would in a code review. The next stage will handle coordinates.",
+    "",
+    "Take your time. Don't omit fields. If you're unsure whether something is fillable, describe it and note the uncertainty.",
+    "",
+    "End your description with a single line: `END OF FIELD DESCRIPTIONS.`",
+  ].join("\n");
+}
+
+/**
+ * v0.4.12 Stage 1a — user prompt. Same image-orientation preamble as
+ * the Pass 1 user prompt minus the "return the JSON object" close
+ * line, since this pass returns plain text.
+ */
+function buildStage1aUserPrompt(
+  rendered: RenderedPage[],
+  filename: string
+): string {
+  return [
+    `Filename: ${filename}`,
+    `Page count: ${rendered.length}`,
+    "",
+    "You have been sent one image per page, in page order. Page images:",
+    rendered
+      .map((p) => `  page ${p.pageNumber}: ${p.widthPx} × ${p.heightPx} px`)
+      .join("\n"),
+    "",
+    "Walk through every page in order and describe every fillable field per the system prompt. Plain English only. End with `END OF FIELD DESCRIPTIONS.`.",
+  ].join("\n");
+}
+
+/**
+ * v0.4.12 Stage 1b — description-aware structured-JSON system prompt.
+ *
+ * The body is the v0.4.11 Pass-1 system prompt verbatim (every rule
+ * preserved: image-coord contract, label-LEFT/ABOVE/BELOW handling,
+ * inline-sentence blanks, CVV preflight, type rules, bbox tightness).
+ * On top of that body we prepend a "use this field-by-field
+ * description" preamble that injects the Stage-1a free-form text as
+ * an authoritative checklist.
+ *
+ * This sequencing is the whole point of the v0.4.12 experiment: split
+ * "decide what fields exist" (Stage 1a, free-form English) from
+ * "place a tight bbox on each one" (Stage 1b, structured JSON), and
+ * use Stage 1a's output to discipline Stage 1b. responseSchema and
+ * structured output are RETAINED on Stage 1b.
+ */
+function buildStage1bSystemPrompt(stage1aText: string): string {
+  return [
+    "## Use this field-by-field description",
+    "",
+    "A senior reviewer has already walked through the form and described every fillable field in plain English. Use this description as your authoritative checklist of which fields exist and what each one represents. For every field in the description, find it on the page image, place a tight bbox on the writable area (NOT the label), and emit it in the JSON. Do not invent fields the description doesn't mention. Do not skip fields the description does mention.",
+    "",
+    "Field-by-field description (from senior reviewer):",
+    "-----",
+    stage1aText,
+    "-----",
+    "",
+    "Now produce the JSON per the rules below.",
+    "",
+    buildPass1SharedSystemPrompt(),
   ].join("\n");
 }
 
@@ -1064,12 +1168,47 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Which Gemini round-trip is currently in flight. Pass 1 is the
- * existing single-pass detection; Pass 2 is the QC audit. The phase
- * mapping is the same between the two — only the user-facing labels
- * and the progress-bar fraction band differ.
+ * Which Gemini round-trip is currently in flight. As of v0.4.12 the
+ * vocabulary is:
+ *   - `pass1`    — Fast-mode single-shot Pass 1 (legacy single-stage).
+ *   - `stage1a`  — Maximum-mode free-form description pass (v0.4.12).
+ *   - `stage1b`  — Maximum-mode description→JSON pass (v0.4.12).
+ *   - `qc`       — Pass 2 quality-control audit.
+ *
+ * Each phase has its own user-facing status text and its own
+ * progress-bar fraction band; the rest of the round-trip plumbing
+ * (SSE subscription, token interpolation) is identical across phases.
  */
-type DetectionPhase = "pass1" | "qc";
+type DetectionPhase = "pass1" | "stage1a" | "stage1b" | "qc";
+
+/**
+ * Inner [0, 1] mapping shared by every phase. Calibrated against
+ * measured timings on Gemini 2.5/3.x Pro: inline-encode (1-3s) →
+ * request fire (1-2s) → streaming (5-25s). Streaming is interpolated
+ * by output token count (typical field-map / description / correction
+ * payloads run 800-3000 output tokens).
+ */
+function innerProgressFraction(progress: GeminiProgress): number {
+  switch (progress.phase) {
+    case "uploading_file":
+      return 0.05;
+    case "file_uploaded":
+      return 0.15;
+    case "request_sent":
+      return 0.3;
+    case "streaming": {
+      const tokens = progress.tokens ?? 0;
+      const expected = 1500;
+      const ratio = Math.min(1, tokens / expected);
+      return 0.3 + ratio * 0.65;
+    }
+    case "done":
+    case "error":
+      return 1.0;
+    default:
+      return 0.0;
+  }
+}
 
 function progressToStatus(
   progress: GeminiProgress,
@@ -1077,6 +1216,48 @@ function progressToStatus(
   phase: DetectionPhase
 ): string {
   const elapsed = elapsedSec > 0 ? ` (${elapsedSec}s)` : "";
+
+  // Stage 1a (v0.4.12 description-first pass) and Stage 1b
+  // (description→JSON) get their own user-facing copy so the
+  // progress feed shows real motion across the new pipeline.
+  if (phase === "stage1a") {
+    switch (progress.phase) {
+      case "uploading_file":
+      case "file_uploaded":
+      case "request_sent":
+      case "streaming":
+        return progress.tokens && progress.phase === "streaming"
+          ? `Reviewing form layout (${progress.tokens} tokens)${elapsed}…`
+          : `Reviewing form layout${elapsed}…`;
+      case "done":
+        return `Layout review complete${elapsed}.`;
+      case "error":
+        return progress.detail
+          ? `Layout review error: ${progress.detail}`
+          : `Layout review failed.`;
+      default:
+        return `Reviewing form layout${elapsed}…`;
+    }
+  }
+  if (phase === "stage1b") {
+    switch (progress.phase) {
+      case "uploading_file":
+      case "file_uploaded":
+      case "request_sent":
+      case "streaming":
+        return progress.tokens && progress.phase === "streaming"
+          ? `Mapping fields to coordinates (${progress.tokens} tokens)${elapsed}…`
+          : `Mapping fields to coordinates${elapsed}…`;
+      case "done":
+        return `Coordinate mapping complete${elapsed}.`;
+      case "error":
+        return progress.detail
+          ? `Coordinate mapping error: ${progress.detail}`
+          : `Coordinate mapping failed.`;
+      default:
+        return `Mapping fields to coordinates${elapsed}…`;
+    }
+  }
   if (phase === "qc") {
     switch (progress.phase) {
       case "uploading_file":
@@ -1099,6 +1280,7 @@ function progressToStatus(
         return `Verifying${elapsed}…`;
     }
   }
+  // Fast-mode single-shot Pass 1.
   switch (progress.phase) {
     case "uploading_file":
       return `Uploading PDF to Gemini${elapsed}…`;
@@ -1122,61 +1304,23 @@ function progressToStatus(
 }
 
 /**
- * Maps a phase to a 0-1 progress fraction within a band. The
- * DocumentList progress bar uses this as a hard floor and animates a
- * time-based curve up to it.
+ * Maps a phase to a 0-1 progress fraction within a configurable band.
+ * The DocumentList progress bar uses the resulting fraction as a hard
+ * floor and animates a time-based curve up to it.
  *
- * In single-pass (Fast) mode Pass 1 occupies the full [0, 1] band.
- * In two-pass (Maximum) mode Pass 1 is squashed into [0, 0.55] and
- * Pass 2 occupies [0.55, 0.95] (with the final 0.05 reserved for the
- * deterministic correction-application step).
+ * Bands (v0.4.12):
+ *   - Fast mode: pass1 → [0, 1].
+ *   - Maximum mode: rendering [0, 0.05] (handled outside this function),
+ *     stage1a → [0.05, 0.30], stage1b → [0.30, 0.55], qc → [0.55, 0.95],
+ *     applying corrections [0.95, 1.0] (handled by the QC dispatcher).
  */
 function progressToFraction(
   progress: GeminiProgress,
-  phase: DetectionPhase,
-  twoPass: boolean
+  bandStart: number,
+  bandEnd: number
 ): number {
-  // Inner [0, 1] mapping calibrated against measured timings on
-  // Gemini 2.5/3.x Pro: inline-encode (1-3s) → request fire (1-2s) →
-  // streaming (5-25s). Streaming is interpolated by token count
-  // (typical field map / correction set 800-2000 output tokens).
-  let inner = 0;
-  switch (progress.phase) {
-    case "uploading_file":
-      inner = 0.05;
-      break;
-    case "file_uploaded":
-      inner = 0.15;
-      break;
-    case "request_sent":
-      inner = 0.3;
-      break;
-    case "streaming": {
-      const tokens = progress.tokens ?? 0;
-      const expected = 1500;
-      const ratio = Math.min(1, tokens / expected);
-      inner = 0.3 + ratio * 0.65;
-      break;
-    }
-    case "done":
-      inner = 1.0;
-      break;
-    case "error":
-      inner = 1.0;
-      break;
-    default:
-      inner = 0.0;
-  }
-
-  if (!twoPass) return inner;
-
-  if (phase === "pass1") {
-    // Squash Pass 1 into [0, 0.55].
-    return inner * 0.55;
-  }
-  // Pass 2 occupies [0.55, 0.95]. The final 0.05 jump to 1.0 happens
-  // when corrections are applied deterministically.
-  return 0.55 + inner * 0.4;
+  const inner = innerProgressFraction(progress);
+  return bandStart + inner * Math.max(0, bandEnd - bandStart);
 }
 
 // ---------------------------------------------------------------------------
@@ -1325,12 +1469,20 @@ async function runGeminiRoundTrip(args: {
   model: string;
   systemPrompt: string;
   userPrompt: string;
-  responseSchema: Record<string, unknown>;
+  /**
+   * Pass `null` to opt out of structured-output mode (Stage 1a, v0.4.12).
+   * Otherwise this is forwarded to Gemini as the responseSchema and we
+   * receive strict JSON back.
+   */
+  responseSchema: Record<string, unknown> | null;
   maxOutputTokens: number;
   temperature: number;
   onStatus?: (status: string, progress?: number) => void;
   phase: DetectionPhase;
-  twoPass: boolean;
+  /** Inclusive lower fraction of the progress-bar band for this phase. */
+  bandStart: number;
+  /** Inclusive upper fraction of the progress-bar band for this phase. */
+  bandEnd: number;
 }): Promise<{
   text: string;
   finishReason: string | null;
@@ -1347,7 +1499,7 @@ async function runGeminiRoundTrip(args: {
   const pushStatus = () =>
     args.onStatus?.(
       progressToStatus(lastProgress, elapsedSec(), args.phase),
-      progressToFraction(lastProgress, args.phase, args.twoPass)
+      progressToFraction(lastProgress, args.bandStart, args.bandEnd)
     );
 
   pushStatus();
@@ -1424,44 +1576,18 @@ interface Pass1Result {
   rawByFieldId: Map<string, RawGeminiField>;
 }
 
-async function runPass1(
-  pages: RenderedPage[],
-  filename: string,
-  model: string,
-  twoPass: boolean,
-  onStatus?: (status: string, progress?: number) => void
-): Promise<Pass1Result> {
-  const result = await runGeminiRoundTrip({
-    pages,
-    model,
-    systemPrompt: buildSystemPrompt(),
-    userPrompt: buildUserPrompt(pages, filename),
-    responseSchema: RESPONSE_SCHEMA,
-    // Empirical: a typical CCAUTH form with 20-30 fields, each
-    // carrying a ~6-word context snippet + 4-element bbox + canonical
-    // id, runs ~150-220 output tokens per field. Multi-page vendor
-    // packets push past 25 fields. 4096 truncates mid-array on every
-    // dense form (manifests as "Expected ']' " parse errors). 32k
-    // gives ~3-4x headroom against the worst form we've seen and is
-    // well within the 65k output budget on Gemini 2.5/3.x Pro.
-    maxOutputTokens: 32768,
-    temperature: 0.0,
-    onStatus,
-    phase: "pass1",
-    twoPass,
-  });
-
-  console.log(
-    `[Typeset Gemini] pass1 model=${model} stop=${result.finishReason} usage=${JSON.stringify(result.usage)}`
-  );
-
-  const parsed = parseStructuredResponse<RawGeminiResponse>(
-    result.text,
-    result.finishReason,
-    "Pass 1"
-  );
-
-  const rawFields = parsed.fields ?? [];
+/**
+ * Shared field-mapping pipeline used by both Pass-1 paths
+ * (Fast-mode single-shot and Maximum-mode Stage 1b). Takes the raw
+ * Gemini-returned fields, runs them through `mapToTemplateField`,
+ * dedupes spatially-overlapping detections, and returns the mapped
+ * fields paired with the surviving raw entries (the QC pass needs
+ * those raw payloads to re-map any field whose action is `fix`).
+ */
+function mapPass1RawFields(
+  rawFields: RawGeminiField[],
+  pages: RenderedPage[]
+): Pass1Result {
   const mapped: TemplateField[] = [];
   const rawByFieldId = new Map<string, RawGeminiField>();
   for (let i = 0; i < rawFields.length; i += 1) {
@@ -1482,6 +1608,171 @@ async function runPass1(
   }
 
   return { fields: deduped, rawByFieldId };
+}
+
+/**
+ * Fast-mode Pass 1 (the v0.4.7-v0.4.11 single-shot detection). Same
+ * Gemini call, same system prompt, same `responseSchema`. This path
+ * is preserved verbatim so Fast-mode behavior is unchanged in
+ * v0.4.12.
+ */
+async function runPass1Single(
+  pages: RenderedPage[],
+  filename: string,
+  model: string,
+  onStatus?: (status: string, progress?: number) => void
+): Promise<Pass1Result> {
+  const result = await runGeminiRoundTrip({
+    pages,
+    model,
+    systemPrompt: buildPass1SharedSystemPrompt(),
+    userPrompt: buildUserPrompt(pages, filename),
+    responseSchema: RESPONSE_SCHEMA,
+    // Empirical: a typical CCAUTH form with 20-30 fields, each
+    // carrying a ~6-word context snippet + 4-element bbox + canonical
+    // id, runs ~150-220 output tokens per field. Multi-page vendor
+    // packets push past 25 fields. 4096 truncates mid-array on every
+    // dense form (manifests as "Expected ']' " parse errors). 32k
+    // gives ~3-4x headroom against the worst form we've seen and is
+    // well within the 65k output budget on Gemini 2.5/3.x Pro.
+    maxOutputTokens: 32768,
+    temperature: 0.0,
+    onStatus,
+    phase: "pass1",
+    bandStart: 0,
+    bandEnd: 1.0,
+  });
+
+  console.log(
+    `[Typeset Gemini] pass1 model=${model} stop=${result.finishReason} usage=${JSON.stringify(result.usage)}`
+  );
+
+  const parsed = parseStructuredResponse<RawGeminiResponse>(
+    result.text,
+    result.finishReason,
+    "Pass 1"
+  );
+
+  return mapPass1RawFields(parsed.fields ?? [], pages);
+}
+
+/**
+ * v0.4.12 Stage 1a — free-form description pass. Asks Gemini to walk
+ * through the form image-by-image and describe every fillable field
+ * in plain English. NO `responseSchema`. The output is consumed
+ * verbatim as Stage 1b's "field-by-field checklist" preamble; we
+ * don't parse it, we just ship it forward.
+ *
+ * Maximum-mode progress band: [0.05, 0.30] (rendering occupied
+ * [0, 0.05] before this is called).
+ */
+async function runStage1a(
+  pages: RenderedPage[],
+  filename: string,
+  model: string,
+  onStatus?: (status: string, progress?: number) => void
+): Promise<string> {
+  const result = await runGeminiRoundTrip({
+    pages,
+    model,
+    systemPrompt: buildStage1aSystemPrompt(),
+    userPrompt: buildStage1aUserPrompt(pages, filename),
+    // No responseSchema — this is a free-form natural-language pass.
+    // The Rust side detects `null` here and omits both
+    // `responseMimeType` and `responseSchema` from generationConfig.
+    responseSchema: null,
+    // 16k is plenty for a thorough English walk-through of every
+    // field on a multi-page form (typically 1-3 sentences per field
+    // × 20-40 fields ≈ 1500-3000 tokens). The cap is well within
+    // Gemini 3.x Pro's output budget.
+    maxOutputTokens: 16384,
+    temperature: 0.0,
+    onStatus,
+    phase: "stage1a",
+    bandStart: 0.05,
+    bandEnd: 0.30,
+  });
+
+  console.log(
+    `[Typeset Gemini] stage1a model=${model} stop=${result.finishReason} usage=${JSON.stringify(result.usage)}`
+  );
+
+  const text = result.text ?? "";
+  const preview = text.replace(/\s+/g, " ").trim().slice(0, 200);
+  console.log(
+    `[Typeset Diag] Stage 1a response length: ${text.length} chars (preview: ${preview}...)`
+  );
+
+  if (text.trim().length === 0) {
+    throw new GeminiApiError(
+      "Stage 1a returned an empty description; cannot proceed to Stage 1b."
+    );
+  }
+
+  return text;
+}
+
+/**
+ * v0.4.12 Stage 1b — description→structured-JSON pass. Same Gemini
+ * call shape as the legacy Pass 1 (same images, same `responseSchema`,
+ * same maxOutputTokens, every v0.4.6/4.7/4.8/4.9/4.11 prompt rule
+ * preserved) PLUS the Stage-1a free-form description prepended to
+ * the system prompt as an authoritative checklist.
+ *
+ * Maximum-mode progress band: [0.30, 0.55].
+ */
+async function runStage1b(
+  pages: RenderedPage[],
+  filename: string,
+  model: string,
+  stage1aText: string,
+  onStatus?: (status: string, progress?: number) => void
+): Promise<Pass1Result> {
+  const result = await runGeminiRoundTrip({
+    pages,
+    model,
+    systemPrompt: buildStage1bSystemPrompt(stage1aText),
+    userPrompt: buildUserPrompt(pages, filename),
+    responseSchema: RESPONSE_SCHEMA,
+    // Same 32k budget as legacy Pass 1 — Stage 1b returns the same
+    // shape and dimensionality of output.
+    maxOutputTokens: 32768,
+    temperature: 0.0,
+    onStatus,
+    phase: "stage1b",
+    bandStart: 0.30,
+    bandEnd: 0.55,
+  });
+
+  console.log(
+    `[Typeset Gemini] stage1b model=${model} stop=${result.finishReason} usage=${JSON.stringify(result.usage)}`
+  );
+
+  const parsed = parseStructuredResponse<RawGeminiResponse>(
+    result.text,
+    result.finishReason,
+    "Stage 1b"
+  );
+
+  const mapped = mapPass1RawFields(parsed.fields ?? [], pages);
+  console.log(`[Typeset Diag] Stage 1b found ${mapped.fields.length} field(s)`);
+  return mapped;
+}
+
+/**
+ * v0.4.12 Maximum-mode Pass 1 orchestrator. Runs Stage 1a (free-form
+ * description) and feeds the resulting text into Stage 1b
+ * (description→JSON), returning the same {fields, rawByFieldId}
+ * shape Pass 2 QC expects. The QC pass downstream is unchanged.
+ */
+async function runPass1TwoStage(
+  pages: RenderedPage[],
+  filename: string,
+  model: string,
+  onStatus?: (status: string, progress?: number) => void
+): Promise<Pass1Result> {
+  const stage1aText = await runStage1a(pages, filename, model, onStatus);
+  return await runStage1b(pages, filename, model, stage1aText, onStatus);
 }
 
 async function detectFieldsImpl(
@@ -1515,7 +1806,12 @@ async function detectFieldsImpl(
   const accuracyMode = getAccuracyMode();
   const twoPass = accuracyMode === "maximum";
 
-  const pass1 = await runPass1(pages, filename, model, twoPass, onStatus);
+  // v0.4.12: Maximum mode runs the new two-stage Pass 1 (free-form
+  // description → description-aware structured JSON). Fast mode
+  // continues to use the legacy single-shot Pass 1.
+  const pass1 = twoPass
+    ? await runPass1TwoStage(pages, filename, model, onStatus)
+    : await runPass1Single(pages, filename, model, onStatus);
 
   if (!twoPass) {
     onStatus?.(`Gemini detected ${pass1.fields.length} field(s).`, 1);
@@ -1861,7 +2157,11 @@ async function runQualityControlPass(args: QcArgs): Promise<TemplateField[]> {
     temperature: 0.0,
     onStatus: args.onStatus,
     phase: "qc",
-    twoPass: true,
+    // Pass 2 occupies [0.55, 0.95] in Maximum mode; the final 0.05 is
+    // reserved for the deterministic correction-application step
+    // ("Applying verification corrections…") below.
+    bandStart: 0.55,
+    bandEnd: 0.95,
   });
 
   console.log(
