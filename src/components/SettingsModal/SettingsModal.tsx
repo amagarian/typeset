@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from "react";
+import { useEffect, useState, useCallback, useRef } from "react";
 import {
   setApiKey,
   hasApiKey,
@@ -17,6 +17,7 @@ import {
   setModelPreference,
   type AccuracyMode,
 } from "@/services/geminiSettings";
+import { writeLocalTemplates } from "@/services/templateCache";
 import styles from "./SettingsModal.module.css";
 
 const CUSTOM_OPTION_VALUE = "__custom__";
@@ -58,6 +59,9 @@ export function SettingsModal({
   const [testStatus, setTestStatus] = useState<TestStatus>({ kind: "idle" });
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [resetConfirming, setResetConfirming] = useState(false);
+  const [resetStatus, setResetStatus] = useState<string | null>(null);
+  const resetStatusTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -80,11 +84,21 @@ export function SettingsModal({
       setAccuracySelection(getAccuracyMode());
       setTestStatus({ kind: "idle" });
       setSaveError(null);
+      setResetConfirming(false);
+      setResetStatus(null);
     })();
     return () => {
       cancelled = true;
     };
   }, [open]);
+
+  useEffect(() => {
+    return () => {
+      if (resetStatusTimerRef.current !== null) {
+        window.clearTimeout(resetStatusTimerRef.current);
+      }
+    };
+  }, []);
 
   const effectiveModel =
     presetSelection === CUSTOM_OPTION_VALUE ? customModelId.trim() : presetSelection;
@@ -128,6 +142,19 @@ export function SettingsModal({
     } finally {
       setSaving(false);
     }
+  }, []);
+
+  const handleResetLocalTemplates = useCallback(() => {
+    writeLocalTemplates([]);
+    setResetConfirming(false);
+    setResetStatus("Local template cache cleared.");
+    if (resetStatusTimerRef.current !== null) {
+      window.clearTimeout(resetStatusTimerRef.current);
+    }
+    resetStatusTimerRef.current = window.setTimeout(() => {
+      setResetStatus(null);
+      resetStatusTimerRef.current = null;
+    }, 3500);
   }, []);
 
   const handleTest = useCallback(async () => {
@@ -283,6 +310,47 @@ export function SettingsModal({
           </div>
 
           {saveError && <span className={styles.statusError}>{saveError}</span>}
+
+          <div className={styles.section}>
+            <span className={styles.label}>Local data</span>
+            <p className={styles.helpText}>
+              Saved templates are cached locally for instant matching on
+              re-drops. Resetting clears that cache only — your published
+              registry templates stay intact, and any matched form will
+              re-pull from the community registry on the next drop.
+            </p>
+            {resetConfirming ? (
+              <div className={styles.inputRow}>
+                <button
+                  type="button"
+                  className={styles.clearBtn}
+                  onClick={handleResetLocalTemplates}
+                >
+                  Confirm reset
+                </button>
+                <button
+                  type="button"
+                  className={styles.testBtn}
+                  onClick={() => setResetConfirming(false)}
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <div className={styles.inputRow}>
+                <button
+                  type="button"
+                  className={styles.clearBtn}
+                  onClick={() => setResetConfirming(true)}
+                >
+                  Reset local templates
+                </button>
+                {resetStatus && (
+                  <span className={styles.statusOk}>{resetStatus}</span>
+                )}
+              </div>
+            )}
+          </div>
         </div>
 
         <footer className={styles.footer}>
