@@ -1,13 +1,29 @@
 /**
- * Vertical-underline snap (v0.5.10).
+ * Vertical-underline snap (v0.5.11).
  *
  * Deterministic post-processor that nudges Gemini-detected text-field
- * bboxes so their CENTER LINE sits on the writable underline stroke
- * actually drawn on the page. Runs AFTER `mapToTemplateField` and the
- * dedup pass, so it operates on already-trusted detections — we
- * never use this to invent or drop fields, only to shift `y` by a
- * few points when there is strong geometric evidence of a stroke
- * within the search band.
+ * bboxes so their CENTER LINE sits at the typographic-baseline target
+ * (`strokeRow - TEXT_BASELINE_BIAS_PT`) for the writable underline
+ * stroke actually drawn on the page. Runs AFTER `mapToTemplateField`
+ * and the dedup pass, so it operates on already-trusted detections
+ * — we never use this to invent or drop fields, only to shift `y`
+ * by a few points when there is strong geometric evidence of a
+ * stroke within the search band.
+ *
+ * v0.5.11 — typographic baseline calibration. The v0.5.5-v0.5.10
+ * snap target was `bbox center == strokeRow`, which puts the bbox
+ * center exactly on the underline. That assumption is geometrically
+ * wrong for typed text: a typed glyph on a writable line has its
+ * BASELINE on the stroke, with most of the visible character
+ * (cap height ~7pt, x-height ~5pt) extending UPWARD and only a
+ * small descender dipping below. So a stroke-centered bbox renders
+ * text ~5pt too LOW — the symptom in the v0.5.10 user report
+ * (every text field 5px low, fix = ArrowUp ×5). The new snap
+ * target is `bbox center == strokeRow - TEXT_BASELINE_BIAS_PT`
+ * (5pt, defined in `typesetConstants.ts`). The bias is included in
+ * the cap check (the cap continues to gate TOTAL movement, not
+ * pre-bias movement) so a snap that would have been at the cap is
+ * still at the cap with the bias applied.
  *
  * Why this exists:
  *   The v0.5.3 prompt rule and Pass-2 audit rule 4b ask the model to
@@ -78,6 +94,7 @@
  */
 
 import type { TemplateField } from "@/types";
+import { TEXT_BASELINE_BIAS_PT } from "@/utils/typesetConstants";
 
 /**
  * One page's rasterized image, plus the page's PDF-space scale, fed
@@ -532,12 +549,23 @@ function snapOneField(
   }
 
   // Step 8: compute the snap delta. We move the bbox so its CENTER
-  // sits on the chosen stroke row. Cap absolute movement at
-  // maxSnapPoints — anything bigger is almost certainly the model
-  // having found a totally different feature, in which case dragging
-  // the bbox onto it would damage rather than fix the detection.
+  // sits `TEXT_BASELINE_BIAS_PT` ABOVE the chosen stroke row — the
+  // stroke is the typographic baseline, and the visible glyph
+  // extends ~5pt upward from the baseline (cap height ~7pt,
+  // x-height ~5pt, with a small descender below). Centering the
+  // bbox on the stroke (the v0.5.5-v0.5.10 behavior) leaves typed
+  // text rendered ~5pt below where it should sit on the line; the
+  // bias here is what fixes that.
+  //
+  // Cap absolute movement at maxSnapPoints — anything bigger is
+  // almost certainly the model having found a totally different
+  // feature, in which case dragging the bbox onto it would damage
+  // rather than fix the detection. The bias is part of `newY`, so
+  // `deltaPt = newY - field.y` already includes it; the cap
+  // continues to gate TOTAL movement (not pre-bias movement), which
+  // is what the user perceives.
   const newCenterYPt = best.row * render.pdfPointsPerPixel;
-  const newY = newCenterYPt - field.height / 2;
+  const newY = newCenterYPt - field.height / 2 - TEXT_BASELINE_BIAS_PT;
   const deltaPt = newY - field.y;
 
   if (Math.abs(deltaPt) > opts.maxSnapPoints) {

@@ -94,6 +94,7 @@ import {
   snapFieldsToUnderlines,
   type PageRender,
 } from "@/utils/underlineSnap";
+import { TEXT_BASELINE_BIAS_PT } from "@/utils/typesetConstants";
 
 export {
   GeminiNotConfiguredError as ClaudeNotConfiguredError, // back-compat alias
@@ -450,8 +451,8 @@ function buildPass1SharedSystemPrompt(): string {
     "",
     "Tightness check before emitting each field: imagine cropping the page to your bbox. The crop should show empty space (or a drawn underline), nothing else. If you would see ANY printed letters in the crop, the bbox is too wide — shrink it.",
     "",
-    "## Vertical alignment is the most common error (v0.5.3)",
-    "When a writable area is a horizontal underline stroke, the bbox MUST be VERTICALLY CENTERED on the stroke. The bbox should extend from ~5pt above the stroke to ~5pt below it (covering where typed text will sit). Do NOT place the bbox entirely above or entirely below the stroke. Verify each bbox: imagine drawing the bbox on the page — does its CENTER LINE pass through the stroke? If yes, alignment is correct. If the bbox is anchored above or below the stroke, shift it down (or up) so it straddles the stroke.",
+    "## Vertical alignment is the most common error (v0.5.11)",
+    "When a writable area is a horizontal underline stroke, the bbox should sit ABOVE the stroke, with its BOTTOM EDGE roughly on the stroke (where the typed text baseline sits). The CENTER of the bbox should be ~5pt ABOVE the stroke. This matches where typed text actually renders — most of the visible glyph (cap height ~7pt, x-height ~5pt) extends UPWARD from the baseline, with only a small descender dipping below. Do NOT center the bbox on the stroke itself; that puts the bbox visibly below where typed text will appear. Verify each bbox: imagine drawing the bbox on the page — does its BOTTOM EDGE roughly meet the stroke (with the bulk of the bbox sitting ABOVE)? If yes, alignment is correct. If the bbox center is on or below the stroke, shift the whole bbox UP so the bottom edge meets the stroke.",
     "",
     "Same rule for label-BELOW layouts (Layout C): the bbox covers the empty band ABOVE the all-caps caption, but the BOTTOM of the bbox should sit roughly at the top of the caption text — within 2-3pt — not floating with a visible gap. The user's typed text will sit immediately above the caption, not several points above it.",
     "",
@@ -1169,6 +1170,36 @@ function mapToTemplateField(
     console.log(`[Typeset Diag] Field ${index} pdf rect: <none — invalid bbox>`);
     return null;
   }
+
+  // v0.5.11 — typographic baseline calibration. Apply a constant
+  // upward shift to every text-typed field's `y` so the bbox center
+  // sits where typed glyphs actually render, NOT on the underline
+  // stroke itself. The user-reported v0.5.10 symptom was "every
+  // field is 5px too low" — the root cause is that both the prompt
+  // ("bbox centered on stroke") and the snap target trained on a
+  // CENTER-ON-STROKE convention. Typed text has its BASELINE on the
+  // stroke and extends ~5pt UPWARD (cap height ~7pt, x-height ~5pt,
+  // with a small descender below the stroke), so centering the
+  // bbox on the stroke renders the glyph 5pt below where it should
+  // appear. The shift is applied at mapping time so it covers
+  // unsnapped fields (the snap pass writes its own y from a target
+  // that ALREADY includes the bias, so snapped fields are not
+  // double-shifted — the snap REPLACES `y` rather than adding to
+  // it).
+  //
+  // Excluded:
+  //   - `checkbox` field type — checkbox glyphs are anchored on the
+  //     center of the printed box, not on a baseline.
+  //   - `signature` field kind — signature lines sit BELOW a
+  //     printed name caption with the visible signature filling the
+  //     band ABOVE the line; the existing y-position is correct.
+  //   `multiline` and `date` text-kinds DO get the bias because
+  //   their typed content renders the same way as a single-line
+  //   text field.
+  if (fieldType === "text" && fieldKind !== "signature") {
+    rect.y = Math.max(0, rect.y - TEXT_BASELINE_BIAS_PT);
+  }
+
   console.log(
     `[Typeset Diag] Field ${index} pdf rect: x=${rect.x.toFixed(2)}, y=${rect.y.toFixed(2)}, w=${rect.width.toFixed(2)}, h=${rect.height.toFixed(2)}`
   );
@@ -2125,8 +2156,8 @@ function buildQualityControlSystemPrompt(): string {
     "  - Multiple signature/date pairs on the same form.",
     "When in doubt about whether two repeats are duplicates, KEEP both.",
     "",
-    "### 4b. Vertical centering check (v0.5.3) — apply BEFORE the keep-bias",
-    "If a field's bbox sits entirely ABOVE or entirely BELOW its writable underline stroke (the bbox CENTER LINE does NOT pass through the stroke), the bbox is misaligned vertically — `action: \"fix\"` with a `fixed_bbox` that's vertically centered on the stroke (≈5pt above + 5pt below the stroke, total height matching the local line height). This is the most common Pass-1 alignment error: a bbox correctly horizontal but anchored above the underline, leaving a visible gap between the typed text and the stroke. For Layout C (label-BELOW), the bottom of the bbox MUST sit within 2-3pt of the top of the caption text — if there's a noticeable gap, shift the bbox DOWN until it abuts the caption. Apply this fix even when otherwise uncertain — vertical mis-centering is mechanical and easy to verify by inspection.",
+    "### 4b. Vertical baseline check (v0.5.11) — apply BEFORE the keep-bias",
+    "Typed text sits with its BASELINE on the underline stroke and the visible glyph extends ~5pt UPWARD from the baseline (cap height ~7pt, x-height ~5pt, with only a small descender below). So a correctly-placed bbox sits ABOVE the stroke with its BOTTOM EDGE roughly on the stroke and its CENTER ~5pt above the stroke — NOT centered on the stroke itself. If a field's bbox center is ON or BELOW the underline stroke (i.e. the bottom edge of the bbox is well below the stroke), the bbox is misaligned vertically — `action: \"fix\"` with a `fixed_bbox` whose BOTTOM EDGE sits at the stroke and whose total height matches the local line height (so the bbox covers the band where the typed glyph will render). For Layout C (label-BELOW), the bottom of the bbox MUST sit within 2-3pt of the top of the caption text — if there's a noticeable gap, shift the bbox DOWN until it abuts the caption. Apply this fix even when otherwise uncertain — vertical mis-placement is mechanical and easy to verify by inspection.",
     "",
     "### 5. When uncertain, KEEP",
     "False drops are worse than false keeps. If you cannot decide between `keep` and `drop`, choose `keep`. If you cannot decide between `keep` and `fix`, choose `keep`. Only `drop` when you are highly confident the field is invalid (no writable area at all anywhere nearby) or a true duplicate per Rule 4. Only `fix` when you are confident the input is wrong AND you can express the corrected value. (Rule 4b is an explicit exception: vertical centering errors should be fixed because the corrective bbox is mechanically determinable from the underline position.)",
