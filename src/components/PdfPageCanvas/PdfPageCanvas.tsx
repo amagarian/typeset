@@ -10,6 +10,14 @@ interface PdfPageCanvasProps {
   pageNumber?: number;
   maxWidth?: number;
   maxHeight?: number;
+  /**
+   * v0.5.3 — render-time zoom multiplier applied AFTER the
+   * fit-to-container scale (and AFTER the 1.5 cap). Defaults to 1.
+   * The reported `scale` in `onDimensions` already includes this
+   * factor, so overlays driven by `pageDims.scale` track the canvas
+   * automatically.
+   */
+  zoomFactor?: number;
   onDimensions?: (dims: { width: number; height: number; scale: number }) => void;
 }
 
@@ -18,6 +26,7 @@ export function PdfPageCanvas({
   pageNumber = 1,
   maxWidth = 600,
   maxHeight = 700,
+  zoomFactor = 1,
   onDimensions,
 }: PdfPageCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -55,7 +64,12 @@ export function PdfPageCanvas({
         const unscaledViewport = page.getViewport({ scale: 1 });
         const scaleX = maxWidth / unscaledViewport.width;
         const scaleY = maxHeight / unscaledViewport.height;
-        const scale = Math.min(scaleX, scaleY, 1.5);
+        const baseScale = Math.min(scaleX, scaleY, 1.5);
+        // v0.5.3: zoomFactor is applied after the fit-to-container
+        // base scale and bypasses the 1.5 cap so users can magnify
+        // beyond the natural fit. Re-rasterizing at the final scale
+        // (rather than CSS-scaling the canvas) keeps text crisp.
+        const scale = baseScale * zoomFactor;
 
         const viewport = page.getViewport({ scale });
 
@@ -98,7 +112,7 @@ export function PdfPageCanvas({
         renderTaskRef.current = null;
       }
     };
-  }, [pdfBytes, pageNumber, maxWidth, maxHeight]);
+  }, [pdfBytes, pageNumber, maxWidth, maxHeight, zoomFactor]);
 
   if (error) {
     return <div className={styles.error}>{error}</div>;

@@ -46,6 +46,20 @@ function isCheckboxField(field: TemplateField): boolean {
   );
 }
 
+// v0.5.3 — render-time zoom bounds. Field coords stay in PDF
+// user-space on disk; zoom is purely cosmetic, applied via the
+// PdfPageCanvas's `zoomFactor` prop (which also scales the reported
+// `pageDims.scale`, so DraggableField overlays track the canvas
+// without any extra math in this file).
+const ZOOM_MIN = 0.5;
+const ZOOM_MAX = 4;
+const ZOOM_STEP = 1.25;
+
+function clampZoom(z: number): number {
+  if (!Number.isFinite(z)) return 1;
+  return Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, z));
+}
+
 
 
 interface TemplateReviewModalProps {
@@ -95,10 +109,37 @@ export function TemplateReviewModal({
 }: TemplateReviewModalProps) {
   const [pageDims, setPageDims] = useState<{ width: number; height: number; scale: number } | null>(null);
   const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
+  const [zoomFactor, setZoomFactor] = useState(1);
   const fieldListRef = useRef<HTMLUListElement>(null);
+  const previewAreaRef = useRef<HTMLDivElement>(null);
 
   const handleDimensions = useCallback((dims: { width: number; height: number; scale: number }) => {
     setPageDims(dims);
+  }, []);
+
+  const zoomIn = useCallback(() => {
+    setZoomFactor((z) => clampZoom(z * ZOOM_STEP));
+  }, []);
+  const zoomOut = useCallback(() => {
+    setZoomFactor((z) => clampZoom(z / ZOOM_STEP));
+  }, []);
+  const zoomReset = useCallback(() => setZoomFactor(1), []);
+
+  // v0.5.3 — macOS trackpad pinch arrives as `wheel` events with
+  // `ctrlKey: true`. We need a non-passive listener so we can
+  // `preventDefault()` and stop the browser's default page-zoom.
+  // Attaching via `addEventListener` (not React's onWheel) is the
+  // only way to pass `{ passive: false }`.
+  useEffect(() => {
+    const node = previewAreaRef.current;
+    if (!node) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!e.ctrlKey) return;
+      e.preventDefault();
+      setZoomFactor((z) => clampZoom(z * Math.exp(-e.deltaY * 0.01)));
+    };
+    node.addEventListener("wheel", onWheel, { passive: false });
+    return () => node.removeEventListener("wheel", onWheel);
   }, []);
 
   useEffect(() => {
@@ -130,7 +171,31 @@ export function TemplateReviewModal({
         return;
       }
 
-      if (!(event.metaKey || event.ctrlKey) || event.key.toLowerCase() !== "z") return;
+      const isModifier = event.metaKey || event.ctrlKey;
+      if (!isModifier) return;
+
+      // v0.5.3 — Cmd+= / Cmd+- / Cmd+0 zoom shortcuts. `event.key`
+      // for Cmd+= is "=" (US layout) and Cmd+- is "-". Some browsers
+      // report "+" when Shift is also held; accept either.
+      if (!isEditable) {
+        if (event.key === "=" || event.key === "+") {
+          event.preventDefault();
+          zoomIn();
+          return;
+        }
+        if (event.key === "-" || event.key === "_") {
+          event.preventDefault();
+          zoomOut();
+          return;
+        }
+        if (event.key === "0") {
+          event.preventDefault();
+          zoomReset();
+          return;
+        }
+      }
+
+      if (event.key.toLowerCase() !== "z") return;
       if (isEditable) return;
       if (event.shiftKey) {
         if (!canRedo) return;
@@ -145,7 +210,7 @@ export function TemplateReviewModal({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canRedo, canUndo, onRedo, onUndo, selectedFieldId, template.fields, onFieldChange, onBeginFieldEdit]);
+  }, [canRedo, canUndo, onRedo, onUndo, selectedFieldId, template.fields, onFieldChange, onBeginFieldEdit, zoomIn, zoomOut, zoomReset]);
 
   useEffect(() => {
     if (!selectedFieldId || !fieldListRef.current) return;
@@ -164,6 +229,37 @@ export function TemplateReviewModal({
             Template review — {template.name}
           </h2>
           <span className={styles.hint}>Click a field to select, drag to move, use handles to resize</span>
+          <div className={styles.zoomToolbar} role="group" aria-label="Zoom">
+            <button
+              type="button"
+              className={styles.zoomBtn}
+              onClick={zoomOut}
+              disabled={zoomFactor <= ZOOM_MIN + 1e-3}
+              title="Zoom out (⌘−)"
+              aria-label="Zoom out"
+            >
+              −
+            </button>
+            <button
+              type="button"
+              className={styles.zoomLevel}
+              onClick={zoomReset}
+              title="Reset zoom (⌘0)"
+              aria-label={`Current zoom ${Math.round(zoomFactor * 100)}%, click to reset`}
+            >
+              {Math.round(zoomFactor * 100)}%
+            </button>
+            <button
+              type="button"
+              className={styles.zoomBtn}
+              onClick={zoomIn}
+              disabled={zoomFactor >= ZOOM_MAX - 1e-3}
+              title="Zoom in (⌘+)"
+              aria-label="Zoom in"
+            >
+              +
+            </button>
+          </div>
           <button
             type="button"
             className={styles.closeBtn}
@@ -175,11 +271,15 @@ export function TemplateReviewModal({
         </header>
 
         <div className={styles.body}>
-          <div className={styles.previewArea} onClickCapture={(e) => {
-            const target = e.target as HTMLElement;
-            if (target.closest("[data-draggable-field]")) return;
-            setSelectedFieldId(null);
-          }}>
+          <div
+            ref={previewAreaRef}
+            className={styles.previewArea}
+            onClickCapture={(e) => {
+              const target = e.target as HTMLElement;
+              if (target.closest("[data-draggable-field]")) return;
+              setSelectedFieldId(null);
+            }}
+          >
             {pdfBytes ? (
               <div className={styles.pdfContainer}>
                 <PdfPageCanvas
@@ -187,6 +287,7 @@ export function TemplateReviewModal({
                   pageNumber={1}
                   maxWidth={580}
                   maxHeight={720}
+                  zoomFactor={zoomFactor}
                   onDimensions={handleDimensions}
                 />
                 {pageDims && template.fields.filter((f) => f.pageNumber === 1).map((f) => (

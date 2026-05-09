@@ -419,6 +419,11 @@ function buildPass1SharedSystemPrompt(): string {
     "",
     "Tightness check before emitting each field: imagine cropping the page to your bbox. The crop should show empty space (or a drawn underline), nothing else. If you would see ANY printed letters in the crop, the bbox is too wide — shrink it.",
     "",
+    "## Vertical alignment is the most common error (v0.5.3)",
+    "When a writable area is a horizontal underline stroke, the bbox MUST be VERTICALLY CENTERED on the stroke. The bbox should extend from ~5pt above the stroke to ~5pt below it (covering where typed text will sit). Do NOT place the bbox entirely above or entirely below the stroke. Verify each bbox: imagine drawing the bbox on the page — does its CENTER LINE pass through the stroke? If yes, alignment is correct. If the bbox is anchored above or below the stroke, shift it down (or up) so it straddles the stroke.",
+    "",
+    "Same rule for label-BELOW layouts (Layout C): the bbox covers the empty band ABOVE the all-caps caption, but the BOTTOM of the bbox should sit roughly at the top of the caption text — within 2-3pt — not floating with a visible gap. The user's typed text will sit immediately above the caption, not several points above it.",
+    "",
     "## Field-type rules (deterministic, do NOT deviate)",
     "  - If a field's surrounding text contains 'CVV', 'CVV2', 'CVC', 'security code', 'verification code', '3 digit', or '4 digit', the field is **always** `text` and `canonical_field_id: 'ccv'`. Do NOT classify it as a credit-card-type checkbox even if 'AMEX' or 'Visa' appears nearby — those words are part of the CVV instructional sentence.",
     "  - CVV / CVV2 / security code / `3 digit number` / `4 digits on front` → always `text`, NEVER `checkbox`. The blank may be drawn with a box outline, but the user types digits in it.",
@@ -764,11 +769,50 @@ function inferCanonicalId(
       if (/\bdiscover\b/.test(ctx)) return "creditCardTypeDiscover";
     }
     // CVV is handled explicitly above the card-type branch — see the
-    // cvvIndicators preflight at the top of this block. We still allow
-    // anything else mistakenly tagged as a checkbox to fall through to
-    // the text-alias matcher below; the type-guard in
-    // `mapToTemplateField` will coerce a text-typed canonical id back
-    // to a text field.
+    // cvvIndicators preflight at the top of this block. The card-type
+    // branches above ALSO short-circuit before we get here, so by this
+    // point we have a checkbox whose context did NOT match CVV or any
+    // card type. The next thing the original code did was fall
+    // through to the text-alias matcher below, which would happily
+    // map a confirmation-style checkbox like
+    //
+    //   ☐ Send PAID invoice to the email address above.
+    //
+    // to `email` (because "email" appears in `context_after`) — and
+    // then the type-guard in `mapToTemplateField` would coerce that
+    // canonical id's expected type ("text") back over the field, so
+    // the box silently became an Email text field.
+    //
+    // v0.5.3 guard: if the alias matcher would resolve this checkbox
+    // to a non-checkbox canonical (text/multiline/date/signature),
+    // the model is wrong about what the box is for. Confirmation
+    // checkboxes sit next to text that mentions email/phone/name/etc.
+    // but they ARE NOT email/phone/name/etc. fields. Return undefined
+    // so the field falls through to a generic boolean checkbox in
+    // `mapToTemplateField` (no canonical id, mappedProjectKey =
+    // `__prompt__`, fieldKind = `boolean-checkbox`).
+    const cbHaystack = `${ctx} ${aft}`.trim();
+    if (cbHaystack) {
+      for (const { alias, id } of ALIAS_INDEX) {
+        if (alias.length < 3) continue;
+        if (!cbHaystack.includes(alias)) continue;
+        const def = CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === id);
+        if (!def) break;
+        // Card-type and CVV cases are handled above and never reach
+        // here. So a `checkbox-group` / `boolean-checkbox` canonical
+        // at this point is a real checkbox-typed match — keep it.
+        if (
+          def.fieldKind === "checkbox-group" ||
+          def.fieldKind === "boolean-checkbox"
+        ) {
+          return id;
+        }
+        // Non-checkbox canonical — text, multiline, date, signature.
+        // The model is wrong; this box is a confirmation checkbox.
+        return undefined;
+      }
+    }
+    return undefined;
   }
 
   const haystack = `${ctx} ${aft}`.trim();
@@ -822,19 +866,37 @@ function inferByLabel(
     // Word-boundary match: the alias must appear as a complete token
     // sequence in the label, not just a substring (so "card" inside
     // "CARDHOLDER NAME" does not hijack into `creditCardNumber`).
-    if (lbl === alias) return id;
+    const isExactMatch = lbl === alias;
     const re = new RegExp(`\\b${escapeRegex(alias)}\\b`);
-    if (re.test(lbl)) {
-      // For card-type checkboxes ("VISA"), require the field is
-      // actually a checkbox (or the alias itself spans the entire
-      // label) — we don't want a label like "Visa Authorization Date"
-      // to resolve as `creditCardTypeVisa`.
-      if (CREDIT_CARD_CHECKBOX_IDS.has(id)) {
-        if (fieldType === "checkbox" || lbl === alias) return id;
+    const isWordMatch = isExactMatch || re.test(lbl);
+    if (!isWordMatch) continue;
+    // For card-type checkboxes ("VISA"), require the field is
+    // actually a checkbox (or the alias itself spans the entire
+    // label) — we don't want a label like "Visa Authorization Date"
+    // to resolve as `creditCardTypeVisa`.
+    if (CREDIT_CARD_CHECKBOX_IDS.has(id)) {
+      if (fieldType === "checkbox" || isExactMatch) return id;
+      continue;
+    }
+    // v0.5.3 mirror of the inferCanonicalId checkbox guard: a
+    // checkbox whose label matches a non-checkbox canonical (text,
+    // multiline, date, signature) is almost always a confirmation
+    // checkbox sitting next to that field, not the field itself.
+    // E.g. a checkbox labelled `Email me a copy` should NOT resolve
+    // to canonical `email`. Card-type ids are handled above and
+    // short-circuit before this. CCV is handled by the explicit
+    // CVV preflight at the top of this function.
+    if (fieldType === "checkbox" && !isExactMatch) {
+      const def = CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === id);
+      if (
+        def &&
+        def.fieldKind !== "checkbox-group" &&
+        def.fieldKind !== "boolean-checkbox"
+      ) {
         continue;
       }
-      return id;
     }
+    return id;
   }
 
   // No alias hit — but still accept an explicit checkbox_value match
@@ -1086,14 +1148,25 @@ function mapToTemplateField(
   const catalogKey = canonicalDef?.mappedProjectKey ?? "";
   // Label resolution priority:
   //   1. Canonical-mapped → use the catalog's label ("Cardholder Name", etc.).
-  //   2. Unmapped → use Gemini's semantic label (generated from context).
-  //   3. Fallback → derive from row context.
+  //   2. Unmapped CHECKBOX (v0.5.3) → prefer `context_after` for
+  //      confirmation checkboxes whose meaning lives in the action
+  //      sentence that follows the box (e.g. ☐ followed by
+  //      "Send PAID invoice to the email address above"). Gemini's
+  //      `label` for these is often generic ("Checkbox", "Yes") or
+  //      misleading (an action-verb fragment). The text AFTER the
+  //      box is the actual semantic content.
+  //   3. Unmapped TEXT → use Gemini's semantic label.
+  //   4. Fallback → derive from row context_before.
   const geminiLabel = (raw.label ?? "").trim();
+  const isUnmappedCheckbox = !canonicalDef && rawFieldType === "checkbox";
+  const contextAfterClean = (raw.context_after ?? "").trim();
   const fieldLabel =
     canonicalDef?.label ??
-    (geminiLabel.length > 0
-      ? geminiLabel
-      : cleanLabel(raw.context_before, `Field ${index + 1}`));
+    (isUnmappedCheckbox && contextAfterClean.length > 0
+      ? cleanLabel(raw.context_after, geminiLabel || `Field ${index + 1}`)
+      : geminiLabel.length > 0
+        ? geminiLabel
+        : cleanLabel(raw.context_before, `Field ${index + 1}`));
 
   const isUnmappedText = !isBooleanCheckbox && !isCardCheckbox && !catalogKey;
   const mappedKey: TemplateMappedProjectKey =
@@ -1989,8 +2062,11 @@ function buildQualityControlSystemPrompt(): string {
     "  - Multiple signature/date pairs on the same form.",
     "When in doubt about whether two repeats are duplicates, KEEP both.",
     "",
+    "### 4b. Vertical centering check (v0.5.3) — apply BEFORE the keep-bias",
+    "If a field's bbox sits entirely ABOVE or entirely BELOW its writable underline stroke (the bbox CENTER LINE does NOT pass through the stroke), the bbox is misaligned vertically — `action: \"fix\"` with a `fixed_bbox` that's vertically centered on the stroke (≈5pt above + 5pt below the stroke, total height matching the local line height). This is the most common Pass-1 alignment error: a bbox correctly horizontal but anchored above the underline, leaving a visible gap between the typed text and the stroke. For Layout C (label-BELOW), the bottom of the bbox MUST sit within 2-3pt of the top of the caption text — if there's a noticeable gap, shift the bbox DOWN until it abuts the caption. Apply this fix even when otherwise uncertain — vertical mis-centering is mechanical and easy to verify by inspection.",
+    "",
     "### 5. When uncertain, KEEP",
-    "False drops are worse than false keeps. If you cannot decide between `keep` and `drop`, choose `keep`. If you cannot decide between `keep` and `fix`, choose `keep`. Only `drop` when you are highly confident the field is invalid (no writable area at all anywhere nearby) or a true duplicate per Rule 4. Only `fix` when you are confident the input is wrong AND you can express the corrected value.",
+    "False drops are worse than false keeps. If you cannot decide between `keep` and `drop`, choose `keep`. If you cannot decide between `keep` and `fix`, choose `keep`. Only `drop` when you are highly confident the field is invalid (no writable area at all anywhere nearby) or a true duplicate per Rule 4. Only `fix` when you are confident the input is wrong AND you can express the corrected value. (Rule 4b is an explicit exception: vertical centering errors should be fixed because the corrective bbox is mechanically determinable from the underline position.)",
     "",
     "### 6. Default",
     "When the field looks correct, return `action: \"keep\"` with all `fixed_*` null. Do not churn fields that are already right.",

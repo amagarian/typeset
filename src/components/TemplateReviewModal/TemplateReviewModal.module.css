@@ -67,6 +67,62 @@
   background: var(--bg-input);
 }
 
+/* v0.5.3 — zoom toolbar in modal header */
+.zoomToolbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-left: auto;
+  margin-right: 6px;
+  padding: 2px;
+  background: var(--bg-input);
+  border-radius: var(--radius-sm);
+}
+
+.zoomBtn {
+  width: 24px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  padding: 0;
+  cursor: pointer;
+}
+
+.zoomBtn:hover:not(:disabled) {
+  background: var(--bg-panel);
+}
+
+.zoomBtn:disabled {
+  color: var(--text-muted);
+  opacity: 0.4;
+  cursor: default;
+}
+
+.zoomLevel {
+  min-width: 44px;
+  height: 22px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: none;
+  border-radius: 3px;
+  padding: 0 6px;
+  cursor: pointer;
+  font-variant-numeric: tabular-nums;
+}
+
+.zoomLevel:hover {
+  background: var(--bg-panel);
+}
+
 .body {
   flex: 1;
   min-height: 0;
