@@ -451,7 +451,7 @@ function buildPass1SharedSystemPrompt(): string {
     "Tightness check before emitting each field: imagine cropping the page to your bbox. The crop should show empty space (or a drawn underline), nothing else. If you would see ANY printed letters in the crop, the bbox is too wide — shrink it.",
     "",
     "## Vertical alignment is the most common error (v0.5.13)",
-    "When a writable area is a horizontal underline stroke, the bbox MUST be VERTICALLY CENTERED on the stroke. The bbox should extend from ~5pt above the stroke to ~5pt below it (covering where typed text will sit). Do NOT place the bbox entirely above or entirely below the stroke. Verify each bbox: imagine drawing the bbox on the page — does its CENTER LINE pass through the stroke? If yes, alignment is correct. If the bbox is anchored above or below the stroke, shift it down (or up) so it straddles the stroke.",
+    "When a writable area is a horizontal underline stroke, place the bbox so that its BOTTOM EDGE sits on the underline stroke (text-baseline geometry: bbox_bottom = stroke_y). The bbox should extend UPWARD from the stroke by the local line height (~10-15pt) — covering where typed text will sit ABOVE the line, the way printed letters sit on a baseline. Do NOT center the bbox on the stroke and do NOT place it entirely below the stroke. Verify each bbox: imagine drawing the bbox on the page — does its BOTTOM EDGE land on the stroke? If yes, alignment is correct. If the bbox is centered on or below the stroke, shift it UP so its bottom edge lands on the stroke.",
     "",
     "Same rule for label-BELOW layouts (Layout C): the bbox covers the empty band ABOVE the all-caps caption, but the BOTTOM of the bbox should sit roughly at the top of the caption text — within 2-3pt — not floating with a visible gap. The user's typed text will sit immediately above the caption, not several points above it.",
     "",
@@ -1196,8 +1196,51 @@ function mapToTemplateField(
     raw.canonical_field_id && VALID_CANONICAL_IDS.has(raw.canonical_field_id)
       ? (raw.canonical_field_id as CanonicalFieldId)
       : undefined;
-  const canonicalId: CanonicalFieldId | undefined =
+  let canonicalId: CanonicalFieldId | undefined =
     labelId ?? aliasId ?? patternId ?? geminiId;
+
+  // v0.5.16 — Last-mile label override (5th tier, runs AFTER the
+  // four-tier ladder above). Person-name labels on cardholder rows
+  // unambiguously denote `creditCardHolder` when they sit ON the
+  // label itself. We override here, post-resolution, as a defense
+  // against context-based heuristics (`inferByPattern`, alias
+  // matching against `context_before + context_after`) leaking the
+  // canonical id onto a sibling blank in the same row — e.g. on a
+  // `Signature ____ Print Name ____ Date ____` row, the Print Name
+  // blank's `context_after` starts with "Date", which the pattern
+  // tier can latch onto, and the alias tier can hijack the canonical
+  // for the Signature/Date siblings if "print name" were registered
+  // as a global alias (the alias index is consulted against
+  // `context_before + context_after` haystacks across ALL fields on
+  // the row, so a global alias for "print name" would resolve every
+  // sibling blank on that row to `creditCardHolder`).
+  //
+  // Why this can't live in the alias catalog: the catalog is the
+  // shared source of truth for both `inferByLabel` (label-only) AND
+  // `inferCanonicalId` (context-based). Adding "print name" /
+  // "first name" / etc. as catalog aliases for `creditCardHolder`
+  // would cause sibling-row leakage via the context path. Keeping
+  // the patterns local here makes them strictly label-only.
+  //
+  // Why it sits HERE and not inside `inferByLabel`: `inferByLabel`
+  // already has these patterns (added in v0.5.15) and SHOULD catch
+  // them. This block is a robust backstop — if an upstream change
+  // ever weakens `inferByLabel`, or if `inferByPattern` /
+  // `inferCanonicalId` somehow returns a non-`creditCardHolder` id
+  // for a label that's literally "Print Name", we still land on
+  // `creditCardHolder`. Label is the most specific local signal
+  // Gemini gives us; trust it last so it has the final word.
+  if (canonicalId !== "creditCardHolder") {
+    const lbl = (raw.label ?? "").trim().toLowerCase();
+    if (
+      /^print\s+name$/.test(lbl) ||
+      /^(?:first|last|full|customer|cardholder|card\s+holder)\s+name$/.test(lbl) ||
+      lbl === "name" ||
+      /^name\s*[:.]$/.test(lbl)
+    ) {
+      canonicalId = "creditCardHolder";
+    }
+  }
 
   const canonicalDef = canonicalId
     ? CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === canonicalId)
@@ -1230,8 +1273,17 @@ function mapToTemplateField(
   // bboxes that fail to produce a rect. Kept on the standard console
   // flow so the next user run streams diagnostics without a special
   // debug build.
+  //
+  // v0.5.16 — `canonical=` now prints the FINAL resolved canonical
+  // id (after the four-tier ladder + last-mile override), not the
+  // raw `raw.canonical_field_id` that Gemini returned. Logging the
+  // raw input made Fix 2 unverifiable: a Print Name field could end
+  // up with `canonicalFieldId: "creditCardHolder"` on the
+  // constructed TemplateField yet still log `canonical=—` (because
+  // Gemini didn't return a canonical id). `gemini_canonical=` shows
+  // the raw input separately for diagnostic completeness.
   console.log(
-    `[Typeset Diag] Field ${index} raw bbox: ${JSON.stringify(raw.bbox)} (page ${pageNumber}, image ${page.widthPx}×${page.heightPx}px, page ${page.pageWidthPt}×${page.pageHeightPt}pt) | label="${(raw.label ?? "").slice(0, 40)}" canonical=${raw.canonical_field_id ?? "—"}`
+    `[Typeset Diag] Field ${index} raw bbox: ${JSON.stringify(raw.bbox)} (page ${pageNumber}, image ${page.widthPx}×${page.heightPx}px, page ${page.pageWidthPt}×${page.pageHeightPt}pt) | label="${(raw.label ?? "").slice(0, 40)}" canonical=${canonicalId ?? "—"} gemini_canonical=${raw.canonical_field_id ?? "—"}`
   );
 
   const rect = bboxToPdfRect(raw.bbox, page, fieldType);
@@ -1240,50 +1292,65 @@ function mapToTemplateField(
     return null;
   }
 
-  // v0.5.15 — height-aware baseline calibration for unsnapped fields.
+  // v0.5.16 — anchor `bbox_bottom` on the underline stroke
+  // ("text-baseline geometry"). Replaces the v0.5.15 height-aware
+  // shift that anchored `bbox_center` on the stroke.
   //
-  // Geometric reasoning (verified against the v0.5.13 cardholder
-  // evidence: snapped fields look correct):
+  // Why we changed reference frames:
+  //   v0.5.15 made unsnapped and snapped fields converge on
+  //   `bbox_center == strokeRow`. The user's v0.5.15 ground-truth
+  //   report ("all fields still 5px too low") confirmed both paths
+  //   were converging — but on the WRONG anchor. Printed text sits
+  //   ON TOP OF a baseline; the underline IS the baseline; so the
+  //   correct field box sits ABOVE the line with `bbox_bottom ==
+  //   strokeRow`, not centered on it. A 12pt-tall field centered on
+  //   its underline overflows ~6pt below the line — exactly the
+  //   "5-6 px too low" the user kept reporting.
   //
-  //   The snap target in `underlineSnap.ts` sets
-  //     newY = strokeRow_pt - height/2
-  //   so a snapped field ends up with `bbox_center == strokeRow`.
-  //   That is the user's visual target (cardholder signature now
-  //   snapping to its underline confirms it).
+  // Geometry (text-baseline frame):
   //
-  //   For UNSNAPPED text-on-a-line fields, Gemini's raw bbox sits
-  //   with its TOP (`bbox_top` ≈ `rect.y`) approximately on the
-  //   underline stroke and extends DOWNWARD. So `rect.y ≈ strokeRow`
-  //   and `bbox_center ≈ strokeRow + height/2` — the field renders
-  //   below the line, which is the "every field is too low" symptom
-  //   we kept seeing. To converge on the snap target we need
-  //     rect.y = strokeRow - height/2 = rect.y_raw - height/2
-  //   i.e. subtract HALF THE HEIGHT, not a flat constant.
+  //   Gemini's raw bbox for a text-on-a-line field sits with
+  //   `bbox_top` ≈ `rect.y` ≈ `strokeRow` (the stroke is the bottom
+  //   of where the model thinks the bbox should go, but it returns
+  //   the bbox starting AT the stroke and extending DOWNWARD by
+  //   `height`). To anchor `bbox_bottom == strokeRow` we shift
+  //   `rect.y` UPWARD by the full height:
+  //     rect.y_corrected = rect.y_raw - height
+  //   so `bbox_top = rect.y_raw - height` and
+  //   `bbox_bottom = rect.y_raw + 0 = strokeRow`.
   //
-  //   v0.5.11 introduced a flat `TEXT_BASELINE_BIAS_PT = 5` here;
-  //   v0.5.13 kept it. That flat 5pt under-corrects typical 14-18pt
-  //   text/signature heights (where height/2 = 7-9pt) and leaves the
-  //   field 2-4pt low, which is exactly what the v0.5.14 user report
-  //   ("all fields still 5px too low") flagged. v0.5.15 replaces the
-  //   constant with `height/2` so unsnapped fields land at the same
-  //   y as snapped fields, by construction, regardless of font size.
+  //   This pairs 1:1 with `underlineSnap.ts`, which now sets
+  //     newY = strokeRow_pt - height
+  //   so snapped fields end at `bbox_bottom == strokeRow` too.
+  //   Math trace: raw_y = 724.68, h = 12 → corrected_y = 712.68.
+  //   If the snap detects a stroke at y = 724.68, it sets newY =
+  //   724.68 - 12 = 712.68. Identical — convergence preserved.
+  //
+  // History:
+  //   v0.5.11 flat `TEXT_BASELINE_BIAS_PT = 5` — under-corrected
+  //   typical heights.
+  //   v0.5.13 kept the flat 5pt — same problem.
+  //   v0.5.15 replaced the flat constant with `height/2` — converged
+  //   the snap and unsnapped paths but on `bbox_center == strokeRow`,
+  //   which is geometrically wrong for printed-text alignment.
+  //   v0.5.16 (this) — moves to the correct anchor: `bbox_bottom ==
+  //   strokeRow`, i.e. subtract the FULL height.
   //
   // Why this is safe alongside the snap: the snap REPLACES `y` with
   // its stroke-anchored target — it does not ADD to the existing
-  // `y`. So snapped fields end at `bbox_center == strokeRow`
+  // `y`. So snapped fields end at `bbox_bottom == strokeRow`
   // regardless of whatever pre-shift we did here. The pre-shift only
   // matters for fields the snap REJECTS (no stroke found, ambiguous,
-  // beyond maxSnapPoints) — and on those the new `-height/2` shift
+  // beyond maxSnapPoints) — and on those the new `-height` shift
   // produces the same target the snap would have produced.
   //
-  // Predicate ("text-on-a-line"):
+  // Predicate ("text-on-a-line") — unchanged from v0.5.15:
   //   - `text` field type: yes (every text-typed field).
   //   - `signature` field kind: yes — v0.5.13. Signatures sit on a
-  //     baseline like text and were under-corrected by the flat 5pt
-  //     bias.
+  //     baseline like text.
   //   - `multiline` field kind: NO. Multilines cover tall regions
   //     with no single underline stroke; their `y` represents the
-  //     top of a band, not a baseline, so a height/2 shift here
+  //     top of a band, not a baseline, so a full-height upward shift
   //     would push the band up off its content.
   //   - `checkbox` field type: NO. Checkbox glyphs anchor on the
   //     printed box, not on a baseline; the predicate excludes
@@ -1293,7 +1360,7 @@ function mapToTemplateField(
     (fieldType === "text" || fieldKind === "signature") &&
     fieldKind !== "multiline";
   if (correctionApplied) {
-    rect.y = Math.max(0, rect.y - rect.height / 2);
+    rect.y = Math.max(0, rect.y - rect.height);
   }
 
   console.log(
@@ -1316,7 +1383,7 @@ function mapToTemplateField(
   // see them locally without flipping the flag.
   if (alignmentDebugEnabled()) {
     console.log(
-      `[Typeset Align] field=${index} label="${(raw.label ?? "").slice(0, 32)}" type=${fieldType} kind=${fieldKind} raw_y=${rawY.toFixed(2)} corrected_y=${rect.y.toFixed(2)} corrected=${correctionApplied} height=${rect.height.toFixed(2)} (post-snap y reported separately by underlineSnap)`
+      `[Typeset Align] field=${index} label="${(raw.label ?? "").slice(0, 32)}" type=${fieldType} kind=${fieldKind} raw_y=${rawY.toFixed(2)} corrected_y=${rect.y.toFixed(2)} corrected=${correctionApplied} height=${rect.height.toFixed(2)} anchor=bbox_bottom_on_stroke (post-snap y reported separately by underlineSnap)`
     );
   }
 
@@ -2272,11 +2339,11 @@ function buildQualityControlSystemPrompt(): string {
     "  - Multiple signature/date pairs on the same form.",
     "When in doubt about whether two repeats are duplicates, KEEP both.",
     "",
-    "### 4b. Vertical centering check (v0.5.13) — apply BEFORE the keep-bias",
-    "If a field's bbox sits entirely ABOVE or entirely BELOW its writable underline stroke (the bbox CENTER LINE does NOT pass through the stroke), the bbox is misaligned vertically — `action: \"fix\"` with a `fixed_bbox` that's vertically centered on the stroke (≈5pt above + 5pt below the stroke, total height matching the local line height). This is the most common Pass-1 alignment error: a bbox correctly horizontal but anchored above the underline, leaving a visible gap between the typed text and the stroke. For Layout C (label-BELOW), the bottom of the bbox MUST sit within 2-3pt of the top of the caption text — if there's a noticeable gap, shift the bbox DOWN until it abuts the caption. Apply this fix even when otherwise uncertain — vertical mis-centering is mechanical and easy to verify by inspection.",
+    "### 4b. Vertical baseline check (v0.5.16) — apply BEFORE the keep-bias",
+    "If a field's bbox is centered on its underline stroke OR sits entirely below the stroke (the bbox BOTTOM EDGE does NOT land on the stroke), the bbox is misaligned vertically — `action: \"fix\"` with a `fixed_bbox` whose bottom edge sits on the stroke and which extends UPWARD from there (text-baseline geometry: bbox_bottom = stroke_y, total height matching the local line height of typed text). This is the most common Pass-1 alignment error: a bbox correctly horizontal but anchored centered-on or below the underline, so the typed text overflows past the line. For Layout C (label-BELOW), the bottom of the bbox MUST sit within 2-3pt of the top of the caption text — if there's a noticeable gap, shift the bbox DOWN until it abuts the caption. Apply this fix even when otherwise uncertain — vertical baseline alignment is mechanical and easy to verify by inspection.",
     "",
     "### 5. When uncertain, KEEP",
-    "False drops are worse than false keeps. If you cannot decide between `keep` and `drop`, choose `keep`. If you cannot decide between `keep` and `fix`, choose `keep`. Only `drop` when you are highly confident the field is invalid (no writable area at all anywhere nearby) or a true duplicate per Rule 4. Only `fix` when you are confident the input is wrong AND you can express the corrected value. (Rule 4b is an explicit exception: vertical centering errors should be fixed because the corrective bbox is mechanically determinable from the underline position.)",
+    "False drops are worse than false keeps. If you cannot decide between `keep` and `drop`, choose `keep`. If you cannot decide between `keep` and `fix`, choose `keep`. Only `drop` when you are highly confident the field is invalid (no writable area at all anywhere nearby) or a true duplicate per Rule 4. Only `fix` when you are confident the input is wrong AND you can express the corrected value. (Rule 4b is an explicit exception: vertical baseline errors should be fixed because the corrective bbox is mechanically determinable from the underline position.)",
     "",
     "### 6. Default",
     "When the field looks correct, return `action: \"keep\"` with all `fixed_*` null. Do not churn fields that are already right.",
