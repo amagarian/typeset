@@ -17,6 +17,21 @@ import {
   setModelPreference,
   type AccuracyMode,
 } from "@/services/geminiSettings";
+import {
+  setRegistryCredentials,
+  getRegistryCredentials,
+  clearRegistryCredentials,
+  hasRegistryCredentials,
+} from "@/services/registrySettings";
+import {
+  reloadRegistry,
+  isRegistryEnabled,
+  testRegistryConnection,
+  searchTemplates,
+  voteOnTemplate,
+  type RegistryTemplate,
+} from "@/services/templateRegistry";
+import type { Template } from "@/types";
 import styles from "./SettingsModal.module.css";
 
 const CUSTOM_OPTION_VALUE = "__custom__";
@@ -25,15 +40,44 @@ interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
   onSaved?: () => void;
+  /** Called whenever the registry's enabled state changes (after Save). */
+  onRegistryConfigChanged?: (enabled: boolean) => void;
+  /** Called when the user clicks Install on a registry-browser row. */
+  onInstallTemplate?: (template: Template) => void;
 }
 
 type TestStatus =
   | { kind: "idle" }
   | { kind: "running" }
-  | { kind: "ok" }
+  | { kind: "ok"; message?: string }
   | { kind: "error"; message: string };
 
-export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
+function buildTemplateFromRegistryRow(row: RegistryTemplate): Template {
+  const now = new Date().toISOString();
+  return {
+    id: `tpl-registry-${row.id}`,
+    name: row.name,
+    status: "local-verified",
+    source: "remote-registry",
+    registryId: row.id,
+    fields: row.fields,
+    fingerprint: row.fingerprint,
+    pageCount: row.pageCount,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
+export function SettingsModal({
+  open,
+  onClose,
+  onSaved,
+  onRegistryConfigChanged,
+  onInstallTemplate,
+}: SettingsModalProps) {
+  // -------------------------------------------------------------------------
+  // Gemini section state
+  // -------------------------------------------------------------------------
   const [keyInput, setKeyInput] = useState("");
   const [keyConfigured, setKeyConfigured] = useState(false);
   const [presetSelection, setPresetSelection] = useState<string>(DEFAULT_MODEL);
@@ -43,6 +87,28 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
   const [testStatus, setTestStatus] = useState<TestStatus>({ kind: "idle" });
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+
+  // -------------------------------------------------------------------------
+  // Template-registry section state
+  // -------------------------------------------------------------------------
+  const [registryUrlInput, setRegistryUrlInput] = useState("");
+  const [registryKeyInput, setRegistryKeyInput] = useState("");
+  const [registryConfigured, setRegistryConfigured] = useState(false);
+  const [registryTestStatus, setRegistryTestStatus] = useState<TestStatus>({
+    kind: "idle",
+  });
+  const [registryBusy, setRegistryBusy] = useState(false);
+
+  // Browser panel state.
+  const [browseQuery, setBrowseQuery] = useState("");
+  const [browseResults, setBrowseResults] = useState<RegistryTemplate[]>([]);
+  const [browseLoading, setBrowseLoading] = useState(false);
+  const [browseError, setBrowseError] = useState<string | null>(null);
+  const [voteBusyId, setVoteBusyId] = useState<string | null>(null);
+  // Track which rows the device has upvoted in this session (we don't
+  // round-trip the user's own votes from the server in v0.5.0; this is
+  // a UI-only optimistic indicator).
+  const [upvotedIds, setUpvotedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     if (!open) return;
@@ -65,6 +131,17 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
       setAccuracySelection(getAccuracyMode());
       setTestStatus({ kind: "idle" });
       setSaveError(null);
+
+      // Registry section.
+      const creds = await getRegistryCredentials();
+      if (cancelled) return;
+      setRegistryUrlInput(creds.url ?? "");
+      setRegistryKeyInput("");
+      setRegistryConfigured(await hasRegistryCredentials());
+      setRegistryTestStatus({ kind: "idle" });
+      setBrowseQuery("");
+      setBrowseResults([]);
+      setBrowseError(null);
     })();
     return () => {
       cancelled = true;
@@ -142,6 +219,141 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
       }
     }
   }, [effectiveModel, keyInput]);
+
+  // -------------------------------------------------------------------------
+  // Registry section actions
+  // -------------------------------------------------------------------------
+
+  const handleSaveRegistryCreds = useCallback(async () => {
+    setRegistryBusy(true);
+    setRegistryTestStatus({ kind: "idle" });
+    try {
+      const url = registryUrlInput.trim();
+      const key = registryKeyInput.trim();
+      if (!url || !key) {
+        setRegistryTestStatus({
+          kind: "error",
+          message: "Both fields are required.",
+        });
+        return;
+      }
+      await setRegistryCredentials(url, key);
+      setRegistryConfigured(true);
+      setRegistryKeyInput("");
+      const enabled = await reloadRegistry();
+      onRegistryConfigChanged?.(enabled);
+      setRegistryTestStatus({
+        kind: "ok",
+        message: "Saved. Use Test connection to verify the migration ran.",
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to save credentials.";
+      setRegistryTestStatus({ kind: "error", message });
+    } finally {
+      setRegistryBusy(false);
+    }
+  }, [registryUrlInput, registryKeyInput, onRegistryConfigChanged]);
+
+  const handleClearRegistryCreds = useCallback(async () => {
+    setRegistryBusy(true);
+    setRegistryTestStatus({ kind: "idle" });
+    try {
+      await clearRegistryCredentials();
+      setRegistryConfigured(false);
+      setRegistryUrlInput("");
+      setRegistryKeyInput("");
+      const enabled = await reloadRegistry();
+      onRegistryConfigChanged?.(enabled);
+      setBrowseResults([]);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to clear credentials.";
+      setRegistryTestStatus({ kind: "error", message });
+    } finally {
+      setRegistryBusy(false);
+    }
+  }, [onRegistryConfigChanged]);
+
+  const handleTestRegistry = useCallback(async () => {
+    setRegistryTestStatus({ kind: "running" });
+    try {
+      // If the user typed new credentials but hasn't pressed Save, persist
+      // them now so the test exercises what they just typed.
+      const url = registryUrlInput.trim();
+      const key = registryKeyInput.trim();
+      if (url && key) {
+        await setRegistryCredentials(url, key);
+        setRegistryConfigured(true);
+        setRegistryKeyInput("");
+        const enabled = await reloadRegistry();
+        onRegistryConfigChanged?.(enabled);
+      }
+      const count = await testRegistryConnection();
+      setRegistryTestStatus({
+        kind: "ok",
+        message: `OK — ${count} template${count === 1 ? "" : "s"} in registry.`,
+      });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Connection test failed.";
+      setRegistryTestStatus({ kind: "error", message });
+    }
+  }, [registryUrlInput, registryKeyInput, onRegistryConfigChanged]);
+
+  const handleBrowse = useCallback(async () => {
+    if (!isRegistryEnabled()) {
+      setBrowseError("Save and verify your Supabase credentials first.");
+      return;
+    }
+    setBrowseLoading(true);
+    setBrowseError(null);
+    try {
+      const rows = await searchTemplates(browseQuery, 30);
+      setBrowseResults(rows);
+      if (rows.length === 0) {
+        setBrowseError(
+          browseQuery.trim()
+            ? `No matches for “${browseQuery.trim()}”.`
+            : "No community templates yet — be the first to publish one!"
+        );
+      }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Browse failed.";
+      setBrowseError(message);
+    } finally {
+      setBrowseLoading(false);
+    }
+  }, [browseQuery]);
+
+  const handleInstall = useCallback(
+    (row: RegistryTemplate) => {
+      const installed = buildTemplateFromRegistryRow(row);
+      onInstallTemplate?.(installed);
+    },
+    [onInstallTemplate]
+  );
+
+  const handleUpvote = useCallback(
+    async (row: RegistryTemplate) => {
+      if (upvotedIds.has(row.id)) return;
+      setVoteBusyId(row.id);
+      try {
+        await voteOnTemplate(row.id, 1);
+        setUpvotedIds((prev) => {
+          const next = new Set(prev);
+          next.add(row.id);
+          return next;
+        });
+        setBrowseResults((prev) =>
+          prev.map((r) => (r.id === row.id ? { ...r, upvotes: r.upvotes + 1 } : r))
+        );
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Vote failed.";
+        setBrowseError(message);
+      } finally {
+        setVoteBusyId(null);
+      }
+    },
+    [upvotedIds]
+  );
 
   if (!open) return null;
 
@@ -268,6 +480,175 @@ export function SettingsModal({ open, onClose, onSaved }: SettingsModalProps) {
           </div>
 
           {saveError && <span className={styles.statusError}>{saveError}</span>}
+
+          {/* ---------------------------------------------------------------
+              Template registry (Supabase)
+              --------------------------------------------------------------- */}
+          <div className={styles.divider} />
+
+          <div className={styles.section}>
+            <span className={styles.label}>Template registry (Supabase)</span>
+            <p className={styles.helpText}>
+              Optional. When configured, Typeset matches dropped PDFs against
+              a public registry of community-published templates before
+              falling back to Gemini detection — and lets you publish your
+              own. Stored in your OS keychain. See{" "}
+              <code>supabase/README.md</code> for setup.
+            </p>
+            <input
+              type="text"
+              className={styles.input}
+              placeholder="https://your-project.supabase.co"
+              value={registryUrlInput}
+              onChange={(e) => setRegistryUrlInput(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <input
+              type="password"
+              className={`${styles.input} ${styles.maskedInput}`}
+              placeholder={
+                registryConfigured
+                  ? "•••••••••••••••• (saved)"
+                  : "sb_publishable_… or eyJhbGciOi… (anon key)"
+              }
+              value={registryKeyInput}
+              onChange={(e) => setRegistryKeyInput(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+            />
+            {registryConfigured && registryKeyInput.length === 0 && (
+              <span className={styles.keyMeta}>Credentials are currently saved.</span>
+            )}
+
+            <div className={styles.inputRow}>
+              <button
+                type="button"
+                className={styles.testBtn}
+                onClick={handleSaveRegistryCreds}
+                disabled={
+                  registryBusy ||
+                  registryUrlInput.trim().length === 0 ||
+                  registryKeyInput.trim().length === 0
+                }
+              >
+                {registryBusy ? "Saving…" : "Save credentials"}
+              </button>
+              <button
+                type="button"
+                className={styles.testBtn}
+                onClick={handleTestRegistry}
+                disabled={
+                  registryTestStatus.kind === "running" ||
+                  registryBusy ||
+                  (!registryConfigured &&
+                    (registryUrlInput.trim().length === 0 ||
+                      registryKeyInput.trim().length === 0))
+                }
+              >
+                {registryTestStatus.kind === "running"
+                  ? "Testing…"
+                  : "Test connection"}
+              </button>
+              {registryConfigured && (
+                <button
+                  type="button"
+                  className={styles.clearBtn}
+                  onClick={handleClearRegistryCreds}
+                  disabled={registryBusy}
+                >
+                  Clear
+                </button>
+              )}
+            </div>
+            {registryTestStatus.kind === "ok" && (
+              <span className={styles.statusOk}>
+                {registryTestStatus.message ?? "OK — connection works."}
+              </span>
+            )}
+            {registryTestStatus.kind === "error" && (
+              <span className={styles.statusError}>{registryTestStatus.message}</span>
+            )}
+          </div>
+
+          {registryConfigured && (
+            <div className={styles.section}>
+              <span className={styles.label}>Browse community templates</span>
+              <div className={styles.inputRow}>
+                <input
+                  type="text"
+                  className={styles.input}
+                  placeholder="Search by name (e.g. payroll, NDA, credit auth)…"
+                  value={browseQuery}
+                  onChange={(e) => setBrowseQuery(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleBrowse();
+                    }
+                  }}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <button
+                  type="button"
+                  className={styles.testBtn}
+                  onClick={handleBrowse}
+                  disabled={browseLoading}
+                >
+                  {browseLoading ? "Searching…" : "Search"}
+                </button>
+              </div>
+              {browseError && (
+                <span className={styles.statusError}>{browseError}</span>
+              )}
+              {browseResults.length > 0 && (
+                <ul className={styles.browseList}>
+                  {browseResults.map((row) => (
+                    <li key={row.id} className={styles.browseRow}>
+                      <div className={styles.browseRowMain}>
+                        <span className={styles.browseRowName}>{row.name}</span>
+                        <span className={styles.browseRowMeta}>
+                          {row.pageCount} page{row.pageCount === 1 ? "" : "s"} ·{" "}
+                          {row.fieldCount} field{row.fieldCount === 1 ? "" : "s"} ·{" "}
+                          {row.upvotes} upvote{row.upvotes === 1 ? "" : "s"}
+                          {row.isMine ? " · yours" : ""}
+                        </span>
+                      </div>
+                      <div className={styles.browseRowActions}>
+                        <button
+                          type="button"
+                          className={styles.testBtn}
+                          onClick={() => handleUpvote(row)}
+                          disabled={
+                            voteBusyId === row.id ||
+                            upvotedIds.has(row.id) ||
+                            row.isMine
+                          }
+                          title={
+                            row.isMine
+                              ? "Can't vote on your own publish"
+                              : upvotedIds.has(row.id)
+                              ? "Already upvoted in this session"
+                              : "Upvote"
+                          }
+                        >
+                          {upvotedIds.has(row.id) ? "↑ Voted" : "↑ Upvote"}
+                        </button>
+                        <button
+                          type="button"
+                          className={styles.saveBtn}
+                          onClick={() => handleInstall(row)}
+                        >
+                          Install
+                        </button>
+                      </div>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+          )}
         </div>
 
         <footer className={styles.footer}>

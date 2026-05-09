@@ -29,12 +29,21 @@ import {
 import { hasApiKey } from "@/services/geminiClient";
 import {
   buildPdfFingerprint,
+  buildTemplateFingerprintFromTemplate,
   scoreFingerprintMatch,
 } from "@/utils/templateFingerprint";
 import {
   readLocalTemplates,
   upsertLocalTemplate,
 } from "@/services/templateCache";
+import {
+  initRegistry,
+  isRegistryEnabled,
+  findRegistryMatches,
+  publishTemplate,
+  updatePublishedTemplate,
+  type MatchedRegistryTemplate,
+} from "@/services/templateRegistry";
 import { initTray, updateTrayMenu } from "@/utils/trayManager";
 
 function isDropZoneWindow(): boolean {
@@ -117,6 +126,28 @@ function findMatchingLocalTemplate(
   return null;
 }
 
+/**
+ * Convert a community-published registry submission into a local
+ * Template suitable for installation. We give it a fresh local id and
+ * tag it as `remote-registry` so future flows can show "Synced from
+ * registry" affordances without mistaking it for a draft.
+ */
+function buildTemplateFromRegistry(remote: MatchedRegistryTemplate): Template {
+  const now = new Date().toISOString();
+  return {
+    id: `tpl-registry-${remote.template.id}`,
+    name: remote.template.name,
+    status: "local-verified",
+    source: "remote-registry",
+    registryId: remote.template.id,
+    fields: remote.template.fields,
+    fingerprint: remote.template.fingerprint,
+    pageCount: remote.template.pageCount,
+    createdAt: now,
+    updatedAt: now,
+  };
+}
+
 function cloneTemplate(template: Template): Template {
   return JSON.parse(JSON.stringify(template)) as Template;
 }
@@ -189,6 +220,10 @@ function MainApp() {
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [matchModal, setMatchModal] = useState<PdfMatchResult | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // Mirrors `isRegistryEnabled()` so React re-renders when the user
+  // saves Supabase credentials in Settings. Updated by `initRegistry()`
+  // on startup and by the Settings modal's `onSaved` callback.
+  const [registryReady, setRegistryReady] = useState(false);
 
   const selectedProject = selectedProjectId
     ? projects.find((p) => p.id === selectedProjectId) ?? null
@@ -203,6 +238,13 @@ function MainApp() {
     if (localTemplates.length > 0) {
       setEditedTemplates(templatesToMap(localTemplates));
     }
+  }, []);
+
+  // Boot the public template registry once, in the background. Failure
+  // is non-fatal: the app remains fully usable in local-only mode and
+  // every registry call gracefully no-ops when credentials are absent.
+  useEffect(() => {
+    void initRegistry().then((ok) => setRegistryReady(ok));
   }, []);
 
   const trayInitialized = useRef(false);
@@ -414,7 +456,82 @@ function MainApp() {
         return "verified-ready";
       }
 
-      // Step 2: nothing in cache. Make sure Gemini is configured.
+      // Step 1.5: nothing in the LOCAL cache — try the public registry
+      // before paying for a Gemini detection. Hits here are gold: zero
+      // detection cost, ~200ms round-trip, and the user gets a
+      // community-verified field map. We use the same 0.92 confidence
+      // threshold as the local matcher so behaviour is symmetric — a
+      // registry hit is semantically equivalent to a local hit, just
+      // sourced remotely. Below the threshold we *don't* auto-install;
+      // a non-blocking toast lets the user browse candidates manually.
+      if (isRegistryEnabled()) {
+        try {
+          const remoteMatches = await findRegistryMatches(fingerprint, 4);
+          const best = remoteMatches[0];
+          if (best && best.matchScore >= 0.92) {
+            const installed = buildTemplateFromRegistry(best);
+            // Cache locally so the next drop of the same form is instant
+            // and works offline.
+            upsertLocalTemplate(installed);
+            setEditedTemplates((prev) => ({ ...prev, [installed.id]: installed }));
+            setDraftTemplate(installed);
+
+            const upvoteSummary =
+              best.template.upvotes > 0
+                ? ` (${best.template.upvotes} upvote${best.template.upvotes === 1 ? "" : "s"})`
+                : "";
+            const result: PdfMatchResult = {
+              kind: "verified",
+              verifiedMatch: {
+                templateId: installed.id,
+                templateName: installed.name,
+                status: installed.status,
+                confidence: best.matchScore,
+                source: "remote-registry",
+              },
+              fileName: file.name,
+              lookupMessage: `Matched a community template${upvoteSummary}.`,
+              matchSource: "remote-registry",
+              syncState: "matched",
+            };
+
+            updateDocumentInProject(effectiveProjectId, docId, {
+              status: "matched",
+              matchResult: result,
+              templateId: installed.id,
+            });
+
+            if (options.showMatchModal !== false) {
+              setMatchModal(result);
+            }
+
+            autoFillDocument(installed, docId, effectiveProjectId);
+            if (!options.silentToasts) {
+              showToast(
+                `Matched a community template${upvoteSummary} — ready to fill.`,
+                "success"
+              );
+            }
+            return "verified-ready";
+          }
+          if (remoteMatches.length > 0 && !options.silentToasts) {
+            // Below auto-install threshold but candidates exist — give
+            // the user a soft hint so they can browse.
+            showToast(
+              `Found ${remoteMatches.length} community template${
+                remoteMatches.length === 1 ? "" : "s"
+              } that may match. Open Settings → Browse community templates.`,
+              "info"
+            );
+          }
+        } catch (err) {
+          // Registry is best-effort. Any failure (network, RPC, RLS)
+          // silently falls through to the Gemini detection path.
+          console.warn("[Typeset] Registry lookup failed; falling back to Gemini:", err);
+        }
+      }
+
+      // Step 2: nothing in cache or registry. Make sure Gemini is configured.
       const configured = await hasApiKey();
       if (!configured) {
         if (!options.silentToasts) {
@@ -853,6 +970,74 @@ function MainApp() {
     [activeDocumentId, selectedProjectId, showToast, updateDocumentInProject]
   );
 
+  /**
+   * Publish (or update) a template to the public Supabase registry.
+   *
+   * The fingerprint is rebuilt from the latest fields so any post-
+   * detection edits (re-mapped labels, new manual fields) are reflected
+   * in the public row. The registry service strips device-specific
+   * data — `id`, `customValue`, `__custom__` mappings — before upload.
+   *
+   * After a successful first publish we stash the returned `registryId`
+   * on the local copy so subsequent edits route through
+   * `updatePublishedTemplate` (RLS scopes that to the original
+   * publisher's device).
+   */
+  const handlePublishTemplate = useCallback(
+    async (template: Template) => {
+      if (!isRegistryEnabled()) {
+        showToast(
+          "Template registry isn't configured. Add Supabase credentials in Settings.",
+          "info"
+        );
+        setSettingsOpen(true);
+        return;
+      }
+      try {
+        // Always recompute the fingerprint from the latest fields so the
+        // anchor terms / canonical ids reflect any post-detection edits.
+        const fingerprint = buildTemplateFingerprintFromTemplate(template);
+        const ready: Template = { ...template, fingerprint };
+
+        if (template.registryId) {
+          await updatePublishedTemplate(template.registryId, ready);
+          const updated: Template = {
+            ...ready,
+            updatedAt: new Date().toISOString(),
+          };
+          upsertLocalTemplate(updated);
+          setEditedTemplates((prev) => ({ ...prev, [updated.id]: updated }));
+          setDraftTemplate((prev) =>
+            prev && prev.id === updated.id ? updated : prev
+          );
+          showToast("Updated your published template.", "success");
+        } else {
+          const { registryId } = await publishTemplate(ready);
+          const updated: Template = {
+            ...ready,
+            registryId,
+            source: "remote-registry",
+            updatedAt: new Date().toISOString(),
+          };
+          upsertLocalTemplate(updated);
+          setEditedTemplates((prev) => ({ ...prev, [updated.id]: updated }));
+          setDraftTemplate((prev) =>
+            prev && prev.id === updated.id ? updated : prev
+          );
+          showToast(
+            "Published. Other users with the same form will see this template.",
+            "success"
+          );
+        }
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Publish failed.";
+        console.warn("[Typeset] Publish failed:", err);
+        showToast(message, "error");
+      }
+    },
+    [showToast]
+  );
+
   const exportFilledPdf = useCallback(
     async (
       template: Template,
@@ -1264,6 +1449,7 @@ function MainApp() {
             }
           }}
           onSaveLocal={(template) => handleSaveTemplate(template, { promote: true })}
+          onPublish={registryReady ? handlePublishTemplate : undefined}
           onUndo={handleUndoTemplateEdit}
           canUndo={templateUndoStack.length > 0}
           onRedo={handleRedoTemplateEdit}
@@ -1401,6 +1587,12 @@ function MainApp() {
       <SettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
+        onRegistryConfigChanged={(enabled) => setRegistryReady(enabled)}
+        onInstallTemplate={(template) => {
+          upsertLocalTemplate(template);
+          setEditedTemplates((prev) => ({ ...prev, [template.id]: template }));
+          showToast(`Installed “${template.name}” to your local templates.`, "success");
+        }}
       />
 
       <Toast toast={toast} onDismiss={() => setToast(null)} />
