@@ -38,7 +38,6 @@ import {
 } from "@/services/templateCache";
 import {
   initRegistry,
-  isRegistryEnabled,
   findRegistryMatches,
   publishTemplateAuto,
   type MatchedRegistryTemplate,
@@ -235,13 +234,12 @@ function MainApp() {
     }
   }, []);
 
-  // Boot the public template registry once, in the background. Failure
-  // is non-fatal: the app remains fully usable in local-only mode and
-  // every registry call gracefully no-ops when credentials are absent.
-  // The Settings modal calls `reloadRegistry()` directly when the user
-  // saves new credentials, so we don't need a React-state mirror here.
+  // Boot the public template registry. Since v0.5.8 credentials are
+  // baked in, so this is unconditional and synchronous — no
+  // keychain round-trip, no "is configured?" gate. Subsequent calls
+  // through `getRegistryClient()` reuse the singleton.
   useEffect(() => {
-    void initRegistry();
+    initRegistry();
   }, []);
 
   const trayInitialized = useRef(false);
@@ -461,71 +459,70 @@ function MainApp() {
       // registry hit is semantically equivalent to a local hit, just
       // sourced remotely. Below the threshold we *don't* auto-install;
       // a non-blocking toast lets the user browse candidates manually.
-      if (isRegistryEnabled()) {
-        try {
-          const remoteMatches = await findRegistryMatches(fingerprint, 4);
-          const best = remoteMatches[0];
-          if (best && best.matchScore >= 0.92) {
-            const installed = buildTemplateFromRegistry(best);
-            // Cache locally so the next drop of the same form is instant
-            // and works offline.
-            upsertLocalTemplate(installed);
-            setEditedTemplates((prev) => ({ ...prev, [installed.id]: installed }));
-            setDraftTemplate(installed);
+      // Since v0.5.8 the registry is always configured (creds baked in),
+      // so this runs unconditionally; any failure (offline / RLS / RPC)
+      // is caught and silently falls through to Gemini detection.
+      try {
+        const remoteMatches = await findRegistryMatches(fingerprint, 4);
+        const best = remoteMatches[0];
+        if (best && best.matchScore >= 0.92) {
+          const installed = buildTemplateFromRegistry(best);
+          // Cache locally so the next drop of the same form is instant
+          // and works offline.
+          upsertLocalTemplate(installed);
+          setEditedTemplates((prev) => ({ ...prev, [installed.id]: installed }));
+          setDraftTemplate(installed);
 
-            const upvoteSummary =
-              best.template.upvotes > 0
-                ? ` (${best.template.upvotes} upvote${best.template.upvotes === 1 ? "" : "s"})`
-                : "";
-            const result: PdfMatchResult = {
-              kind: "verified",
-              verifiedMatch: {
-                templateId: installed.id,
-                templateName: installed.name,
-                status: installed.status,
-                confidence: best.matchScore,
-                source: "remote-registry",
-              },
-              fileName: file.name,
-              lookupMessage: `Matched a community template${upvoteSummary}.`,
-              matchSource: "remote-registry",
-              syncState: "matched",
-            };
-
-            updateDocumentInProject(effectiveProjectId, docId, {
-              status: "matched",
-              matchResult: result,
+          const upvoteSummary =
+            best.template.upvotes > 0
+              ? ` (${best.template.upvotes} upvote${best.template.upvotes === 1 ? "" : "s"})`
+              : "";
+          const result: PdfMatchResult = {
+            kind: "verified",
+            verifiedMatch: {
               templateId: installed.id,
-            });
+              templateName: installed.name,
+              status: installed.status,
+              confidence: best.matchScore,
+              source: "remote-registry",
+            },
+            fileName: file.name,
+            lookupMessage: `Matched a community template${upvoteSummary}.`,
+            matchSource: "remote-registry",
+            syncState: "matched",
+          };
 
-            if (options.showMatchModal !== false) {
-              setMatchModal(result);
-            }
+          updateDocumentInProject(effectiveProjectId, docId, {
+            status: "matched",
+            matchResult: result,
+            templateId: installed.id,
+          });
 
-            autoFillDocument(installed, docId, effectiveProjectId);
-            if (!options.silentToasts) {
-              showToast(
-                `Matched a community template${upvoteSummary} — ready to fill.`,
-                "success"
-              );
-            }
-            return "verified-ready";
+          if (options.showMatchModal !== false) {
+            setMatchModal(result);
           }
-          if (remoteMatches.length > 0 && !options.silentToasts) {
-            // Below auto-install threshold but candidates exist — give
-            // the user a soft hint so they can browse.
+
+          autoFillDocument(installed, docId, effectiveProjectId);
+          if (!options.silentToasts) {
             showToast(
-              `Found ${remoteMatches.length} community template${
-                remoteMatches.length === 1 ? "" : "s"
-              } that may match. Open Settings → Browse community templates.`,
-              "info"
+              `Matched a community template${upvoteSummary} — ready to fill.`,
+              "success"
             );
           }
-        } catch (err) {
-          // Registry is best-effort. Any failure (network, RPC, RLS)
-          // silently falls through to the Gemini detection path.
-          console.warn("[Typeset] Registry lookup failed; falling back to Gemini:", err);
+          return "verified-ready";
         }
+        if (remoteMatches.length > 0 && !options.silentToasts) {
+          // Below auto-install threshold but candidates exist — give
+          // the user a soft hint so they can browse.
+          showToast(
+            `Found ${remoteMatches.length} community template${
+              remoteMatches.length === 1 ? "" : "s"
+            } that may match. Open Settings → Browse community templates.`,
+            "info"
+          );
+        }
+      } catch (err) {
+        console.warn("[Typeset] Registry lookup failed; falling back to Gemini:", err);
       }
 
       // Step 2: nothing in cache or registry. Make sure Gemini is configured.
@@ -981,23 +978,16 @@ function MainApp() {
       }
 
       // Local save is done. Now (best-effort) push to the registry.
-      // Skip when the registry isn't configured, when the template
-      // has no fields (nothing useful to share), or when no
-      // fingerprint could be computed.
+      // Since v0.5.8 the registry is always configured, so the only
+      // reasons to skip are local-only: empty field list (nothing
+      // useful to share) or no fingerprint computed. Network / RLS
+      // failures fall through to the catch below as a non-blocking
+      // toast — local save has already succeeded.
       const canAttemptPublish =
-        isRegistryEnabled() && savedTemplate.fields.length > 0 && Boolean(fingerprint);
+        savedTemplate.fields.length > 0 && Boolean(fingerprint);
 
       if (!canAttemptPublish) {
-        if (savedTemplate.fields.length === 0) {
-          showToast("Saved template locally.", "success");
-        } else if (!isRegistryEnabled()) {
-          showToast(
-            "Saved locally. Configure Template Registry in Settings to share.",
-            "info"
-          );
-        } else {
-          showToast("Saved template locally.", "success");
-        }
+        showToast("Saved template locally.", "success");
         return;
       }
 
@@ -1041,7 +1031,7 @@ function MainApp() {
         // than "error" so the user understands their work is safe.
         console.warn("[Typeset] Registry publish failed:", err);
         showToast(
-          "Saved locally. Registry publish failed — check Settings → Test connection.",
+          "Saved locally. Couldn't reach the community registry — try again later.",
           "info"
         );
       }

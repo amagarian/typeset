@@ -6,18 +6,13 @@
 //!
 //! Accounts (all under service `typeset`):
 //!   - `gemini-api-key`              the Gemini detection API key
-//!   - `registry-supabase-url`       the user's Supabase project URL
-//!   - `registry-supabase-anon-key`  the publishable / anon key
 //!
-//! The Supabase pair is stored alongside the Gemini key (rather than in
-//! a config file) so that:
-//!   1. The user can change projects without rebuilding the app — no
-//!      .env, no `import.meta.env.VITE_SUPABASE_*`.
-//!   2. The publishable key, while not strictly secret, is treated as
-//!      sensitive runtime config and never lands in plain-text on disk.
-//!   3. The renderer always pulls credentials through the same Tauri
-//!      command path it uses for the Gemini key, keeping the surface
-//!      area uniform.
+//! As of v0.5.8 the Supabase template-registry credentials are baked
+//! into the binary at build time (URL + publishable key, with optional
+//! `VITE_SUPABASE_*` overrides for staging) so they no longer need to
+//! be persisted here. Keychain entries from earlier versions
+//! (`registry-supabase-url`, `registry-supabase-anon-key`) on user
+//! machines are simply ignored — the new code path never reads them.
 //!
 //! Earlier versions stored an Anthropic key under `anthropic-api-key`;
 //! we don't migrate it because the keys are not interchangeable. Users
@@ -27,8 +22,6 @@ use keyring::Entry;
 
 const SERVICE: &str = "typeset";
 const GEMINI_ACCOUNT: &str = "gemini-api-key";
-const REGISTRY_URL_ACCOUNT: &str = "registry-supabase-url";
-const REGISTRY_ANON_ACCOUNT: &str = "registry-supabase-anon-key";
 
 fn entry_for(account: &str) -> Result<Entry, String> {
     Entry::new(SERVICE, account).map_err(|e| format!("keychain entry init failed: {e}"))
@@ -98,59 +91,4 @@ pub fn has_gemini_key() -> Result<bool, String> {
 #[tauri::command]
 pub fn clear_gemini_key() -> Result<(), String> {
     delete_secret(GEMINI_ACCOUNT)
-}
-
-// ---------------------------------------------------------------------------
-// Supabase template-registry credentials
-//
-// `url` is the project URL (e.g. https://xyz.supabase.co).
-// `anon_key` is the project's publishable / anon key (the newer
-// `sb_publishable_*` format and the legacy JWT-shaped anon key both
-// work — Supabase accepts either via `createClient(url, key)`). We
-// don't validate the format on either side.
-// ---------------------------------------------------------------------------
-
-/// Whatever the renderer pasted into Settings. Both fields are
-/// `Option<String>` so the UI can render "configured / not configured"
-/// correctly even when only one half exists (e.g. the user wiped the
-/// anon key but not the URL).
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-pub struct RegistryCredentials {
-    pub url: Option<String>,
-    pub anon_key: Option<String>,
-}
-
-#[tauri::command]
-pub fn registry_set_credentials(url: String, anon_key: String) -> Result<(), String> {
-    let url_trimmed = url.trim();
-    let key_trimmed = anon_key.trim();
-    if url_trimmed.is_empty() {
-        return Err("Supabase URL cannot be empty.".into());
-    }
-    if key_trimmed.is_empty() {
-        return Err("Supabase anon key cannot be empty.".into());
-    }
-    write_secret(REGISTRY_URL_ACCOUNT, url_trimmed)?;
-    write_secret(REGISTRY_ANON_ACCOUNT, key_trimmed)?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn registry_get_credentials() -> Result<RegistryCredentials, String> {
-    Ok(RegistryCredentials {
-        url: read_secret(REGISTRY_URL_ACCOUNT),
-        anon_key: read_secret(REGISTRY_ANON_ACCOUNT),
-    })
-}
-
-#[tauri::command]
-pub fn registry_has_credentials() -> Result<bool, String> {
-    Ok(read_secret(REGISTRY_URL_ACCOUNT).is_some() && read_secret(REGISTRY_ANON_ACCOUNT).is_some())
-}
-
-#[tauri::command]
-pub fn registry_clear_credentials() -> Result<(), String> {
-    delete_secret(REGISTRY_URL_ACCOUNT)?;
-    delete_secret(REGISTRY_ANON_ACCOUNT)?;
-    Ok(())
 }

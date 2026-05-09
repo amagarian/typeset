@@ -18,15 +18,6 @@ import {
   type AccuracyMode,
 } from "@/services/geminiSettings";
 import {
-  setRegistryCredentials,
-  getRegistryCredentials,
-  clearRegistryCredentials,
-  hasRegistryCredentials,
-} from "@/services/registrySettings";
-import {
-  reloadRegistry,
-  isRegistryEnabled,
-  testRegistryConnection,
   searchTemplates,
   voteOnTemplate,
   type RegistryTemplate,
@@ -86,17 +77,12 @@ export function SettingsModal({
   const [saving, setSaving] = useState(false);
 
   // -------------------------------------------------------------------------
-  // Template-registry section state
+  // Browse-community-templates panel state.
+  //
+  // Since v0.5.8 the registry is always configured (credentials baked
+  // in at build time), so this panel is unconditionally visible and
+  // unconditionally usable. There's no "configure first" gate.
   // -------------------------------------------------------------------------
-  const [registryUrlInput, setRegistryUrlInput] = useState("");
-  const [registryKeyInput, setRegistryKeyInput] = useState("");
-  const [registryConfigured, setRegistryConfigured] = useState(false);
-  const [registryTestStatus, setRegistryTestStatus] = useState<TestStatus>({
-    kind: "idle",
-  });
-  const [registryBusy, setRegistryBusy] = useState(false);
-
-  // Browser panel state.
   const [browseQuery, setBrowseQuery] = useState("");
   const [browseResults, setBrowseResults] = useState<RegistryTemplate[]>([]);
   const [browseLoading, setBrowseLoading] = useState(false);
@@ -129,13 +115,6 @@ export function SettingsModal({
       setTestStatus({ kind: "idle" });
       setSaveError(null);
 
-      // Registry section.
-      const creds = await getRegistryCredentials();
-      if (cancelled) return;
-      setRegistryUrlInput(creds.url ?? "");
-      setRegistryKeyInput("");
-      setRegistryConfigured(await hasRegistryCredentials());
-      setRegistryTestStatus({ kind: "idle" });
       setBrowseQuery("");
       setBrowseResults([]);
       setBrowseError(null);
@@ -218,87 +197,10 @@ export function SettingsModal({
   }, [effectiveModel, keyInput]);
 
   // -------------------------------------------------------------------------
-  // Registry section actions
+  // Browse-community-templates actions
   // -------------------------------------------------------------------------
 
-  const handleSaveRegistryCreds = useCallback(async () => {
-    setRegistryBusy(true);
-    setRegistryTestStatus({ kind: "idle" });
-    try {
-      const url = registryUrlInput.trim();
-      const key = registryKeyInput.trim();
-      if (!url || !key) {
-        setRegistryTestStatus({
-          kind: "error",
-          message: "Both fields are required.",
-        });
-        return;
-      }
-      await setRegistryCredentials(url, key);
-      setRegistryConfigured(true);
-      setRegistryKeyInput("");
-      // Rebuild the in-module Supabase client immediately so the next
-      // Save-template click can publish without a restart.
-      await reloadRegistry();
-      setRegistryTestStatus({
-        kind: "ok",
-        message: "Saved. Use Test connection to verify the migration ran.",
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to save credentials.";
-      setRegistryTestStatus({ kind: "error", message });
-    } finally {
-      setRegistryBusy(false);
-    }
-  }, [registryUrlInput, registryKeyInput]);
-
-  const handleClearRegistryCreds = useCallback(async () => {
-    setRegistryBusy(true);
-    setRegistryTestStatus({ kind: "idle" });
-    try {
-      await clearRegistryCredentials();
-      setRegistryConfigured(false);
-      setRegistryUrlInput("");
-      setRegistryKeyInput("");
-      await reloadRegistry();
-      setBrowseResults([]);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Failed to clear credentials.";
-      setRegistryTestStatus({ kind: "error", message });
-    } finally {
-      setRegistryBusy(false);
-    }
-  }, []);
-
-  const handleTestRegistry = useCallback(async () => {
-    setRegistryTestStatus({ kind: "running" });
-    try {
-      // If the user typed new credentials but hasn't pressed Save, persist
-      // them now so the test exercises what they just typed.
-      const url = registryUrlInput.trim();
-      const key = registryKeyInput.trim();
-      if (url && key) {
-        await setRegistryCredentials(url, key);
-        setRegistryConfigured(true);
-        setRegistryKeyInput("");
-        await reloadRegistry();
-      }
-      const count = await testRegistryConnection();
-      setRegistryTestStatus({
-        kind: "ok",
-        message: `OK — ${count} template${count === 1 ? "" : "s"} in registry.`,
-      });
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Connection test failed.";
-      setRegistryTestStatus({ kind: "error", message });
-    }
-  }, [registryUrlInput, registryKeyInput]);
-
   const handleBrowse = useCallback(async () => {
-    if (!isRegistryEnabled()) {
-      setBrowseError("Save and verify your Supabase credentials first.");
-      return;
-    }
     setBrowseLoading(true);
     setBrowseError(null);
     try {
@@ -478,174 +380,92 @@ export function SettingsModal({
           {saveError && <span className={styles.statusError}>{saveError}</span>}
 
           {/* ---------------------------------------------------------------
-              Template registry (Supabase)
+              Browse community templates.
+              Always available — registry credentials are baked in.
               --------------------------------------------------------------- */}
           <div className={styles.divider} />
 
           <div className={styles.section}>
-            <span className={styles.label}>Template registry (Supabase)</span>
+            <span className={styles.label}>Browse community templates</span>
             <p className={styles.helpText}>
-              Optional. When configured, every template you save is
-              automatically shared to the public registry — and other
-              users dropping the same form will get your field map
-              instantly, no Gemini call required. Credentials live in
-              your OS keychain (no rebuild required). See{" "}
-              <code>supabase/README.md</code> for setup.
+              Search field maps that other Typeset users have published.
+              Install one to skip the Gemini detection round-trip on
+              forms you haven&apos;t seen before.
             </p>
-            <input
-              type="text"
-              className={styles.input}
-              placeholder="https://your-project.supabase.co"
-              value={registryUrlInput}
-              onChange={(e) => setRegistryUrlInput(e.target.value)}
-              autoComplete="off"
-              spellCheck={false}
-            />
-            <input
-              type="password"
-              className={`${styles.input} ${styles.maskedInput}`}
-              placeholder={
-                registryConfigured
-                  ? "•••••••••••••••• (saved)"
-                  : "sb_publishable_… or eyJhbGciOi… (anon key)"
-              }
-              value={registryKeyInput}
-              onChange={(e) => setRegistryKeyInput(e.target.value)}
-              autoComplete="off"
-              spellCheck={false}
-            />
-            {registryConfigured && registryKeyInput.length === 0 && (
-              <span className={styles.keyMeta}>Credentials are currently saved.</span>
-            )}
-
             <div className={styles.inputRow}>
+              <input
+                type="text"
+                className={styles.input}
+                placeholder="Search by name (e.g. payroll, NDA, credit auth)…"
+                value={browseQuery}
+                onChange={(e) => setBrowseQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    void handleBrowse();
+                  }
+                }}
+                autoComplete="off"
+                spellCheck={false}
+              />
               <button
                 type="button"
                 className={styles.testBtn}
-                onClick={handleSaveRegistryCreds}
-                disabled={
-                  registryBusy ||
-                  registryUrlInput.trim().length === 0 ||
-                  registryKeyInput.trim().length === 0
-                }
+                onClick={handleBrowse}
+                disabled={browseLoading}
               >
-                {registryBusy ? "Saving…" : "Save credentials"}
+                {browseLoading ? "Searching…" : "Search"}
               </button>
-              <button
-                type="button"
-                className={styles.testBtn}
-                onClick={handleTestRegistry}
-                disabled={
-                  registryTestStatus.kind === "running" ||
-                  registryBusy ||
-                  (!registryConfigured &&
-                    (registryUrlInput.trim().length === 0 ||
-                      registryKeyInput.trim().length === 0))
-                }
-              >
-                {registryTestStatus.kind === "running"
-                  ? "Testing…"
-                  : "Test connection"}
-              </button>
-              {registryConfigured && (
-                <button
-                  type="button"
-                  className={styles.clearBtn}
-                  onClick={handleClearRegistryCreds}
-                  disabled={registryBusy}
-                >
-                  Clear
-                </button>
-              )}
             </div>
-            {registryTestStatus.kind === "ok" && (
-              <span className={styles.statusOk}>
-                {registryTestStatus.message ?? "OK — connection works."}
-              </span>
+            {browseError && (
+              <span className={styles.statusError}>{browseError}</span>
             )}
-            {registryTestStatus.kind === "error" && (
-              <span className={styles.statusError}>{registryTestStatus.message}</span>
+            {browseResults.length > 0 && (
+              <ul className={styles.browseList}>
+                {browseResults.map((row) => (
+                  <li key={row.id} className={styles.browseRow}>
+                    <div className={styles.browseRowMain}>
+                      <span className={styles.browseRowName}>{row.name}</span>
+                      <span className={styles.browseRowMeta}>
+                        {row.pageCount} page{row.pageCount === 1 ? "" : "s"} ·{" "}
+                        {row.fieldCount} field{row.fieldCount === 1 ? "" : "s"} ·{" "}
+                        {row.upvotes} upvote{row.upvotes === 1 ? "" : "s"}
+                        {row.isMine ? " · yours" : ""}
+                      </span>
+                    </div>
+                    <div className={styles.browseRowActions}>
+                      <button
+                        type="button"
+                        className={styles.testBtn}
+                        onClick={() => handleUpvote(row)}
+                        disabled={
+                          voteBusyId === row.id ||
+                          upvotedIds.has(row.id) ||
+                          row.isMine
+                        }
+                        title={
+                          row.isMine
+                            ? "Can't vote on your own publish"
+                            : upvotedIds.has(row.id)
+                            ? "Already upvoted in this session"
+                            : "Upvote"
+                        }
+                      >
+                        {upvotedIds.has(row.id) ? "↑ Voted" : "↑ Upvote"}
+                      </button>
+                      <button
+                        type="button"
+                        className={styles.saveBtn}
+                        onClick={() => handleInstall(row)}
+                      >
+                        Install
+                      </button>
+                    </div>
+                  </li>
+                ))}
+              </ul>
             )}
           </div>
-
-          {registryConfigured && (
-            <div className={styles.section}>
-              <span className={styles.label}>Browse community templates</span>
-              <div className={styles.inputRow}>
-                <input
-                  type="text"
-                  className={styles.input}
-                  placeholder="Search by name (e.g. payroll, NDA, credit auth)…"
-                  value={browseQuery}
-                  onChange={(e) => setBrowseQuery(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      void handleBrowse();
-                    }
-                  }}
-                  autoComplete="off"
-                  spellCheck={false}
-                />
-                <button
-                  type="button"
-                  className={styles.testBtn}
-                  onClick={handleBrowse}
-                  disabled={browseLoading}
-                >
-                  {browseLoading ? "Searching…" : "Search"}
-                </button>
-              </div>
-              {browseError && (
-                <span className={styles.statusError}>{browseError}</span>
-              )}
-              {browseResults.length > 0 && (
-                <ul className={styles.browseList}>
-                  {browseResults.map((row) => (
-                    <li key={row.id} className={styles.browseRow}>
-                      <div className={styles.browseRowMain}>
-                        <span className={styles.browseRowName}>{row.name}</span>
-                        <span className={styles.browseRowMeta}>
-                          {row.pageCount} page{row.pageCount === 1 ? "" : "s"} ·{" "}
-                          {row.fieldCount} field{row.fieldCount === 1 ? "" : "s"} ·{" "}
-                          {row.upvotes} upvote{row.upvotes === 1 ? "" : "s"}
-                          {row.isMine ? " · yours" : ""}
-                        </span>
-                      </div>
-                      <div className={styles.browseRowActions}>
-                        <button
-                          type="button"
-                          className={styles.testBtn}
-                          onClick={() => handleUpvote(row)}
-                          disabled={
-                            voteBusyId === row.id ||
-                            upvotedIds.has(row.id) ||
-                            row.isMine
-                          }
-                          title={
-                            row.isMine
-                              ? "Can't vote on your own publish"
-                              : upvotedIds.has(row.id)
-                              ? "Already upvoted in this session"
-                              : "Upvote"
-                          }
-                        >
-                          {upvotedIds.has(row.id) ? "↑ Voted" : "↑ Upvote"}
-                        </button>
-                        <button
-                          type="button"
-                          className={styles.saveBtn}
-                          onClick={() => handleInstall(row)}
-                        >
-                          Install
-                        </button>
-                      </div>
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </div>
-          )}
         </div>
 
         <footer className={styles.footer}>

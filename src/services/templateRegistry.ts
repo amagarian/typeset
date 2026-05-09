@@ -1,22 +1,16 @@
 /**
  * Public template-registry client.
  *
- * Backed by Supabase. The whole module silently no-ops when credentials
- * are missing (or haven't been pasted into Settings yet) so the app
- * stays fully functional in local-only mode — see `isRegistryEnabled()`
- * for the gate every UI affordance should use.
+ * Backed by Supabase. Zero-config since v0.5.8: every install of
+ * Typeset connects to the same shared registry on first run. The
+ * project URL and publishable / anon key are baked in at compile
+ * time below; RLS plus the device-bound anonymous id ship in
+ * `services/deviceId.ts` are what actually gate writes.
  *
  * Server schema lives in `supabase/migrations/`. The table is named
  * `template_submissions`; RLS does the bulk of the policy work, and
  * this module just shapes payloads and adds the `x-device-id` header
  * used by RLS for ownership / vote-dedup.
- *
- * Credentials:
- *   * URL + anon (publishable) key live in the OS keychain via the
- *     `registry_*` Tauri commands (see `services/registrySettings.ts`).
- *     The user pastes them into Settings; no rebuild required.
- *   * `initRegistry()` (re)builds the Supabase client from the cached
- *     credentials. Call it on app startup and after Settings updates.
  *
  * Matching:
  *   1. Client computes a `TemplateFingerprint` (already done locally).
@@ -38,14 +32,30 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Template, TemplateField, TemplateFingerprint } from "@/types";
 import { getDeviceId } from "./deviceId";
-import {
-  getRegistryCredentials,
-  hasRegistryCredentials,
-} from "./registrySettings";
 import { scoreFingerprintMatch } from "@/utils/templateFingerprint";
 
 // ---------------------------------------------------------------------------
-// Singleton client (rebuilt whenever Settings updates the credentials).
+// Baked-in registry credentials.
+//
+// Publishable / anon keys are designed to be embedded in clients —
+// they only grant whatever the project's RLS policies allow, which
+// for Typeset is "anonymous read of non-hidden rows + author-only
+// updates keyed off the x-device-id header". See supabase/README.md.
+//
+// `import.meta.env.VITE_SUPABASE_*` lets dev builds point at a
+// staging project without rebuilding the binary; production builds
+// fall through to the constants below.
+// ---------------------------------------------------------------------------
+
+const REGISTRY_URL =
+  (import.meta.env.VITE_SUPABASE_URL as string | undefined) ??
+  "https://sxtcmjahbgefqneauzpn.supabase.co";
+const REGISTRY_KEY =
+  (import.meta.env.VITE_SUPABASE_PUBLISHABLE_KEY as string | undefined) ??
+  "sb_publishable_zVIlCZ9YSdPEEiQE3BGSYQ_mFtOLX1e";
+
+// ---------------------------------------------------------------------------
+// Singleton client.
 // ---------------------------------------------------------------------------
 
 const SUBMISSIONS_TABLE = "template_submissions";
@@ -54,14 +64,13 @@ const FLAGS_TABLE = "template_submission_flags";
 const MATCH_RPC = "match_template_submissions_by_fingerprint";
 
 let cachedClient: SupabaseClient | null = null;
-let cachedConfigured = false;
 
-function buildClient(url: string, anonKey: string): SupabaseClient {
+function buildClient(): SupabaseClient {
   // The `x-device-id` header is read by RLS policies (see migration)
   // to gate UPDATE / DELETE on template_submissions and ownership of
   // votes/flags. We set it once on the client and let supabase-js
   // attach it to every request automatically.
-  return createClient(url, anonKey, {
+  return createClient(REGISTRY_URL, REGISTRY_KEY, {
     global: {
       headers: {
         "x-device-id": getDeviceId(),
@@ -75,56 +84,23 @@ function buildClient(url: string, anonKey: string): SupabaseClient {
 }
 
 /**
- * Load credentials from the keychain and build (or rebuild) the
- * Supabase client. Idempotent. Call once on app startup, and again
- * whenever the user saves new credentials in Settings.
- *
- * Returns `true` if the registry is now usable, `false` otherwise.
+ * Build the singleton Supabase client. Idempotent and synchronous —
+ * since v0.5.8 there are no credentials to load from disk. Safe to
+ * call from a `useEffect` on app mount.
  */
-export async function initRegistry(): Promise<boolean> {
-  try {
-    const creds = await getRegistryCredentials();
-    if (creds.url && creds.anonKey) {
-      cachedClient = buildClient(creds.url, creds.anonKey);
-      cachedConfigured = true;
-    } else {
-      cachedClient = null;
-      cachedConfigured = false;
-    }
-  } catch (err) {
-    console.warn("[Typeset registry] init failed:", err);
-    cachedClient = null;
-    cachedConfigured = false;
-  }
-  return cachedConfigured;
-}
-
-/** Force-reload after Settings updates the credentials. */
-export async function reloadRegistry(): Promise<boolean> {
-  cachedClient = null;
-  cachedConfigured = false;
-  return initRegistry();
+export function initRegistry(): void {
+  if (cachedClient) return;
+  cachedClient = buildClient();
 }
 
 /**
- * Sync gate for UI affordances. Reflects the cached state set by the
- * most recent `initRegistry()` / `reloadRegistry()` call. UI code
- * should call `initRegistry()` once at startup and treat this as
- * authoritative thereafter.
+ * Returns the singleton client, lazily initialising on first call.
+ * Every public API in this module routes through here so callers
+ * never have to think about init order.
  */
-export function isRegistryEnabled(): boolean {
-  return cachedConfigured && cachedClient !== null;
-}
-
-/** Async escape hatch for callers that arrive before init has finished. */
-export async function ensureRegistryReady(): Promise<SupabaseClient | null> {
-  if (cachedClient) return cachedClient;
-  await initRegistry();
-  return cachedClient;
-}
-
-function getClient(): SupabaseClient | null {
-  return cachedClient;
+export function getRegistryClient(): SupabaseClient {
+  if (!cachedClient) initRegistry();
+  return cachedClient!;
 }
 
 // ---------------------------------------------------------------------------
@@ -246,13 +222,6 @@ function cryptoUuid(): string {
 // Public API
 // ---------------------------------------------------------------------------
 
-export class RegistryDisabledError extends Error {
-  constructor() {
-    super("Public template registry is not configured.");
-    this.name = "RegistryDisabledError";
-  }
-}
-
 export interface PublishOptions {
   /** Override the displayed template name in the registry. */
   name?: string;
@@ -349,8 +318,7 @@ export async function publishTemplateAuto(
   template: Template,
   options: PublishOptions = {}
 ): Promise<AutoPublishOutcome> {
-  const client = getClient();
-  if (!client) throw new RegistryDisabledError();
+  const client = getRegistryClient();
   if (!template.fingerprint) {
     throw new Error("Template is missing a fingerprint; refusing to publish.");
   }
@@ -426,8 +394,7 @@ export async function publishTemplateAuto(
 
 /** Delete a template you own. RLS enforces ownership. */
 export async function deletePublishedTemplate(registryId: string): Promise<void> {
-  const client = getClient();
-  if (!client) throw new RegistryDisabledError();
+  const client = getRegistryClient();
   const { error } = await client
     .from(SUBMISSIONS_TABLE)
     .delete()
@@ -457,8 +424,7 @@ export async function findRegistryMatches(
   fingerprint: TemplateFingerprint,
   limit: number = 8
 ): Promise<MatchedRegistryTemplate[]> {
-  const client = getClient();
-  if (!client) return [];
+  const client = getRegistryClient();
 
   const { data, error } = await client.rpc(MATCH_RPC, {
     p_fingerprint_hash: fingerprint.fingerprintHash,
@@ -499,8 +465,7 @@ export async function findRegistryMatches(
 export async function listFeaturedTemplates(
   limit: number = 50
 ): Promise<RegistryTemplate[]> {
-  const client = getClient();
-  if (!client) return [];
+  const client = getRegistryClient();
   const { data, error } = await client
     .from(SUBMISSIONS_TABLE)
     .select("*")
@@ -523,8 +488,7 @@ export async function searchTemplates(
   query: string,
   limit: number = 30
 ): Promise<RegistryTemplate[]> {
-  const client = getClient();
-  if (!client) return [];
+  const client = getRegistryClient();
   const trimmed = query.trim();
   if (!trimmed) return listFeaturedTemplates(limit);
   const { data, error } = await client
@@ -542,45 +506,6 @@ export async function searchTemplates(
 }
 
 // ---------------------------------------------------------------------------
-// Connection test (for the Settings "Test connection" button)
-// ---------------------------------------------------------------------------
-
-/**
- * Performs a trivial `head: true` count against `template_submissions`
- * so the user can verify their pasted credentials reach a project that
- * has the migration applied. Returns the row count on success; throws
- * with a human-readable message on failure.
- *
- * NOT cached — runs every time the button is clicked.
- */
-export async function testRegistryConnection(): Promise<number> {
-  if (!(await hasRegistryCredentials())) {
-    throw new Error(
-      "Paste your Supabase URL and publishable key first, then test the connection."
-    );
-  }
-  // Force a fresh client from the latest stored credentials so testing
-  // works even before `initRegistry()` has been re-run after a save.
-  const creds = await getRegistryCredentials();
-  if (!creds.url || !creds.anonKey) {
-    throw new Error(
-      "Supabase credentials missing. Paste both the project URL and publishable key."
-    );
-  }
-  const probe = buildClient(creds.url, creds.anonKey);
-  const { count, error } = await probe
-    .from(SUBMISSIONS_TABLE)
-    .select("*", { count: "exact", head: true });
-  if (error) {
-    const hint = /relation .* does not exist/i.test(error.message)
-      ? " — has the SQL migration been applied? See supabase/README.md."
-      : "";
-    throw new Error(`${error.message}${hint}`);
-  }
-  return count ?? 0;
-}
-
-// ---------------------------------------------------------------------------
 // Votes & flags
 // ---------------------------------------------------------------------------
 
@@ -594,8 +519,7 @@ export async function voteOnTemplate(
   registryId: string,
   vote: VoteValue
 ): Promise<void> {
-  const client = getClient();
-  if (!client) throw new RegistryDisabledError();
+  const client = getRegistryClient();
   const deviceId = getDeviceId();
   if (vote === 0) {
     const { error } = await client
@@ -626,8 +550,7 @@ export async function flagTemplate(
   reason: FlagReason,
   detail?: string
 ): Promise<void> {
-  const client = getClient();
-  if (!client) throw new RegistryDisabledError();
+  const client = getRegistryClient();
   const { error } = await client
     .from(FLAGS_TABLE)
     .upsert(
