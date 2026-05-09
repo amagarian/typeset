@@ -12,13 +12,6 @@
  *   2. Progress events stream over `gemini-progress` instead of
  *      `anthropic-progress`, and the phase vocabulary is shorter:
  *      `uploading_file → file_uploaded → request_sent → streaming → done`.
- *
- * v0.4.10: `responseSchema` is now optional. When omitted, Gemini
- * emits free-form text (with thinking enabled) and the renderer
- * extracts the canonical JSON block from a trailing ```json``` fence.
- * Pass 1 / Pass 2 use this mode; the project-import path keeps the
- * schema. Both modes always pass `thinkingBudget: -1` so the model
- * has unbounded internal reasoning room.
  */
 
 import { invoke } from "@tauri-apps/api/core";
@@ -115,42 +108,13 @@ export interface DetectFieldsOptions {
   systemPrompt: string;
   userPrompt: string;
   /**
-   * Gemini-flavoured JSON schema constraining the output. Optional as
-   * of v0.4.10 — when omitted, Gemini emits free-form text and the
-   * renderer extracts the canonical JSON block from a trailing
-   * ```json``` fence (see `extractJsonFromText` in
-   * `geminiFieldDetector.ts`).
-   *
-   * Why we drop it for the detection passes: forcing
-   * `responseMimeType: application/json` + `responseSchema` puts
-   * Gemini into a one-shot structured-output mode where its thinking
-   * budget is effectively wasted — the model can't reason step-by-
-   * step before committing to an answer. Removing the constraint
-   * lets the model think freely (with `thinkingConfig.thinkingBudget
-   * = -1`) and then emit a single JSON block at the end of its
-   * response, which is exactly how Gemini's web UI behaves on the
-   * same forms.
-   *
-   * The legacy project-import flow keeps this set because it's a
-   * tiny one-shot extraction with no thinking benefit.
+   * Gemini-flavoured JSON schema constraining the output. Required —
+   * we always call Gemini in structured-output mode so the renderer
+   * can `JSON.parse(result.text)` without defensive extraction.
    */
-  responseSchema?: Record<string, unknown>;
+  responseSchema: Record<string, unknown>;
   maxOutputTokens?: number;
   temperature?: number;
-  /**
-   * Thinking budget for the Gemini 2.5/3.x thinking models. `-1`
-   * (default) = dynamic / unbounded — the model decides. `0` = off.
-   * Positive integer = explicit cap. Pass 1 / Pass 2 / project-import
-   * all default to `-1` so the model always has thinking room.
-   */
-  thinkingBudget?: number;
-  /**
-   * Whether the model's chain-of-thought is included in the visible
-   * response. We default to `false` so the response body is just the
-   * answer (the thinking still happens server-side; we just don't
-   * waste round-trip bandwidth on it).
-   */
-  includeThoughts?: boolean;
 }
 
 function isTauriAvailable(): boolean {
@@ -211,11 +175,9 @@ export async function detectFieldsWithGemini(
           model: opts.model,
           system_prompt: opts.systemPrompt,
           user_prompt: opts.userPrompt,
-          response_schema: opts.responseSchema ?? null,
+          response_schema: opts.responseSchema,
           max_output_tokens: opts.maxOutputTokens,
           temperature: opts.temperature,
-          thinking_budget: opts.thinkingBudget ?? -1,
-          include_thoughts: opts.includeThoughts ?? false,
         },
       }
     );
@@ -270,11 +232,9 @@ export async function detectFieldsWithGeminiImages(
           model: opts.model,
           system_prompt: opts.systemPrompt,
           user_prompt: opts.userPrompt,
-          response_schema: opts.responseSchema ?? null,
+          response_schema: opts.responseSchema,
           max_output_tokens: opts.maxOutputTokens,
           temperature: opts.temperature,
-          thinking_budget: opts.thinkingBudget ?? -1,
-          include_thoughts: opts.includeThoughts ?? false,
         },
       }
     );
