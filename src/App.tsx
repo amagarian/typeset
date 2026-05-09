@@ -442,9 +442,6 @@ function MainApp() {
         detectedFields = await detectFieldsWithClaude(bytes, 1, setDocProcessing, {
           projectHint: effectiveProject,
           filename: file.name,
-          onPrecisionFallback: (msg) => {
-            if (!options.silentToasts) showToast(msg, "info");
-          },
         });
       } catch (err) {
         console.warn("[Typeset] Gemini detection failed:", err);
@@ -1306,7 +1303,6 @@ function MainApp() {
                       {
                         projectHint: selectedProject ?? undefined,
                         filename: pdfSource.fileName,
-                        onPrecisionFallback: (msg) => showToast(msg, "info"),
                       }
                     );
                   } catch (err) {

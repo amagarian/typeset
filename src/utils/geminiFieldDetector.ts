@@ -90,16 +90,6 @@ import {
 } from "@/types";
 import { CANONICAL_FIELD_DEFINITIONS } from "@/utils/fieldCatalog";
 import { normalizeCardType } from "@/utils/fill";
-import {
-  extractPdfText,
-  isScannedPdf,
-  type PdfRenderScale,
-} from "@/utils/pdfTextLayer";
-import { detectBlanks, summarizeKinds } from "@/utils/blankDetector";
-import {
-  pairBlanksWithContext,
-  type BlankWithContext,
-} from "@/utils/blankContextResolver";
 
 export {
   GeminiNotConfiguredError as ClaudeNotConfiguredError, // back-compat alias
@@ -128,15 +118,6 @@ interface RenderedPage {
    *  of the app stores on `TemplateField` rectangles). */
   pageWidthPt: number;
   pageHeightPt: number;
-  /**
-   * The canvas the page was rasterized onto. Retained ONLY when the
-   * caller needs to do further pixel work (v0.4.13 Precision mode
-   * runs ImageData reads against the same canvas to find horizontal
-   * underline strokes, small box outlines, and empty bands above
-   * captions). Fast and Maximum modes ignore this field — they only
-   * use `pngBytes`.
-   */
-  canvas?: HTMLCanvasElement;
 }
 
 interface RawGeminiField {
@@ -252,13 +233,7 @@ const RENDER_LONG_EDGE_PX = 2048;
  */
 async function renderPagesToPng(
   pdfBytes: Uint8Array,
-  onProgress?: (pageNumber: number, totalPages: number) => void,
-  /**
-   * v0.4.13 Precision mode keeps the rasterized canvas alive so the
-   * blank detector can read ImageData off it without re-rendering.
-   * Default off (Fast/Maximum modes only need the PNG bytes).
-   */
-  retainCanvas: boolean = false
+  onProgress?: (pageNumber: number, totalPages: number) => void
 ): Promise<RenderedPage[]> {
   const bytesCopy = new Uint8Array(pdfBytes);
   const pdf = await pdfjsLib.getDocument({ data: bytesCopy }).promise;
@@ -308,7 +283,6 @@ async function renderPagesToPng(
         heightPx: canvas.height,
         pageWidthPt: Math.round(baseViewport.width),
         pageHeightPt: Math.round(baseViewport.height),
-        canvas: retainCanvas ? canvas : undefined,
       });
     }
   } finally {
@@ -1194,29 +1168,18 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
 // ---------------------------------------------------------------------------
 
 /**
- * Which Gemini round-trip is currently in flight. As of v0.4.13 the
+ * Which Gemini round-trip is currently in flight. As of v0.4.12 the
  * vocabulary is:
- *   - `pass1`              — Fast-mode single-shot Pass 1 (legacy
- *     single-stage).
- *   - `stage1a`            — Maximum-mode free-form description pass
- *     (v0.4.12).
- *   - `stage1b`            — Maximum-mode description→JSON pass
- *     (v0.4.12).
- *   - `qc`                 — Maximum-mode Pass 2 quality-control
- *     audit.
- *   - `precision_labeling` — Precision-mode single Gemini call that
- *     labels deterministically-located blanks (v0.4.13).
+ *   - `pass1`    — Fast-mode single-shot Pass 1 (legacy single-stage).
+ *   - `stage1a`  — Maximum-mode free-form description pass (v0.4.12).
+ *   - `stage1b`  — Maximum-mode description→JSON pass (v0.4.12).
+ *   - `qc`       — Pass 2 quality-control audit.
  *
  * Each phase has its own user-facing status text and its own
  * progress-bar fraction band; the rest of the round-trip plumbing
  * (SSE subscription, token interpolation) is identical across phases.
  */
-type DetectionPhase =
-  | "pass1"
-  | "stage1a"
-  | "stage1b"
-  | "qc"
-  | "precision_labeling";
+type DetectionPhase = "pass1" | "stage1a" | "stage1b" | "qc";
 
 /**
  * Inner [0, 1] mapping shared by every phase. Calibrated against
@@ -1293,25 +1256,6 @@ function progressToStatus(
           : `Coordinate mapping failed.`;
       default:
         return `Mapping fields to coordinates${elapsed}…`;
-    }
-  }
-  if (phase === "precision_labeling") {
-    switch (progress.phase) {
-      case "uploading_file":
-      case "file_uploaded":
-      case "request_sent":
-      case "streaming":
-        return progress.tokens && progress.phase === "streaming"
-          ? `Labeling fields (${progress.tokens} tokens)${elapsed}…`
-          : `Labeling fields${elapsed}…`;
-      case "done":
-        return `Labeling complete${elapsed}.`;
-      case "error":
-        return progress.detail
-          ? `Labeling error: ${progress.detail}`
-          : `Labeling failed.`;
-      default:
-        return `Labeling fields${elapsed}…`;
     }
   }
   if (phase === "qc") {
@@ -1483,13 +1427,6 @@ export interface DetectFieldsOptions {
   projectHint?: Project | null;
   /** Original filename — only used in the user prompt for context. */
   filename?: string;
-  /**
-   * v0.4.13: invoked when Precision mode silently falls back to
-   * Maximum mode because the input PDF has no extractable text layer
-   * (i.e. it's a scanned image). The renderer should surface a
-   * non-blocking toast — the detection itself proceeds normally.
-   */
-  onPrecisionFallback?: (message: string) => void;
 }
 
 /**
@@ -1844,70 +1781,6 @@ async function detectFieldsImpl(
   options: DetectFieldsOptions = {}
 ): Promise<TemplateField[]> {
   const filename = options.filename ?? "document.pdf";
-  const accuracyMode = getAccuracyMode();
-  const model = getModelPreference();
-
-  // -------- v0.4.13 Precision mode ----------------------------------------
-  // Determinstic geometric blank detection + a single Gemini call that
-  // labels the located blanks. When the PDF is scanned (no text
-  // layer), Precision automatically falls back to Maximum mode and
-  // surfaces a non-blocking toast via `options.onPrecisionFallback`.
-  if (accuracyMode === "precision") {
-    onStatus?.("Rendering PDF pages…", 0.02);
-    const pagesP = await renderPagesToPng(
-      pdfBytes,
-      (current, total) => {
-        onStatus?.(
-          `Rendering page ${current}/${total}…`,
-          0.02 + 0.08 * (current / Math.max(1, total))
-        );
-      },
-      /* retainCanvas */ true
-    );
-    if (pagesP.length === 0) {
-      throw new GeminiApiError("PDF has no readable pages.");
-    }
-    for (const p of pagesP) {
-      console.log(
-        `[Typeset Diag] Page ${p.pageNumber} size: width=${p.pageWidthPt}pt, height=${p.pageHeightPt}pt | rendered=${p.widthPx}×${p.heightPx}px (scale=${(p.widthPx / Math.max(1, p.pageWidthPt)).toFixed(3)}x)`
-      );
-    }
-
-    const precisionResult = await runPrecisionPipeline(
-      pdfBytes,
-      pagesP,
-      filename,
-      model,
-      onStatus
-    );
-
-    if (precisionResult.kind === "ok") {
-      onStatus?.(
-        `Precision detected ${precisionResult.fields.length} field(s).`,
-        1
-      );
-      return precisionResult.fields;
-    }
-
-    // Scanned-PDF fallback. Surface the non-blocking toast and run
-    // Maximum mode against the same RenderedPage[] (we already
-    // rendered them, no need to redo).
-    console.warn(
-      "[Typeset Diag] Precision: text layer empty — falling back to Maximum mode"
-    );
-    options.onPrecisionFallback?.(
-      "Scanned PDF detected — falling back to Maximum accuracy"
-    );
-    onStatus?.("Falling back to Maximum mode…", 0.05);
-    return await runMaximumModeOnRenderedPages(
-      pagesP,
-      filename,
-      model,
-      onStatus
-    );
-  }
-
-  // -------- Fast / Maximum modes (unchanged from v0.4.12) -----------------
   onStatus?.("Rendering PDF pages…", 0.02);
 
   const pages = await renderPagesToPng(pdfBytes, (current, total) => {
@@ -1920,14 +1793,22 @@ async function detectFieldsImpl(
     throw new GeminiApiError("PDF has no readable pages.");
   }
 
+  // [Typeset Diag] Page-size + render-scale dump. Logged once per run
+  // so we can correlate any stray bbox offsets with the underlying
+  // page geometry.
   for (const p of pages) {
     console.log(
       `[Typeset Diag] Page ${p.pageNumber} size: width=${p.pageWidthPt}pt, height=${p.pageHeightPt}pt | rendered=${p.widthPx}×${p.heightPx}px (scale=${(p.widthPx / Math.max(1, p.pageWidthPt)).toFixed(3)}x)`
     );
   }
 
+  const model = getModelPreference();
+  const accuracyMode = getAccuracyMode();
   const twoPass = accuracyMode === "maximum";
 
+  // v0.4.12: Maximum mode runs the new two-stage Pass 1 (free-form
+  // description → description-aware structured JSON). Fast mode
+  // continues to use the legacy single-shot Pass 1.
   const pass1 = twoPass
     ? await runPass1TwoStage(pages, filename, model, onStatus)
     : await runPass1Single(pages, filename, model, onStatus);
@@ -2403,434 +2284,6 @@ async function runQualityControlPass(args: QcArgs): Promise<TemplateField[]> {
   );
 
   return deduped;
-}
-
-// ---------------------------------------------------------------------------
-// v0.4.13 Precision mode: deterministic blank detection + semantic labeling
-// ---------------------------------------------------------------------------
-
-/**
- * Helper that re-uses an already-rendered RenderedPage[] to run the
- * Maximum-mode pipeline (two-stage Pass 1 + Pass 2 QC). Called from
- * the Precision-mode scanned-PDF fallback path so we don't double-
- * render the same PDF.
- *
- * The Maximum-mode behaviour is byte-identical to v0.4.12 — same
- * `runPass1TwoStage`, same `runQualityControlPass`, same drop-
- * override and dedup ladder.
- */
-async function runMaximumModeOnRenderedPages(
-  pages: RenderedPage[],
-  filename: string,
-  model: string,
-  onStatus?: (status: string, progress?: number) => void
-): Promise<TemplateField[]> {
-  const pass1 = await runPass1TwoStage(pages, filename, model, onStatus);
-  onStatus?.(
-    `Pass 1 detected ${pass1.fields.length} field(s); starting verification…`,
-    0.55
-  );
-  let qcFields: TemplateField[];
-  try {
-    qcFields = await runQualityControlPass({
-      pages,
-      filename,
-      model,
-      pass1Fields: pass1.fields,
-      rawByFieldId: pass1.rawByFieldId,
-      onStatus,
-    });
-  } catch (err) {
-    console.warn(
-      `[Typeset Gemini QC] Verification pass failed; falling back to Pass 1: ${
-        err instanceof Error ? err.message : String(err)
-      }`
-    );
-    onStatus?.(
-      `Verification failed; using Pass 1 results (${pass1.fields.length} field(s)).`,
-      1
-    );
-    return pass1.fields;
-  }
-  onStatus?.(
-    `Detection complete — ${qcFields.length} field(s) after verification.`,
-    1
-  );
-  return qcFields;
-}
-
-interface PrecisionLabel {
-  blank_index?: number;
-  label?: string;
-  canonical_field_id?: string | null;
-  field_type?: "text" | "checkbox";
-  checkbox_value?: string | null;
-}
-
-interface PrecisionLabelResponse {
-  labels?: PrecisionLabel[];
-}
-
-/**
- * Gemini responseSchema for the Precision-mode labeling pass. The
- * model only needs to map `blank_index` → semantic identity. It
- * does NOT return any coordinates or bboxes; those came from the
- * deterministic geometric detector.
- */
-const PRECISION_RESPONSE_SCHEMA: Record<string, unknown> = {
-  type: "object",
-  required: ["labels"],
-  properties: {
-    labels: {
-      type: "array",
-      items: {
-        type: "object",
-        required: ["blank_index", "label", "field_type"],
-        propertyOrdering: [
-          "blank_index",
-          "label",
-          "canonical_field_id",
-          "field_type",
-          "checkbox_value",
-        ],
-        properties: {
-          blank_index: { type: "integer", minimum: 0 },
-          label: { type: "string" },
-          canonical_field_id: { type: "string", nullable: true },
-          field_type: { type: "string", enum: ["text", "checkbox"] },
-          checkbox_value: { type: "string", nullable: true },
-        },
-      },
-    },
-  },
-};
-
-function buildPrecisionSystemPrompt(): string {
-  return [
-    "You are labeling fillable form fields on a paper/PDF form. The blanks have ALREADY been located deterministically by an upstream geometric detector — you do NOT need to find them, place them, or output any coordinates. Your only job is to look at each blank's surrounding context (which the detector has paired with each blank) plus the page images, and decide WHAT each blank represents semantically.",
-    "",
-    "Return ONLY a JSON object that conforms to the supplied responseSchema. No prose, no markdown fences.",
-    "",
-    "## Output shape",
-    "For every input blank, emit one entry in `labels` keyed by its `blank_index`. For each entry:",
-    "  - `blank_index` — the integer index from the input. MUST match exactly so the upstream system can correlate.",
-    "  - `label` — a 2-5 word Title Case description of what belongs in the blank (e.g. `Cardholder Name`, `Phone Number`, `Expiration Date`, `Security Code`).",
-    "  - `canonical_field_id` — one of the canonical ids listed below, OR `null` if the blank doesn't fit any canonical field. NULL is better than a wrong id.",
-    "  - `field_type` — `\"text\"` or `\"checkbox\"`. Use `\"checkbox\"` ONLY for the small box outlines marked `kind: \"small-box\"` that sit alongside a printed card-type label (Visa / MasterCard / Discover / AMEX). Everything else is `\"text\"`.",
-    "  - `checkbox_value` — for card-type checkboxes only: the canonical card name (`visa`, `mastercard`, `discover`, `amex`). Null otherwise.",
-    "",
-    "## How to use the input",
-    "Each blank carries:",
-    "  - `kind`: `underscore-line`, `horizontal-line`, `small-box`, or `empty-band`. The geometric detector knows what it found.",
-    "  - `page` and `bbox` (in normalized 0-1000 image coords). Use these to LOCATE the blank in the page image so you can reason about its visual context.",
-    "  - `context_before` / `context_after`: text on the same row immediately before / after the blank. Inline-sentence blanks (e.g. `I, ___, authorize...`) typically use `context_before: \"I,\"` and `context_after: \", authorize...\"`.",
-    "  - `paragraph`: a wider snapshot of the surrounding text (~6 lines). Use this when the row context is sparse.",
-    "  - `hint_label`: when present, the all-caps caption directly below the blank (Layout C: `PHONE NUMBER` etc.) OR the colon-terminated label directly left (Layout A: `Cardholder Name:`). When `hint_label` is set, treat it as the strongest single signal of what the blank is for.",
-    "",
-    "Decision priority:",
-    "  1. `hint_label` — if it matches a canonical alias (e.g. `PHONE NUMBER` → `phone`), use that.",
-    "  2. `context_before` + `context_after` — alias match against either side.",
-    "  3. `paragraph` — last-resort scan of the wider context.",
-    "  4. The page image itself, when text-only signals are ambiguous.",
-    "",
-    "## Field-type rules (deterministic — do NOT deviate)",
-    "  - If `kind === \"small-box\"` AND the row context contains a card-type word (`Visa`, `MasterCard`, `Discover`, `AMEX`/`American Express`), emit `field_type: \"checkbox\"` with `canonical_field_id` set to the matching card type and `checkbox_value` set to the card name. CRITICAL: the `Visa/MC/AMEX` tokens that appear in CVV instructional text (`3-digit number on back of Visa/MC, 4 digits on front of AMEX`) are NOT card-type checkboxes — they're part of the CVV's instructional sentence. If `context_before` / `context_after` / `hint_label` mentions `CVV`, `CVV2`, `CVC`, `security code`, `verification code`, `card identification`, `3 digit`, or `4 digit`, the field is `\"text\"` with `canonical_field_id: \"ccv\"` regardless of what other words are nearby.",
-    "  - All non-checkbox blanks are `\"text\"`. Card number, expiration date, signature, name, address, phone, email → always `\"text\"`.",
-    "",
-    "## Repeats",
-    "If two blanks have the same canonical identity at different positions on the page (e.g. two Cardholder Name lines, two Date lines), emit one entry per blank with the SAME `canonical_field_id` and `label`. Do NOT collapse them — the upstream system fills repeats with the same value.",
-    "",
-    "## Canonical field ids",
-    "Set `canonical_field_id` ONLY when the surrounding context unambiguously identifies the field. NULL is better than a wrong id. Available ids:",
-    buildCatalogSummary(),
-    "",
-    "## Spatial reasoning is NOT your job",
-    "Do NOT return bboxes or coordinates of any kind. Do NOT try to invent new blanks the input doesn't include. Do NOT skip blanks you can't perfectly identify — emit `canonical_field_id: null` and a best-guess `label` instead. The geometric detector already located every blank; your job is purely semantic classification.",
-  ].join("\n");
-}
-
-function buildPrecisionUserPrompt(
-  pages: RenderedPage[],
-  filename: string,
-  blankCount: number,
-  payload: string
-): string {
-  return [
-    `Filename: ${filename}`,
-    `Page count: ${pages.length}`,
-    `Blank count: ${blankCount}`,
-    "",
-    "Page images (one per page, in page order):",
-    pages
-      .map(
-        (p) => `  page ${p.pageNumber}: ${p.widthPx} × ${p.heightPx} px`
-      )
-      .join("\n"),
-    "",
-    "Blank inputs (already located deterministically — your job is to label each one):",
-    payload,
-  ].join("\n");
-}
-
-/**
- * Convert a pixel bbox into the same normalized 0-1000 frame Pass-1
- * uses. The internal payload Precision builds for `mapToTemplateField`
- * carries floats here (no integer rounding) so the round-trip from
- * pixel-space → normalized → user-space points is lossless. The
- * payload we SEND to Gemini for context still rounds to integers
- * (the schema requires that) — those are display values, not the
- * authoritative bbox.
- */
-function pixelRectToNormalized(
-  rect: { x: number; y: number; width: number; height: number },
-  page: RenderedPage
-): [number, number, number, number] {
-  const norm = (v: number, max: number) =>
-    clampNumber((v / Math.max(1, max)) * 1000, 0, 1000);
-  return [
-    norm(rect.y, page.heightPx),
-    norm(rect.x, page.widthPx),
-    norm(rect.y + rect.height, page.heightPx),
-    norm(rect.x + rect.width, page.widthPx),
-  ];
-}
-
-/** Integer-rounded variant for Gemini-facing payloads (the
- *  responseSchema mandates integers in [0, 1000]). */
-function pixelRectToNormalizedInt(
-  rect: { x: number; y: number; width: number; height: number },
-  page: RenderedPage
-): [number, number, number, number] {
-  const float = pixelRectToNormalized(rect, page);
-  return [
-    Math.round(float[0]),
-    Math.round(float[1]),
-    Math.round(float[2]),
-    Math.round(float[3]),
-  ];
-}
-
-interface PrecisionFieldsOk {
-  kind: "ok";
-  fields: TemplateField[];
-}
-
-interface PrecisionScanned {
-  kind: "scanned";
-}
-
-type PrecisionResult = PrecisionFieldsOk | PrecisionScanned;
-
-/**
- * Main Precision orchestrator. Runs the four phases in order:
- *
- *   1. PDF text-layer extraction (pdf.js getTextContent).
- *   2. Geometric blank detection (canvas pixel analysis + text words).
- *   3. Context pairing (each blank → row + paragraph + hint).
- *   4. ONE Gemini round-trip that labels each blank.
- *   5. Convert to TemplateField via the existing `mapToTemplateField`
- *      pipeline (canonical-id ladder, type guard, dedup all apply).
- *
- * Returns `{ kind: "scanned" }` when the PDF has no extractable text
- * layer; the caller falls back to Maximum mode in that case.
- */
-async function runPrecisionPipeline(
-  pdfBytes: Uint8Array,
-  pages: RenderedPage[],
-  filename: string,
-  model: string,
-  onStatus?: (status: string, progress?: number) => void
-): Promise<PrecisionResult> {
-  // ---- Phase 1: text-layer extraction ----------------------------------
-  onStatus?.("Reading PDF text layer…", 0.10);
-  const renderScales: PdfRenderScale[] = pages.map((p) => ({
-    page: p.pageNumber,
-    scaleX: p.widthPx / Math.max(1, p.pageWidthPt),
-    scaleY: p.heightPx / Math.max(1, p.pageHeightPt),
-  }));
-  const pageText = await extractPdfText(pdfBytes, renderScales);
-  const pageWordCounts = pageText
-    .map((p) => `page ${p.page}: ${p.words.length} words`)
-    .join(", ");
-  const totalWords = pageText.reduce((acc, p) => acc + p.words.length, 0);
-  console.log(
-    `[Typeset Diag] Precision: extracted ${totalWords} words from text layer (${pageWordCounts})`
-  );
-
-  if (isScannedPdf(pageText)) {
-    return { kind: "scanned" };
-  }
-
-  // ---- Phase 2: geometric blank detection ------------------------------
-  onStatus?.("Detecting writable areas…", 0.25);
-  const pageImages = pages.map((p) => ({
-    page: p.pageNumber,
-    canvas: p.canvas as HTMLCanvasElement,
-    widthPx: p.widthPx,
-    heightPx: p.heightPx,
-  }));
-  // Defensive: if any page is missing its canvas (Precision was
-  // requested without retainCanvas), we still proceed but those
-  // pages contribute only text-layer / underscore blanks.
-  const blanks = await detectBlanks(
-    pageImages.filter((pi) => Boolean(pi.canvas)),
-    pageText
-  );
-  const summary = summarizeKinds(blanks);
-  console.log(
-    `[Typeset Diag] Precision: detected ${summary.total} blanks (underscore=${summary.underscore}, horizontal=${summary.horizontal}, small-box=${summary.smallBox}, empty-band=${summary.emptyBand})`
-  );
-
-  if (blanks.length === 0) {
-    // No blanks found at all — return an empty TemplateField list
-    // rather than spending a Gemini call on an empty payload. This
-    // is a real-world outcome on form PDFs that are pre-flattened
-    // and have no detectable writable areas.
-    onStatus?.("Precision detected 0 fields.", 1);
-    return { kind: "ok", fields: [] };
-  }
-
-  // ---- Phase 3: context pairing ----------------------------------------
-  onStatus?.("Resolving field context…", 0.55);
-  const withContext = pairBlanksWithContext(blanks, pageText);
-  console.log(
-    `[Typeset Diag] Precision: paired ${withContext.length} blanks with context`
-  );
-
-  // ---- Phase 4: Gemini labeling pass -----------------------------------
-  onStatus?.("Labeling fields…", 0.65);
-  const labels = await runPrecisionLabelingPass(
-    pages,
-    filename,
-    model,
-    withContext,
-    onStatus
-  );
-
-  console.log(
-    `[Typeset Diag] Precision: Gemini labeled ${labels.length}/${withContext.length} blanks`
-  );
-
-  // ---- Phase 5: convert to TemplateField via the standard pipeline -----
-  onStatus?.("Building field map…", 0.95);
-  const labelByIndex = new Map<number, PrecisionLabel>();
-  for (const lbl of labels) {
-    if (typeof lbl.blank_index === "number") {
-      labelByIndex.set(lbl.blank_index, lbl);
-    }
-  }
-
-  const rawFields: RawGeminiField[] = withContext.map((bwc, idx) => {
-    const lbl = labelByIndex.get(idx);
-    const page = pages.find((p) => p.pageNumber === bwc.candidate.page);
-    const fieldType: "text" | "checkbox" =
-      lbl?.field_type === "checkbox" ? "checkbox" : "text";
-
-    // Carry the deterministic bbox forward in normalized 0-1000
-    // coords so `mapToTemplateField` can pick it up via its existing
-    // `bboxToPdfRect` path.
-    const bbox = page
-      ? pixelRectToNormalized(
-          {
-            x: bwc.candidate.x,
-            y: bwc.candidate.y,
-            width: bwc.candidate.width,
-            height: bwc.candidate.height,
-          },
-          page
-        )
-      : [0, 0, 0, 0];
-
-    return {
-      page_number: bwc.candidate.page,
-      bbox,
-      field_type: fieldType,
-      label: lbl?.label?.trim() || bwc.hintLabel?.trim() || `Field ${idx + 1}`,
-      canonical_field_id: lbl?.canonical_field_id ?? null,
-      checkbox_value: lbl?.checkbox_value ?? null,
-      context_before: bwc.contextBefore,
-      context_after: bwc.contextAfter || (bwc.hintLabel ?? ""),
-    };
-  });
-
-  const mapped = mapPass1RawFields(rawFields, pages);
-  return { kind: "ok", fields: mapped.fields };
-}
-
-async function runPrecisionLabelingPass(
-  pages: RenderedPage[],
-  filename: string,
-  model: string,
-  blanks: BlankWithContext[],
-  onStatus?: (status: string, progress?: number) => void
-): Promise<PrecisionLabel[]> {
-  const payload = blanks.map((bwc, idx) => {
-    const page = pages.find((p) => p.pageNumber === bwc.candidate.page);
-    const bbox = page
-      ? pixelRectToNormalizedInt(
-          {
-            x: bwc.candidate.x,
-            y: bwc.candidate.y,
-            width: bwc.candidate.width,
-            height: bwc.candidate.height,
-          },
-          page
-        )
-      : [0, 0, 0, 0];
-    return {
-      blank_index: idx,
-      page: bwc.candidate.page,
-      bbox,
-      kind: bwc.candidate.kind,
-      hint_label: bwc.hintLabel ?? null,
-      context_before: bwc.contextBefore,
-      context_after: bwc.contextAfter,
-      paragraph: trimParagraph(bwc.paragraph, 600),
-    };
-  });
-
-  const result = await runGeminiRoundTrip({
-    pages,
-    model,
-    systemPrompt: buildPrecisionSystemPrompt(),
-    userPrompt: buildPrecisionUserPrompt(
-      pages,
-      filename,
-      blanks.length,
-      JSON.stringify(payload, null, 2)
-    ),
-    responseSchema: PRECISION_RESPONSE_SCHEMA,
-    // 16k is plenty for ~150 blanks with short canonical-id labels
-    // each. The labeling response is much narrower than Pass-1's
-    // bbox+context output, so we don't need 32k like Stage 1b does.
-    maxOutputTokens: 16384,
-    temperature: 0.0,
-    onStatus,
-    phase: "precision_labeling",
-    bandStart: 0.65,
-    bandEnd: 0.95,
-  });
-
-  console.log(
-    `[Typeset Gemini] precision_labeling model=${model} stop=${result.finishReason} usage=${JSON.stringify(result.usage)}`
-  );
-
-  const parsed = parseStructuredResponse<PrecisionLabelResponse>(
-    result.text,
-    result.finishReason,
-    "Precision labeling"
-  );
-  return Array.isArray(parsed.labels) ? parsed.labels : [];
-}
-
-/** Trim long paragraph context strings to a safe budget for the
- *  per-blank JSON payload. We keep up to `maxLen` characters at a
- *  word boundary; longer paragraphs are unusual in practice. */
-function trimParagraph(text: string, maxLen: number): string {
-  if (text.length <= maxLen) return text;
-  const cut = text.slice(0, maxLen);
-  const lastSpace = cut.lastIndexOf(" ");
-  return (lastSpace > maxLen / 2 ? cut.slice(0, lastSpace) : cut) + "…";
 }
 
 // ---------------------------------------------------------------------------
