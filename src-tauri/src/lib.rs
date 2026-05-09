@@ -16,6 +16,7 @@ pub fn run() {
             keychain::has_gemini_key,
             keychain::clear_gemini_key,
             gemini::gemini_detect_fields,
+            gemini::gemini_detect_fields_images,
             gemini::gemini_test_connection,
         ])
         .run(tauri::generate_context!())

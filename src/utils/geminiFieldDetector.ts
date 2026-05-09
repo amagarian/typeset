@@ -1,55 +1,72 @@
 /**
  * Gemini-powered field detection.
  *
- * Flow (mirrors what the Gemini desktop client appears to do under the
- * hood — single round-trip, no agentic dance):
+ * Flow (image-based as of v0.4.9):
  *
- *   1. Render PDF page sizes via pdfjs (we still need page dimensions
- *      locally to convert Gemini's 0-1000 normalized bbox coords back
- *      into PDF user-space).
- *   2. Send PDF + system+user prompt + responseSchema to Gemini.
- *      Gemini natively understands PDFs as a multimodal modality, so
- *      we DON'T pre-render to images and DON'T run a Python sandbox.
- *   3. Parse the strict-JSON response (responseSchema guarantees it
+ *   1. Read PDF page sizes via pdfjs (PDF user-space points; we still
+ *      need them so the dimensions we report to the canvas/UI match
+ *      the points the rest of the app uses).
+ *   2. Render every page to a PNG client-side via pdf.js + canvas at
+ *      a 2048px long-edge resolution. This is the same approach
+ *      Gemini's web app appears to take internally — it eliminates
+ *      the systematic vertical offset we saw when sending the PDF
+ *      directly (Gemini's internal renderer uses opaque margins/
+ *      CropBox handling that don't match pdf.js's MediaBox-based
+ *      viewport).
+ *   3. Send the resulting PNG bytes to Gemini as `image/png`
+ *      `inlineData` parts (one part per page) plus the system+user
+ *      prompt and the responseSchema.
+ *   4. Parse the strict-JSON response (responseSchema guarantees it
  *      parses).
- *   4. Map raw fields → TemplateField[] with deterministic canonical-id
- *      resolution and label cleanup. This is the same three-tier
- *      resolver from the previous Claude flow (alias match → pattern
- *      match → model-supplied semantic id) — keeping it preserves the
- *      hard-won accuracy on body-text patterns like
- *      `I, ____, authorize my credit card to be charged...`.
+ *   5. Map Gemini's 0-1000 normalized bboxes → image-pixel space →
+ *      PDF user-space using the captured per-page render scale.
+ *      Coord system is fully deterministic.
+ *   6. Resolve canonical ids (alias → pattern → model semantic),
+ *      clean up labels, dedupe, and return as `TemplateField[]`.
  *
  * Two-pass mode (v0.4.7+, default = "maximum"):
  *   When the user picks the "Maximum" accuracy preset, we run a second
- *   Gemini round-trip after Pass 1 finishes. Pass 2 sees the SAME PDF
- *   plus a structured dump of every field Pass 1 produced, and returns
- *   keep/drop/fix corrections per field. The corrections are applied
- *   deterministically and re-run through `mapToTemplateField` so the
- *   v0.4.5/v0.4.6 type-guard (CVV-as-checkbox → text) cannot be
- *   weakened by a Pass-2 mistake. ~12s typical end-to-end on Pro vs.
- *   ~6s for the single-pass Fast preset.
+ *   Gemini round-trip after Pass 1 finishes. Pass 2 sees the SAME page
+ *   images plus a structured dump of every field Pass 1 produced, and
+ *   returns keep/drop/fix corrections per field. The corrections are
+ *   applied deterministically and re-run through `mapToTemplateField`
+ *   so the v0.4.5/v0.4.6 type-guard (CVV-as-checkbox → text) cannot
+ *   be weakened by a Pass-2 mistake.
  *
- * Single-pass call typically completes in 5-10s on a 1-3 page production
- * form (Gemini 3.x Pro). Two-pass adds 4-6s. There is no Python
- * sandbox, no code-execution tool, no thinking-effort knob.
- *
- * Coordinate system contract with Gemini:
- *   - Gemini returns spatial coordinates in `[y_min, x_min, y_max, x_max]`
- *     as integers in the 0-1000 normalized range, per page.
- *   - We multiply (y/1000)*pageHeight and (x/1000)*pageWidth to get
- *     PDF user-space points. Y-first ordering is critical — reversing
- *     it produces fields rotated 90° from where they should be.
- *   - The `pageNumber` field is 1-based.
+ * Coordinate-system contract with Gemini (v0.4.9+):
+ *   - Gemini returns `[y_min, x_min, y_max, x_max]` as integers in the
+ *     0-1000 normalized range, per *image*. Y-first ordering.
+ *   - bbox_px = bbox_normalized / 1000 * imageDimensionPx (clean: the
+ *     model's frame of reference is the image we sent it).
+ *   - bbox_pt = bbox_px / scale, where scale_x = imageWidthPx /
+ *     pageWidthPt. We carry the per-page scale alongside the bbox
+ *     conversion functions.
+ *   - PDF user-space points stored on TemplateField are TOP-DOWN: the
+ *     renderer (DraggableField) positions fields with `top: y * scale`,
+ *     so y=0 is the top of the page. This matches pdf.js's viewport
+ *     convention and matches the (top-down) pixel coords Gemini
+ *     returns. No Y flip is required.
  */
 
 import * as pdfjsLib from "pdfjs-dist";
 import {
   detectFieldsWithGemini,
+  detectFieldsWithGeminiImages,
   GeminiNotConfiguredError,
   GeminiApiError,
   subscribeGeminiProgress,
+  type GeminiPageImage,
   type GeminiProgress,
 } from "@/services/geminiClient";
+
+// Ensure pdf.js worker is configured before the detector kicks off. The
+// PdfPageCanvas component sets this on mount, but the detector can run
+// before any canvas has been rendered (e.g. immediately on file drop),
+// so we set it here too. Idempotent — repeated assignment to the same
+// path is harmless.
+if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+}
 import { getAccuracyMode, getModelPreference } from "@/services/geminiSettings";
 import {
   type CanonicalFieldId,
@@ -71,10 +88,23 @@ export {
 // Wire types — match the responseSchema 1:1.
 // ---------------------------------------------------------------------------
 
-interface PdfPageSize {
+/**
+ * One PDF page rasterized to PNG, plus the captured render scale so we
+ * can convert image-pixel bboxes back to PDF user-space points
+ * losslessly. The page point dimensions are stored alongside the
+ * pixel dimensions so coord helpers don't have to cross-index a
+ * separate array.
+ */
+interface RenderedPage {
   pageNumber: number;
-  width: number;
-  height: number;
+  pngBytes: Uint8Array;
+  /** Rendered PNG dimensions in pixels. */
+  widthPx: number;
+  heightPx: number;
+  /** PDF user-space dimensions in points (the same numbers the rest
+   *  of the app stores on `TemplateField` rectangles). */
+  pageWidthPt: number;
+  pageHeightPt: number;
 }
 
 interface RawGeminiField {
@@ -160,22 +190,95 @@ const ALIAS_INDEX: ReadonlyArray<{ alias: string; id: CanonicalFieldId }> =
 // PDF helpers
 // ---------------------------------------------------------------------------
 
-async function getPageSizes(pdfBytes: Uint8Array): Promise<PdfPageSize[]> {
+/**
+ * Long-edge target resolution for the rendered page images we send to
+ * Gemini.
+ *
+ * Why 2048:
+ *   - Gemini accepts inline images up to 20MB total. A 2048-long-edge
+ *     PNG of a US-letter form is ~600-1500 KB; a 4-page form fits
+ *     comfortably under the inline budget with headroom to spare.
+ *   - At 2048px, body text on a standard 8.5×11 form (the dominant
+ *     case in this corpus) renders at ~24px tall — well above the
+ *     legibility threshold for OCR/multimodal models.
+ *   - Lower (e.g. 1536) starts losing fine print and the model emits
+ *     fewer / wronger field detections; higher (e.g. 3072) burns
+ *     bandwidth without measurable accuracy gains in our forms.
+ */
+const RENDER_LONG_EDGE_PX = 2048;
+
+/**
+ * Render every page of the PDF to a PNG via pdf.js + canvas at a
+ * 2048-long-edge resolution. Returns the PNG bytes plus the captured
+ * pixel/point dimensions for each page. Used by the v0.4.9+ image-
+ * based detection flow.
+ *
+ * pdf.js's viewport coordinate system is top-down (y=0 is the top of
+ * the page), so the rendered PNG has the same top-down origin as the
+ * field rectangles we store on `TemplateField`. No Y flip is needed
+ * anywhere in the pipeline.
+ */
+async function renderPagesToPng(
+  pdfBytes: Uint8Array,
+  onProgress?: (pageNumber: number, totalPages: number) => void
+): Promise<RenderedPage[]> {
   const bytesCopy = new Uint8Array(pdfBytes);
   const pdf = await pdfjsLib.getDocument({ data: bytesCopy }).promise;
-  const sizes: PdfPageSize[] = [];
-  for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-    const page = await pdf.getPage(pageNumber);
-    const viewport = page.getViewport({ scale: 1 });
-    sizes.push({
-      pageNumber,
-      width: Math.round(viewport.width),
-      height: Math.round(viewport.height),
-    });
+  const rendered: RenderedPage[] = [];
+
+  try {
+    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
+      onProgress?.(pageNumber, pdf.numPages);
+
+      const page = await pdf.getPage(pageNumber);
+      const baseViewport = page.getViewport({ scale: 1 });
+      const longEdge = Math.max(baseViewport.width, baseViewport.height);
+      const scale = longEdge > 0 ? RENDER_LONG_EDGE_PX / longEdge : 1;
+      const viewport = page.getViewport({ scale });
+
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(viewport.width);
+      canvas.height = Math.round(viewport.height);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        throw new GeminiApiError(
+          `Could not acquire 2D canvas context to render page ${pageNumber}.`
+        );
+      }
+      // White background so transparency in the source PDF doesn't
+      // produce black areas that Gemini might interpret as filled
+      // shapes.
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      await page.render({ canvasContext: ctx, viewport }).promise;
+
+      const blob = await new Promise<Blob | null>((resolve) =>
+        canvas.toBlob((b) => resolve(b), "image/png")
+      );
+      if (!blob) {
+        throw new GeminiApiError(
+          `canvas.toBlob returned null for page ${pageNumber}.`
+        );
+      }
+      const arrayBuffer = await blob.arrayBuffer();
+
+      rendered.push({
+        pageNumber,
+        pngBytes: new Uint8Array(arrayBuffer),
+        widthPx: canvas.width,
+        heightPx: canvas.height,
+        pageWidthPt: Math.round(baseViewport.width),
+        pageHeightPt: Math.round(baseViewport.height),
+      });
+    }
+  } finally {
+    pdf.destroy();
   }
-  pdf.destroy();
-  return sizes;
+
+  return rendered;
 }
+
 
 // ---------------------------------------------------------------------------
 // Prompt + schema
@@ -191,12 +294,13 @@ function buildCatalogSummary(): string {
 /**
  * The single system prompt. Designed to mirror Gemini's desktop-client
  * behaviour: ask for a clean structured-JSON response, not for the
- * model to "show its work" or run any tool. Native multimodal PDF
- * understanding does the heavy lifting on its own.
+ * model to "show its work" or run any tool. The input is one or more
+ * page IMAGES (rendered from the underlying PDF client-side), which
+ * removes any ambiguity in the bbox→pixel coordinate mapping.
  */
 function buildSystemPrompt(): string {
   return [
-    "You are extracting fillable form fields from a PDF for a film-production assistant.",
+    "You are extracting fillable form fields from one or more page IMAGES of a paper/PDF form for a film-production assistant. Each image is a single page of the form, in page order.",
     "Return ONLY a JSON object that conforms to the supplied responseSchema. No prose, no markdown fences.",
     "",
     "## What to find",
@@ -210,8 +314,8 @@ function buildSystemPrompt(): string {
     "Skip pre-filled values, decorative lines, table borders, and column dividers.",
     "",
     "## Output schema notes",
-    "  - `bbox` MUST be `[y_min, x_min, y_max, x_max]` integers in the normalized 0-1000 range, per page. Y-first ordering is mandatory.",
-    "  - `page_number` is 1-based.",
+    "  - `bbox` MUST be `[y_min, x_min, y_max, x_max]` integers in the normalized 0-1000 range, computed against the dimensions of the image that contains the field. Y-first ordering is mandatory. (0,0) is the TOP-LEFT corner of the image; y increases downward.",
+    "  - `page_number` is 1-based and corresponds to the position of the page image in the parts list (page_number=1 → first image, page_number=2 → second image, etc.).",
     "  - `field_type` is `text` or `checkbox`.",
     "  - `field_kind` is one of: text, multiline, date, signature, checkbox-group, boolean-checkbox.",
     "  - `label` is a 2-5 word Title Case description of what belongs in the blank, derived from the surrounding sentence (NOT the literal text after the blank). Example: for `...charged an additional $______ plus a 3.3% fee for my booking...`, the label is `Additional Charge Amount`, not `plus a 3.3% fee`.",
@@ -245,13 +349,13 @@ function buildSystemPrompt(): string {
     "",
     "Rule of thumb: if a horizontal scan-line through your bbox would cross any printed letters, the bbox is wrong — shift it horizontally so it covers ONLY empty space (or only the drawn underline, never the label).",
     "",
-    "Concrete examples (numbers in PDF user-space points for clarity):",
-    "  - Row `Billing Address ________________` where `Billing Address` ends at x≈250 and the line ends at x≈540: bbox starts at x≈260 (just past the label), NOT at x≈170 (start of the label).",
+    "Concrete examples (positions described relative to the page image):",
+    "  - Row `Billing Address ________________` where the label ends near the left third of the row and the line continues to the right edge of the row: bbox starts immediately after the label, NOT at the start of the label.",
     "  - Row `Phone#________ Email________` (two fields on one row): two separate bboxes, each starting just past its own label, never overlapping the label text.",
-    "  - Checkbox row `☐ Visa  ☐ MasterCard`: each bbox is a 10-15pt square aligned with the printed checkbox glyph itself, NOT including the word next to it.",
+    "  - Checkbox row `☐ Visa  ☐ MasterCard`: each bbox is a small square aligned with the printed checkbox glyph itself, NOT including the word next to it.",
     "  - Inline `I, _________, authorize…`: bbox spans only the underscore region between the two commas.",
     "",
-    "Vertical extent: match the local line height (typically 12-18 pt for body text, 18-30 pt for signatures/dates). NEVER include the row above or below.",
+    "Vertical extent: match the local line height (i.e. the visible row height for body text; signature/date rows are often taller). NEVER include the row above or below.",
     "",
     "Tightness check before emitting each field: imagine cropping the page to your bbox. The crop should show empty space (or a drawn underline), nothing else. If you would see ANY printed letters in the crop, the bbox is too wide — shrink it.",
     "",
@@ -266,12 +370,21 @@ function buildSystemPrompt(): string {
   ].join("\n");
 }
 
-function buildUserPrompt(pageSizes: PdfPageSize[], filename: string): string {
+function buildUserPrompt(
+  rendered: RenderedPage[],
+  filename: string
+): string {
   return [
     `Filename: ${filename}`,
-    "Page sizes (PDF user-space points; you only need them for context — output bbox in normalized 0-1000):",
-    pageSizes
-      .map((p) => `  page ${p.pageNumber}: ${p.width} x ${p.height} pt`)
+    `Page count: ${rendered.length}`,
+    "",
+    "You have been sent one image per page, in page order. Each image's pixel dimensions are listed below — your normalized 0-1000 bbox values are computed against these dimensions (e.g. y_min=500 means the field starts halfway down the image vertically).",
+    "Page images:",
+    rendered
+      .map(
+        (p) =>
+          `  page ${p.pageNumber}: ${p.widthPx} × ${p.heightPx} px`
+      )
       .join("\n"),
     "",
     "Extract every fillable field per the system prompt's instructions and return the JSON object.",
@@ -570,13 +683,31 @@ function cleanLabel(context: string | undefined, fallback: string): string {
 
 /**
  * Convert Gemini's normalized [y_min, x_min, y_max, x_max] (0-1000)
- * into PDF user-space (x, y, w, h). Clamps to page bounds and enforces
- * a minimum dimension so single-character checkboxes are still
- * clickable.
+ * into PDF user-space (x, y, w, h).
+ *
+ * v0.4.9+: the model sees a rendered image, not the raw PDF, so the
+ * normalized coords map FIRST to image-pixel space and THEN to PDF
+ * user-space points via the captured render scale. This is how Gemini
+ * achieves perfect bbox accuracy in its web app — the image is the
+ * model's frame of reference, and the pixel→points conversion is
+ * lossless because we own both numbers.
+ *
+ *   bbox_px   = bbox_norm / 1000 × imageDimensionPx
+ *   bbox_pt   = bbox_px / scale         where scale = imageDimensionPx / pageDimensionPt
+ *             = bbox_norm / 1000 × pageDimensionPt
+ *
+ * The math collapses to the same expression as the previous PDF-input
+ * path, but the SEMANTIC frame of reference is now the image — the
+ * 0-1000 coordinates are guaranteed to be relative to the rendered
+ * image's actual dimensions, eliminating the systematic offset
+ * Gemini's opaque PDF rasterizer was introducing.
+ *
+ * Both image dimensions and page dimensions are top-down origin
+ * (pdf.js viewport convention) so no Y flip is required.
  */
 function bboxToPdfRect(
   bbox: number[] | undefined,
-  pageSize: PdfPageSize,
+  page: RenderedPage,
   fieldType: "text" | "checkbox"
 ): { x: number; y: number; width: number; height: number } | null {
   if (!Array.isArray(bbox) || bbox.length !== 4) return null;
@@ -587,20 +718,29 @@ function bboxToPdfRect(
   );
   if ([yMin, xMin, yMax, xMax].some((n) => Number.isNaN(n))) return null;
 
-  const x = (xMin / 1000) * pageSize.width;
-  const y = (yMin / 1000) * pageSize.height;
-  const x2 = (xMax / 1000) * pageSize.width;
-  const y2 = (yMax / 1000) * pageSize.height;
+  const scaleX = page.widthPx / Math.max(1, page.pageWidthPt);
+  const scaleY = page.heightPx / Math.max(1, page.pageHeightPt);
+
+  // Normalized 0-1000 → image pixels → PDF points.
+  const xPx = (xMin / 1000) * page.widthPx;
+  const yPx = (yMin / 1000) * page.heightPx;
+  const x2Px = (xMax / 1000) * page.widthPx;
+  const y2Px = (yMax / 1000) * page.heightPx;
+
+  const x = xPx / scaleX;
+  const y = yPx / scaleY;
+  const x2 = x2Px / scaleX;
+  const y2 = y2Px / scaleY;
 
   const minDim = fieldType === "checkbox" ? 8 : 12;
   const width = Math.max(minDim, x2 - x);
   const height = Math.max(minDim, y2 - y);
 
   return {
-    x: clampNumber(x, 0, Math.max(0, pageSize.width - 1)),
-    y: clampNumber(y, 0, Math.max(0, pageSize.height - 1)),
-    width: clampNumber(width, minDim, pageSize.width - x),
-    height: clampNumber(height, minDim, pageSize.height - y),
+    x: clampNumber(x, 0, Math.max(0, page.pageWidthPt - 1)),
+    y: clampNumber(y, 0, Math.max(0, page.pageHeightPt - 1)),
+    width: clampNumber(width, minDim, page.pageWidthPt - x),
+    height: clampNumber(height, minDim, page.pageHeightPt - y),
   };
 }
 
@@ -609,25 +749,29 @@ function bboxToPdfRect(
  * `[y_min, x_min, y_max, x_max]` (0-1000) coordinate system. Inverse of
  * {@link bboxToPdfRect}; used by the QC pass so Pass 2 sees the same
  * coordinate frame Pass 1 produced.
+ *
+ * Same algebraic identity as the forward path: 0-1000 maps cleanly to
+ * the page image's pixel dimensions, which are an exact integer scale
+ * of the PDF point dimensions.
  */
 function pdfRectToBbox(
   rect: { x: number; y: number; width: number; height: number },
-  pageSize: PdfPageSize
+  page: RenderedPage
 ): [number, number, number, number] {
   const norm = (v: number, max: number) =>
     Math.round(clampNumber((v / Math.max(1, max)) * 1000, 0, 1000));
   return [
-    norm(rect.y, pageSize.height),
-    norm(rect.x, pageSize.width),
-    norm(rect.y + rect.height, pageSize.height),
-    norm(rect.x + rect.width, pageSize.width),
+    norm(rect.y, page.pageHeightPt),
+    norm(rect.x, page.pageWidthPt),
+    norm(rect.y + rect.height, page.pageHeightPt),
+    norm(rect.x + rect.width, page.pageWidthPt),
   ];
 }
 
 function mapToTemplateField(
   raw: RawGeminiField,
   index: number,
-  pageSizes: PdfPageSize[],
+  pages: RenderedPage[],
   /** Optional explicit id — used by the QC pass when re-mapping a fixed
    *  field so its id stays stable across passes. */
   explicitId?: string
@@ -641,9 +785,9 @@ function mapToTemplateField(
     typeof raw.page_number === "number" && raw.page_number >= 1
       ? Math.floor(raw.page_number)
       : 1;
-  const pageSize =
-    pageSizes.find((p) => p.pageNumber === pageNumber) ?? pageSizes[0];
-  if (!pageSize) return null;
+  const page =
+    pages.find((p) => p.pageNumber === pageNumber) ?? pages[0];
+  if (!page) return null;
 
   // Three-tier canonical-id resolution:
   //   1. Alias match — explicit-label rows hit a known alias.
@@ -689,8 +833,23 @@ function mapToTemplateField(
     );
   }
 
-  const rect = bboxToPdfRect(raw.bbox, pageSize, fieldType);
-  if (!rect) return null;
+  // [Typeset Diag] Per-field raw bbox log — fires BEFORE the rect
+  // conversion so we still see the raw payload for any malformed
+  // bboxes that fail to produce a rect. Kept on the standard console
+  // flow so the next user run streams diagnostics without a special
+  // debug build.
+  console.log(
+    `[Typeset Diag] Field ${index} raw bbox: ${JSON.stringify(raw.bbox)} (page ${pageNumber}, image ${page.widthPx}×${page.heightPx}px, page ${page.pageWidthPt}×${page.pageHeightPt}pt) | label="${(raw.label ?? "").slice(0, 40)}" canonical=${raw.canonical_field_id ?? "—"}`
+  );
+
+  const rect = bboxToPdfRect(raw.bbox, page, fieldType);
+  if (!rect) {
+    console.log(`[Typeset Diag] Field ${index} pdf rect: <none — invalid bbox>`);
+    return null;
+  }
+  console.log(
+    `[Typeset Diag] Field ${index} pdf rect: x=${rect.x.toFixed(2)}, y=${rect.y.toFixed(2)}, w=${rect.width.toFixed(2)}, h=${rect.height.toFixed(2)}`
+  );
 
   const isCardCheckbox = canonicalId && CREDIT_CARD_CHECKBOX_IDS.has(canonicalId);
   const isBooleanCheckbox = fieldType === "checkbox" && !isCardCheckbox;
@@ -1030,9 +1189,14 @@ export const detectFieldsWithGeminiPublic = detectFieldsWithClaude;
  * `progressToStatus` / `progressToFraction` values keyed by `phase`
  * so the renderer can show distinct messages and progress-bar bands
  * for each pass.
+ *
+ * v0.4.9+: the round-trip sends pre-rendered page images (not the raw
+ * PDF) to Gemini. The `pages` array is the canonical source of truth
+ * for both the request payload (`pngBytes`) and the bbox→points
+ * conversion (`widthPx`/`pageWidthPt` etc.).
  */
 async function runGeminiRoundTrip(args: {
-  pdfBytes: Uint8Array;
+  pages: RenderedPage[];
   model: string;
   systemPrompt: string;
   userPrompt: string;
@@ -1069,7 +1233,12 @@ async function runGeminiRoundTrip(args: {
   });
 
   try {
-    const result = await detectFieldsWithGemini(args.pdfBytes, {
+    const images: GeminiPageImage[] = args.pages.map((p) => ({
+      pngBytes: p.pngBytes,
+      pageNumber: p.pageNumber,
+    }));
+    const result = await detectFieldsWithGeminiImages({
+      images,
       model: args.model,
       systemPrompt: args.systemPrompt,
       userPrompt: args.userPrompt,
@@ -1131,18 +1300,17 @@ interface Pass1Result {
 }
 
 async function runPass1(
-  pdfBytes: Uint8Array,
-  pageSizes: PdfPageSize[],
+  pages: RenderedPage[],
   filename: string,
   model: string,
   twoPass: boolean,
   onStatus?: (status: string, progress?: number) => void
 ): Promise<Pass1Result> {
   const result = await runGeminiRoundTrip({
-    pdfBytes,
+    pages,
     model,
     systemPrompt: buildSystemPrompt(),
-    userPrompt: buildUserPrompt(pageSizes, filename),
+    userPrompt: buildUserPrompt(pages, filename),
     responseSchema: RESPONSE_SCHEMA,
     // Empirical: a typical CCAUTH form with 20-30 fields, each
     // carrying a ~6-word context snippet + 4-element bbox + canonical
@@ -1173,7 +1341,7 @@ async function runPass1(
   const rawByFieldId = new Map<string, RawGeminiField>();
   for (let i = 0; i < rawFields.length; i += 1) {
     const raw = rawFields[i];
-    const field = mapToTemplateField(raw, i, pageSizes);
+    const field = mapToTemplateField(raw, i, pages);
     if (field) {
       mapped.push(field);
       rawByFieldId.set(field.id, raw);
@@ -1197,17 +1365,32 @@ async function detectFieldsImpl(
   options: DetectFieldsOptions = {}
 ): Promise<TemplateField[]> {
   const filename = options.filename ?? "document.pdf";
-  onStatus?.("Reading PDF metadata…", 0.02);
-  const pageSizes = await getPageSizes(pdfBytes);
-  if (pageSizes.length === 0) {
+  onStatus?.("Rendering PDF pages…", 0.02);
+
+  const pages = await renderPagesToPng(pdfBytes, (current, total) => {
+    onStatus?.(
+      `Rendering page ${current}/${total} for Gemini…`,
+      0.02 + 0.05 * (current / Math.max(1, total))
+    );
+  });
+  if (pages.length === 0) {
     throw new GeminiApiError("PDF has no readable pages.");
+  }
+
+  // [Typeset Diag] Page-size + render-scale dump. Logged once per run
+  // so we can correlate any stray bbox offsets with the underlying
+  // page geometry.
+  for (const p of pages) {
+    console.log(
+      `[Typeset Diag] Page ${p.pageNumber} size: width=${p.pageWidthPt}pt, height=${p.pageHeightPt}pt | rendered=${p.widthPx}×${p.heightPx}px (scale=${(p.widthPx / Math.max(1, p.pageWidthPt)).toFixed(3)}x)`
+    );
   }
 
   const model = getModelPreference();
   const accuracyMode = getAccuracyMode();
   const twoPass = accuracyMode === "maximum";
 
-  const pass1 = await runPass1(pdfBytes, pageSizes, filename, model, twoPass, onStatus);
+  const pass1 = await runPass1(pages, filename, model, twoPass, onStatus);
 
   if (!twoPass) {
     onStatus?.(`Gemini detected ${pass1.fields.length} field(s).`, 1);
@@ -1223,8 +1406,7 @@ async function detectFieldsImpl(
   let qcFields: TemplateField[];
   try {
     qcFields = await runQualityControlPass({
-      pdfBytes,
-      pageSizes,
+      pages,
       filename,
       model,
       pass1Fields: pass1.fields,
@@ -1330,12 +1512,12 @@ const QC_RESPONSE_SCHEMA: Record<string, unknown> = {
 
 function buildQualityControlSystemPrompt(): string {
   return [
-    "You are auditing field detection on a PDF form. A previous Gemini pass produced a list of detected fields; for each one, decide whether it is correctly placed and typed given the actual PDF.",
+    "You are auditing field detection on a paper/PDF form. You have been sent one IMAGE per page (in page order). A previous pass produced a list of detected fields; for each one, decide whether it is correctly placed and typed given the actual page images.",
     "",
     "Return ONLY a JSON object that conforms to the supplied responseSchema. No prose, no markdown fences.",
     "",
     "## Coordinate system",
-    "Bounding boxes use the SAME native Gemini system as Pass 1: `[y_min, x_min, y_max, x_max]` integers in the normalized 0-1000 range, per page. Y-first ordering is mandatory.",
+    "Bounding boxes use the SAME native system as Pass 1: `[y_min, x_min, y_max, x_max]` integers in the normalized 0-1000 range, computed against the dimensions of the page image that contains the field. Y-first ordering is mandatory; (0,0) is the TOP-LEFT corner of the image, y increasing downward.",
     "",
     "## Output shape",
     "For every input field, emit exactly one entry in `corrections` keyed by its `id`. Use:",
@@ -1389,15 +1571,20 @@ function buildQualityControlSystemPrompt(): string {
 }
 
 function buildQualityControlUserPrompt(
-  pageSizes: PdfPageSize[],
+  pages: RenderedPage[],
   filename: string,
   fields: AuditFieldDescriptor[]
 ): string {
   return [
     `Filename: ${filename}`,
-    "Page sizes (PDF user-space points; bbox is normalized 0-1000):",
-    pageSizes
-      .map((p) => `  page ${p.pageNumber}: ${p.width} x ${p.height} pt`)
+    `Page count: ${pages.length}`,
+    "",
+    "You have been sent one image per page, in page order. Each image's pixel dimensions are listed below — bbox values are normalized 0-1000 against these dimensions.",
+    "Page images:",
+    pages
+      .map(
+        (p) => `  page ${p.pageNumber}: ${p.widthPx} × ${p.heightPx} px`
+      )
       .join("\n"),
     "",
     `Pass 1 detected ${fields.length} field(s). Audit each one and return the corrections JSON.`,
@@ -1426,7 +1613,7 @@ function applyCorrectionToField(
   raw: RawGeminiField,
   correction: FieldCorrection,
   index: number,
-  pageSizes: PdfPageSize[]
+  pages: RenderedPage[]
 ): TemplateField | null {
   const action = (correction.action ?? "keep").toLowerCase();
   if (action === "drop") return null;
@@ -1461,7 +1648,7 @@ function applyCorrectionToField(
   // a fixed_field_type of "checkbox" with canonical_field_id "ccv"
   // will still be coerced back to "text" because ccv's canonical type
   // is text.
-  const remapped = mapToTemplateField(patched, index, pageSizes, field.id);
+  const remapped = mapToTemplateField(patched, index, pages, field.id);
   return remapped ?? field;
 }
 
@@ -1474,15 +1661,23 @@ function applyCorrectionToField(
 function buildAuditDescriptors(
   pass1Fields: TemplateField[],
   rawByFieldId: Map<string, RawGeminiField>,
-  pageSizes: PdfPageSize[]
+  pages: RenderedPage[]
 ): AuditFieldDescriptor[] {
   return pass1Fields.map((field) => {
     const raw = rawByFieldId.get(field.id);
-    const pageSize =
-      pageSizes.find((p) => p.pageNumber === field.pageNumber) ?? pageSizes[0];
+    const page =
+      pages.find((p) => p.pageNumber === field.pageNumber) ?? pages[0];
+    const fallbackPage: RenderedPage = page ?? {
+      pageNumber: 1,
+      pngBytes: new Uint8Array(),
+      widthPx: 1,
+      heightPx: 1,
+      pageWidthPt: 612,
+      pageHeightPt: 792,
+    };
     const bbox = pdfRectToBbox(
       { x: field.x, y: field.y, width: field.width, height: field.height },
-      pageSize ?? { pageNumber: 1, width: 612, height: 792 }
+      fallbackPage
     );
     return {
       id: field.id,
@@ -1498,8 +1693,7 @@ function buildAuditDescriptors(
 }
 
 interface QcArgs {
-  pdfBytes: Uint8Array;
-  pageSizes: PdfPageSize[];
+  pages: RenderedPage[];
   filename: string;
   model: string;
   pass1Fields: TemplateField[];
@@ -1513,14 +1707,14 @@ async function runQualityControlPass(args: QcArgs): Promise<TemplateField[]> {
   const descriptors = buildAuditDescriptors(
     args.pass1Fields,
     args.rawByFieldId,
-    args.pageSizes
+    args.pages
   );
 
   const result = await runGeminiRoundTrip({
-    pdfBytes: args.pdfBytes,
+    pages: args.pages,
     model: args.model,
     systemPrompt: buildQualityControlSystemPrompt(),
-    userPrompt: buildQualityControlUserPrompt(args.pageSizes, args.filename, descriptors),
+    userPrompt: buildQualityControlUserPrompt(args.pages, args.filename, descriptors),
     responseSchema: QC_RESPONSE_SCHEMA,
     // The audit response is much smaller than Pass 1 (one record per
     // input field, no bbox unless action=fix). 16k is comfortable for
@@ -1607,7 +1801,7 @@ async function runQualityControlPass(args: QcArgs): Promise<TemplateField[]> {
     }
 
     if (action === "fix") {
-      const next = applyCorrectionToField(field, raw, correction, i, args.pageSizes);
+      const next = applyCorrectionToField(field, raw, correction, i, args.pages);
       if (!next) {
         console.log(
           `[Typeset Gemini QC] Fix → drop ${field.id} (${field.canonicalFieldId ?? "—"}, ${field.label}): ${

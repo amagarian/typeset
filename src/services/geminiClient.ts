@@ -150,10 +150,12 @@ function normalizeUsage(raw: unknown): GeminiUsage {
 }
 
 /**
- * Fires the streaming `:streamGenerateContent` request against Gemini.
- * The PDF is base64-inlined in the request body — Gemini supports
- * inline payloads up to ~20MB and production paperwork is virtually
- * always far below that.
+ * Fires the streaming `:streamGenerateContent` request against Gemini
+ * with the PDF inlined as `application/pdf`. Kept as a fallback path
+ * (used by the project-import flow that doesn't need pixel-perfect
+ * coordinates). v0.4.9+ field detection prefers
+ * {@link detectFieldsWithGeminiImages}, which sidesteps Gemini's
+ * opaque internal PDF rasterization.
  */
 export async function detectFieldsWithGemini(
   pdfBytes: Uint8Array,
@@ -170,6 +172,63 @@ export async function detectFieldsWithGemini(
       {
         request: {
           pdf_bytes: Array.from(pdfBytes),
+          model: opts.model,
+          system_prompt: opts.systemPrompt,
+          user_prompt: opts.userPrompt,
+          response_schema: opts.responseSchema,
+          max_output_tokens: opts.maxOutputTokens,
+          temperature: opts.temperature,
+        },
+      }
+    );
+    return {
+      text: response.text,
+      finishReason: response.finish_reason ?? null,
+      usage: normalizeUsage(response.usage),
+      model: response.model,
+    };
+  } catch (err) {
+    throw normalizeError(err);
+  }
+}
+
+/** One rendered page sent to Gemini as an `image/png` inlineData part. */
+export interface GeminiPageImage {
+  /** PNG bytes produced by `canvas.toBlob({ type: "image/png" })`. */
+  pngBytes: Uint8Array;
+  /** 1-based page index. Sent to Rust for diagnostic purposes only —
+   *  Gemini uses parts ordering to determine page sequence. */
+  pageNumber: number;
+}
+
+export interface DetectFieldsImagesOptions extends DetectFieldsOptions {
+  images: GeminiPageImage[];
+}
+
+/**
+ * v0.4.9+ image-based detection. The renderer rasterizes each PDF
+ * page client-side via pdf.js to a known-pixel-space PNG, and we
+ * inline those PNGs into the request. Gemini's normalized 0-1000
+ * bbox coordinates then map cleanly to image-pixel space (and from
+ * there to PDF user-space via the captured render scale).
+ */
+export async function detectFieldsWithGeminiImages(
+  opts: DetectFieldsImagesOptions
+): Promise<DetectFieldsResult> {
+  if (!isTauriAvailable()) {
+    throw new GeminiNotConfiguredError(
+      "Gemini integration requires the desktop app (run `npm run tauri dev`)."
+    );
+  }
+  try {
+    const response = await invoke<DetectFieldsResponseRaw>(
+      "gemini_detect_fields_images",
+      {
+        request: {
+          images: opts.images.map((img) => ({
+            png_bytes: Array.from(img.pngBytes),
+            page_number: img.pageNumber,
+          })),
           model: opts.model,
           system_prompt: opts.systemPrompt,
           user_prompt: opts.userPrompt,

@@ -80,6 +80,33 @@ pub struct DetectFieldsRequest {
     pub temperature: Option<f32>,
 }
 
+/// One rendered page, ready to inline as `inlineData` in the request
+/// body. The renderer (pdf.js + canvas.toBlob) hands these to Rust as
+/// raw PNG bytes; we base64-encode and inline them. Sent in `page_number`
+/// order — Gemini sees them in the same order as the underlying PDF.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PageImage {
+    pub png_bytes: Vec<u8>,
+    /// 1-based page index (informational; Gemini infers position from
+    /// the parts ordering).
+    pub page_number: u32,
+}
+
+/// Image-based variant of `DetectFieldsRequest`. Sent by the v0.4.9+
+/// detector after the renderer rasterizes each PDF page client-side
+/// to a known-pixel-space PNG. See the comment block at the top of
+/// `gemini_detect_fields_images` for the rationale.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DetectFieldsImagesRequest {
+    pub images: Vec<PageImage>,
+    pub model: String,
+    pub system_prompt: String,
+    pub user_prompt: String,
+    pub response_schema: Value,
+    pub max_output_tokens: Option<u32>,
+    pub temperature: Option<f32>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DetectFieldsResponse {
     /// Concatenated text from every streamed chunk. The renderer parses
@@ -136,12 +163,31 @@ fn parse_sse_chunk(line: &str) -> Option<Value> {
     serde_json::from_str::<Value>(trimmed).ok()
 }
 
-/// Drives the Gemini streaming request end-to-end and emits progress
-/// events as bytes arrive.
-#[tauri::command]
-pub async fn gemini_detect_fields(
+/// Internal options shared by both `gemini_detect_fields` (PDF input,
+/// kept as a fallback path) and `gemini_detect_fields_images` (the
+/// preferred v0.4.9+ image-input path).
+struct StreamArgs {
+    /// Already-assembled `parts` array. The caller decides whether it
+    /// contains a single PDF inlineData part, a list of image inlineData
+    /// parts, etc. The trailing user-prompt text part is appended here
+    /// so callers don't repeat themselves.
+    parts: Vec<Value>,
+    user_prompt: String,
+    system_prompt: String,
+    model: String,
+    response_schema: Value,
+    max_output_tokens: Option<u32>,
+    temperature: Option<f32>,
+    /// Detail string for the initial `uploading_file` progress event.
+    upload_detail: String,
+}
+
+/// Drives a Gemini streaming request end-to-end and emits progress
+/// events as bytes arrive. Shared by the PDF path (legacy fallback)
+/// and the image path (v0.4.9+ default).
+async fn run_gemini_stream(
     app: AppHandle,
-    request: DetectFieldsRequest,
+    mut args: StreamArgs,
 ) -> Result<DetectFieldsResponse, String> {
     let api_key = require_key()?;
     let client = build_client()?;
@@ -150,42 +196,37 @@ pub async fn gemini_detect_fields(
         &app,
         GeminiProgress {
             phase: "uploading_file".into(),
-            detail: Some(format!("{} bytes", request.pdf_bytes.len())),
+            detail: Some(args.upload_detail.clone()),
             tokens: None,
         },
     );
 
-    // Inline base64. Gemini caps inline payloads at ~20MB and forms
-    // are typically <2MB so we stay well inside the limit. The
-    // alternative (Files API resumable upload) adds two extra round-
-    // trips and ~3-5s of overhead for no accuracy benefit.
-    let pdf_b64 = B64.encode(&request.pdf_bytes);
-
     let mut generation_config = json!({
         "responseMimeType": "application/json",
-        "responseSchema": request.response_schema,
+        "responseSchema": args.response_schema,
     });
-    if let Some(t) = request.temperature {
+    if let Some(t) = args.temperature {
         generation_config["temperature"] = json!(t);
     } else {
         // Default to 0 for deterministic structural extraction.
         generation_config["temperature"] = json!(0.0);
     }
-    if let Some(m) = request.max_output_tokens {
+    if let Some(m) = args.max_output_tokens {
         generation_config["maxOutputTokens"] = json!(m);
     }
+
+    // Append the user prompt text part to whatever inlineData parts
+    // the caller assembled.
+    args.parts.push(json!({ "text": args.user_prompt }));
 
     let body = json!({
         "systemInstruction": {
             "role": "system",
-            "parts": [{ "text": request.system_prompt }],
+            "parts": [{ "text": args.system_prompt }],
         },
         "contents": [{
             "role": "user",
-            "parts": [
-                { "inlineData": { "mimeType": "application/pdf", "data": pdf_b64 } },
-                { "text": request.user_prompt },
-            ],
+            "parts": args.parts,
         }],
         "generationConfig": generation_config,
     });
@@ -202,7 +243,7 @@ pub async fn gemini_detect_fields(
     let url = format!(
         "{base}/v1beta/models/{model}:streamGenerateContent?alt=sse",
         base = GEMINI_API_BASE,
-        model = request.model,
+        model = args.model,
     );
 
     let response = client
@@ -243,7 +284,7 @@ pub async fn gemini_detect_fields(
     let mut buf = String::new();
     let mut finish_reason: Option<String> = None;
     let mut last_usage: Option<Value> = None;
-    let mut model_echo = request.model.clone();
+    let mut model_echo = args.model.clone();
     let mut total_tokens: u32 = 0;
 
     while let Some(chunk_result) = stream.next().await {
@@ -336,6 +377,100 @@ pub async fn gemini_detect_fields(
         usage: last_usage,
         model: model_echo,
     })
+}
+
+/// PDF-input detection (legacy fallback as of v0.4.9). Inlines the
+/// entire PDF as a single `application/pdf` part. Kept for back-compat
+/// — the v0.4.9+ default path uses `gemini_detect_fields_images` to
+/// avoid Gemini's opaque internal PDF rendering, which produced a
+/// systematic ~one-row vertical offset on dense forms.
+#[tauri::command]
+pub async fn gemini_detect_fields(
+    app: AppHandle,
+    request: DetectFieldsRequest,
+) -> Result<DetectFieldsResponse, String> {
+    // Inline base64. Gemini caps inline payloads at ~20MB and forms
+    // are typically <2MB so we stay well inside the limit.
+    let pdf_b64 = B64.encode(&request.pdf_bytes);
+    let upload_detail = format!("{} bytes", request.pdf_bytes.len());
+
+    run_gemini_stream(
+        app,
+        StreamArgs {
+            parts: vec![
+                json!({ "inlineData": { "mimeType": "application/pdf", "data": pdf_b64 } }),
+            ],
+            user_prompt: request.user_prompt,
+            system_prompt: request.system_prompt,
+            model: request.model,
+            response_schema: request.response_schema,
+            max_output_tokens: request.max_output_tokens,
+            temperature: request.temperature,
+            upload_detail,
+        },
+    )
+    .await
+}
+
+/// Image-input detection (v0.4.9+ default).
+///
+/// Background:
+/// Sending Gemini a raw PDF works in principle (it's natively
+/// multimodal) but the model's internal rasterizer is an opaque black
+/// box — different from pdf.js's MediaBox-based viewport — so the
+/// 0-1000 normalized bbox coordinates Gemini emits don't map cleanly
+/// back to pdf.js's user-space points. On the ARROW Credit-Card
+/// Authorization form (and similar dense forms), this manifested as
+/// every detected field overlay sitting one row above the actual
+/// blank.
+///
+/// Gemini's own web/standalone app sidesteps this by rendering the
+/// PDF to an image client-side and uploading that image — at which
+/// point the bbox→image-pixel mapping is exact (by construction, the
+/// image dimensions are the model's frame of reference). This command
+/// implements the same approach: the renderer rasterizes each PDF
+/// page via pdf.js, sends the resulting PNG bytes here, and we inline
+/// them as `image/png` parts. Multi-page forms send multiple parts,
+/// in page order. Gemini's multimodal API handles that natively.
+#[tauri::command]
+pub async fn gemini_detect_fields_images(
+    app: AppHandle,
+    request: DetectFieldsImagesRequest,
+) -> Result<DetectFieldsResponse, String> {
+    if request.images.is_empty() {
+        return Err("No page images supplied to gemini_detect_fields_images.".into());
+    }
+
+    let mut total_bytes: usize = 0;
+    let mut parts: Vec<Value> = Vec::with_capacity(request.images.len());
+    for image in &request.images {
+        total_bytes += image.png_bytes.len();
+        let b64 = B64.encode(&image.png_bytes);
+        parts.push(json!({
+            "inlineData": { "mimeType": "image/png", "data": b64 },
+        }));
+    }
+
+    let upload_detail = format!(
+        "{} page image(s), {} bytes",
+        request.images.len(),
+        total_bytes
+    );
+
+    run_gemini_stream(
+        app,
+        StreamArgs {
+            parts,
+            user_prompt: request.user_prompt,
+            system_prompt: request.system_prompt,
+            model: request.model,
+            response_schema: request.response_schema,
+            max_output_tokens: request.max_output_tokens,
+            temperature: request.temperature,
+            upload_detail,
+        },
+    )
+    .await
 }
 
 /// Lightweight `generateContent` ping used by the Settings "Test
