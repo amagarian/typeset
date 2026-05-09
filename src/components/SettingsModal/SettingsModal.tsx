@@ -17,12 +17,6 @@ import {
   setModelPreference,
   type AccuracyMode,
 } from "@/services/geminiSettings";
-import {
-  searchTemplates,
-  voteOnTemplate,
-  type RegistryTemplate,
-} from "@/services/templateRegistry";
-import type { Template } from "@/types";
 import styles from "./SettingsModal.module.css";
 
 const CUSTOM_OPTION_VALUE = "__custom__";
@@ -31,8 +25,6 @@ interface SettingsModalProps {
   open: boolean;
   onClose: () => void;
   onSaved?: () => void;
-  /** Called when the user clicks Install on a registry-browser row. */
-  onInstallTemplate?: (template: Template) => void;
 }
 
 type TestStatus =
@@ -41,31 +33,22 @@ type TestStatus =
   | { kind: "ok"; message?: string }
   | { kind: "error"; message: string };
 
-function buildTemplateFromRegistryRow(row: RegistryTemplate): Template {
-  const now = new Date().toISOString();
-  return {
-    id: `tpl-registry-${row.id}`,
-    name: row.name,
-    status: "local-verified",
-    source: "remote-registry",
-    registryId: row.id,
-    fields: row.fields,
-    fingerprint: row.fingerprint,
-    pageCount: row.pageCount,
-    createdAt: now,
-    updatedAt: now,
-  };
-}
-
+/**
+ * Settings panel — Gemini configuration only.
+ *
+ * Since v0.5.9 the public template registry is a passive,
+ * fingerprint-driven backend with no UI surface here. Drop a PDF
+ * and the registry runs invisibly: high-confidence matches are
+ * auto-installed and surface a single toast in the main window;
+ * everything else falls through to Gemini detection. Saves
+ * auto-publish in the background. There is no manual browse,
+ * search, install, or upvote here.
+ */
 export function SettingsModal({
   open,
   onClose,
   onSaved,
-  onInstallTemplate,
 }: SettingsModalProps) {
-  // -------------------------------------------------------------------------
-  // Gemini section state
-  // -------------------------------------------------------------------------
   const [keyInput, setKeyInput] = useState("");
   const [keyConfigured, setKeyConfigured] = useState(false);
   const [presetSelection, setPresetSelection] = useState<string>(DEFAULT_MODEL);
@@ -75,23 +58,6 @@ export function SettingsModal({
   const [testStatus, setTestStatus] = useState<TestStatus>({ kind: "idle" });
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
-
-  // -------------------------------------------------------------------------
-  // Browse-community-templates panel state.
-  //
-  // Since v0.5.8 the registry is always configured (credentials baked
-  // in at build time), so this panel is unconditionally visible and
-  // unconditionally usable. There's no "configure first" gate.
-  // -------------------------------------------------------------------------
-  const [browseQuery, setBrowseQuery] = useState("");
-  const [browseResults, setBrowseResults] = useState<RegistryTemplate[]>([]);
-  const [browseLoading, setBrowseLoading] = useState(false);
-  const [browseError, setBrowseError] = useState<string | null>(null);
-  const [voteBusyId, setVoteBusyId] = useState<string | null>(null);
-  // Track which rows the device has upvoted in this session (we don't
-  // round-trip the user's own votes from the server in v0.5.0; this is
-  // a UI-only optimistic indicator).
-  const [upvotedIds, setUpvotedIds] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     if (!open) return;
@@ -114,10 +80,6 @@ export function SettingsModal({
       setAccuracySelection(getAccuracyMode());
       setTestStatus({ kind: "idle" });
       setSaveError(null);
-
-      setBrowseQuery("");
-      setBrowseResults([]);
-      setBrowseError(null);
     })();
     return () => {
       cancelled = true;
@@ -195,63 +157,6 @@ export function SettingsModal({
       }
     }
   }, [effectiveModel, keyInput]);
-
-  // -------------------------------------------------------------------------
-  // Browse-community-templates actions
-  // -------------------------------------------------------------------------
-
-  const handleBrowse = useCallback(async () => {
-    setBrowseLoading(true);
-    setBrowseError(null);
-    try {
-      const rows = await searchTemplates(browseQuery, 30);
-      setBrowseResults(rows);
-      if (rows.length === 0) {
-        setBrowseError(
-          browseQuery.trim()
-            ? `No matches for “${browseQuery.trim()}”.`
-            : "No community templates yet — be the first to publish one!"
-        );
-      }
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Browse failed.";
-      setBrowseError(message);
-    } finally {
-      setBrowseLoading(false);
-    }
-  }, [browseQuery]);
-
-  const handleInstall = useCallback(
-    (row: RegistryTemplate) => {
-      const installed = buildTemplateFromRegistryRow(row);
-      onInstallTemplate?.(installed);
-    },
-    [onInstallTemplate]
-  );
-
-  const handleUpvote = useCallback(
-    async (row: RegistryTemplate) => {
-      if (upvotedIds.has(row.id)) return;
-      setVoteBusyId(row.id);
-      try {
-        await voteOnTemplate(row.id, 1);
-        setUpvotedIds((prev) => {
-          const next = new Set(prev);
-          next.add(row.id);
-          return next;
-        });
-        setBrowseResults((prev) =>
-          prev.map((r) => (r.id === row.id ? { ...r, upvotes: r.upvotes + 1 } : r))
-        );
-      } catch (err) {
-        const message = err instanceof Error ? err.message : "Vote failed.";
-        setBrowseError(message);
-      } finally {
-        setVoteBusyId(null);
-      }
-    },
-    [upvotedIds]
-  );
 
   if (!open) return null;
 
@@ -378,94 +283,6 @@ export function SettingsModal({
           </div>
 
           {saveError && <span className={styles.statusError}>{saveError}</span>}
-
-          {/* ---------------------------------------------------------------
-              Browse community templates.
-              Always available — registry credentials are baked in.
-              --------------------------------------------------------------- */}
-          <div className={styles.divider} />
-
-          <div className={styles.section}>
-            <span className={styles.label}>Browse community templates</span>
-            <p className={styles.helpText}>
-              Search field maps that other Typeset users have published.
-              Install one to skip the Gemini detection round-trip on
-              forms you haven&apos;t seen before.
-            </p>
-            <div className={styles.inputRow}>
-              <input
-                type="text"
-                className={styles.input}
-                placeholder="Search by name (e.g. payroll, NDA, credit auth)…"
-                value={browseQuery}
-                onChange={(e) => setBrowseQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") {
-                    e.preventDefault();
-                    void handleBrowse();
-                  }
-                }}
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <button
-                type="button"
-                className={styles.testBtn}
-                onClick={handleBrowse}
-                disabled={browseLoading}
-              >
-                {browseLoading ? "Searching…" : "Search"}
-              </button>
-            </div>
-            {browseError && (
-              <span className={styles.statusError}>{browseError}</span>
-            )}
-            {browseResults.length > 0 && (
-              <ul className={styles.browseList}>
-                {browseResults.map((row) => (
-                  <li key={row.id} className={styles.browseRow}>
-                    <div className={styles.browseRowMain}>
-                      <span className={styles.browseRowName}>{row.name}</span>
-                      <span className={styles.browseRowMeta}>
-                        {row.pageCount} page{row.pageCount === 1 ? "" : "s"} ·{" "}
-                        {row.fieldCount} field{row.fieldCount === 1 ? "" : "s"} ·{" "}
-                        {row.upvotes} upvote{row.upvotes === 1 ? "" : "s"}
-                        {row.isMine ? " · yours" : ""}
-                      </span>
-                    </div>
-                    <div className={styles.browseRowActions}>
-                      <button
-                        type="button"
-                        className={styles.testBtn}
-                        onClick={() => handleUpvote(row)}
-                        disabled={
-                          voteBusyId === row.id ||
-                          upvotedIds.has(row.id) ||
-                          row.isMine
-                        }
-                        title={
-                          row.isMine
-                            ? "Can't vote on your own publish"
-                            : upvotedIds.has(row.id)
-                            ? "Already upvoted in this session"
-                            : "Upvote"
-                        }
-                      >
-                        {upvotedIds.has(row.id) ? "↑ Voted" : "↑ Upvote"}
-                      </button>
-                      <button
-                        type="button"
-                        className={styles.saveBtn}
-                        onClick={() => handleInstall(row)}
-                      >
-                        Install
-                      </button>
-                    </div>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </div>
         </div>
 
         <footer className={styles.footer}>

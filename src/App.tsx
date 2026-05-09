@@ -457,11 +457,14 @@ function MainApp() {
       // community-verified field map. We use the same 0.92 confidence
       // threshold as the local matcher so behaviour is symmetric — a
       // registry hit is semantically equivalent to a local hit, just
-      // sourced remotely. Below the threshold we *don't* auto-install;
-      // a non-blocking toast lets the user browse candidates manually.
-      // Since v0.5.8 the registry is always configured (creds baked in),
-      // so this runs unconditionally; any failure (offline / RLS / RPC)
-      // is caught and silently falls through to Gemini detection.
+      // sourced remotely.
+      //
+      // Since v0.5.9 the registry is invisible to the user. The only
+      // user-visible signal is a single discreet toast when an
+      // auto-match installs. Below-threshold candidates fall through
+      // silently to Gemini — there is no manual browse UI to direct
+      // the user to. Any registry failure (offline / RLS / RPC) is
+      // caught and falls through silently as well.
       try {
         const remoteMatches = await findRegistryMatches(fingerprint, 4);
         const best = remoteMatches[0];
@@ -473,10 +476,6 @@ function MainApp() {
           setEditedTemplates((prev) => ({ ...prev, [installed.id]: installed }));
           setDraftTemplate(installed);
 
-          const upvoteSummary =
-            best.template.upvotes > 0
-              ? ` (${best.template.upvotes} upvote${best.template.upvotes === 1 ? "" : "s"})`
-              : "";
           const result: PdfMatchResult = {
             kind: "verified",
             verifiedMatch: {
@@ -487,7 +486,7 @@ function MainApp() {
               source: "remote-registry",
             },
             fileName: file.name,
-            lookupMessage: `Matched a community template${upvoteSummary}.`,
+            lookupMessage: `Matched “${installed.name}” from the community library.`,
             matchSource: "remote-registry",
             syncState: "matched",
           };
@@ -504,23 +503,19 @@ function MainApp() {
 
           autoFillDocument(installed, docId, effectiveProjectId);
           if (!options.silentToasts) {
+            // The single user-visible registry signal in the app.
+            // Concise, non-dismissable, surfaces which template was
+            // applied so the user knows the registry contributed.
             showToast(
-              `Matched a community template${upvoteSummary} — ready to fill.`,
+              `Matched template “${installed.name}” from community library`,
               "success"
             );
           }
           return "verified-ready";
         }
-        if (remoteMatches.length > 0 && !options.silentToasts) {
-          // Below auto-install threshold but candidates exist — give
-          // the user a soft hint so they can browse.
-          showToast(
-            `Found ${remoteMatches.length} community template${
-              remoteMatches.length === 1 ? "" : "s"
-            } that may match. Open Settings → Browse community templates.`,
-            "info"
-          );
-        }
+        // Below the auto-install threshold: silent fall-through to
+        // Gemini detection. No toast — the registry has no manual
+        // browse UI to direct the user to in v0.5.9.
       } catch (err) {
         console.warn("[Typeset] Registry lookup failed; falling back to Gemini:", err);
       }
@@ -1589,11 +1584,6 @@ function MainApp() {
       <SettingsModal
         open={settingsOpen}
         onClose={() => setSettingsOpen(false)}
-        onInstallTemplate={(template) => {
-          upsertLocalTemplate(template);
-          setEditedTemplates((prev) => ({ ...prev, [template.id]: template }));
-          showToast(`Installed “${template.name}” to your local templates.`, "success");
-        }}
       />
 
       <Toast toast={toast} onDismiss={() => setToast(null)} />

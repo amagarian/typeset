@@ -59,8 +59,6 @@ const REGISTRY_KEY =
 // ---------------------------------------------------------------------------
 
 const SUBMISSIONS_TABLE = "template_submissions";
-const VOTES_TABLE = "template_submission_votes";
-const FLAGS_TABLE = "template_submission_flags";
 const MATCH_RPC = "match_template_submissions_by_fingerprint";
 
 let cachedClient: SupabaseClient | null = null;
@@ -225,7 +223,7 @@ function cryptoUuid(): string {
 export interface PublishOptions {
   /** Override the displayed template name in the registry. */
   name?: string;
-  /** Optional 1-2 sentence description shown on the browse panel. */
+  /** Optional 1-2 sentence description stored alongside the row. */
   description?: string;
 }
 
@@ -458,109 +456,15 @@ export async function findRegistryMatches(
     .slice(0, limit);
 }
 
-/**
- * Returns the most recent / highest-scored submissions for a "Browse"
- * surface. No fingerprint required.
- */
-export async function listFeaturedTemplates(
-  limit: number = 50
-): Promise<RegistryTemplate[]> {
-  const client = getRegistryClient();
-  const { data, error } = await client
-    .from(SUBMISSIONS_TABLE)
-    .select("*")
-    .eq("is_hidden", false)
-    .order("verification_score", { ascending: false })
-    .order("created_at", { ascending: false })
-    .limit(limit);
-  if (error) {
-    console.warn("[Typeset registry] list failed:", error.message);
-    return [];
-  }
-  return ((data as SubmissionRow[] | null) ?? []).map(rowToTemplate);
-}
-
-/**
- * Free-text search by submission name. Uses Postgres trigram similarity
- * (the migration creates a gin_trgm_ops index on `name`).
- */
-export async function searchTemplates(
-  query: string,
-  limit: number = 30
-): Promise<RegistryTemplate[]> {
-  const client = getRegistryClient();
-  const trimmed = query.trim();
-  if (!trimmed) return listFeaturedTemplates(limit);
-  const { data, error } = await client
-    .from(SUBMISSIONS_TABLE)
-    .select("*")
-    .eq("is_hidden", false)
-    .ilike("name", `%${trimmed}%`)
-    .order("verification_score", { ascending: false })
-    .limit(limit);
-  if (error) {
-    console.warn("[Typeset registry] search failed:", error.message);
-    return [];
-  }
-  return ((data as SubmissionRow[] | null) ?? []).map(rowToTemplate);
-}
-
 // ---------------------------------------------------------------------------
-// Votes & flags
+// Votes / flags / browse / search were removed in v0.5.9.
+//
+// The registry is now a passive backend: the only client-driven entry
+// points are `findRegistryMatches` (auto-fingerprint lookup on drop)
+// and `publishTemplateAuto` (auto-publish on save). There is no UI
+// surface for browsing, searching, voting on, or flagging community
+// templates, so the corresponding wire endpoints were dead code on
+// the client. The server-side tables (`template_submission_votes`,
+// `template_submission_flags`) and supporting RLS policies still
+// exist server-side and remain harmless — we just don't talk to them.
 // ---------------------------------------------------------------------------
-
-export type VoteValue = -1 | 0 | 1;
-
-/**
- * Set the current device's vote on a submission. Pass 0 to clear an
- * existing vote. Idempotent — safe to call repeatedly.
- */
-export async function voteOnTemplate(
-  registryId: string,
-  vote: VoteValue
-): Promise<void> {
-  const client = getRegistryClient();
-  const deviceId = getDeviceId();
-  if (vote === 0) {
-    const { error } = await client
-      .from(VOTES_TABLE)
-      .delete()
-      .eq("submission_id", registryId)
-      .eq("voter_device_id", deviceId);
-    if (error) throw new Error(`Vote clear failed: ${error.message}`);
-    return;
-  }
-  const { error } = await client
-    .from(VOTES_TABLE)
-    .upsert(
-      { submission_id: registryId, voter_device_id: deviceId, vote },
-      { onConflict: "submission_id,voter_device_id" }
-    );
-  if (error) throw new Error(`Vote failed: ${error.message}`);
-}
-
-export type FlagReason = "spam" | "incorrect" | "pii" | "copyright" | "other";
-
-/**
- * Flag a submission for review. Three flags from distinct devices auto-
- * hide it (handled server-side via trigger).
- */
-export async function flagTemplate(
-  registryId: string,
-  reason: FlagReason,
-  detail?: string
-): Promise<void> {
-  const client = getRegistryClient();
-  const { error } = await client
-    .from(FLAGS_TABLE)
-    .upsert(
-      {
-        submission_id: registryId,
-        reporter_device_id: getDeviceId(),
-        reason,
-        detail: detail?.slice(0, 500) ?? null,
-      },
-      { onConflict: "submission_id,reporter_device_id" }
-    );
-  if (error) throw new Error(`Flag failed: ${error.message}`);
-}
