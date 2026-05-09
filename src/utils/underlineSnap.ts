@@ -1,5 +1,5 @@
 /**
- * Vertical-underline snap (v0.5.13).
+ * Vertical-underline snap (v0.5.15).
  *
  * Deterministic post-processor that nudges Gemini-detected text-field
  * bboxes so their CENTER LINE sits exactly on the writable underline
@@ -9,26 +9,29 @@
  * drop fields, only to shift `y` by a few points when there is
  * strong geometric evidence of a stroke within the search band.
  *
- * v0.5.13 — retarget calibration to the snap-anchored center.
- * v0.5.11 attempted a typographic baseline calibration here by
- * subtracting `TEXT_BASELINE_BIAS_PT` from the snap target so the
- * bbox would sit ABOVE the stroke (baseline-on-stroke). That
- * over-corrected the fields the snap was already catching: the
- * v0.5.10 snap was producing exactly the user's visual target
- * (bbox vertically centered on the underline) — the user called
- * those "perfect". The 5pt-low complaint was about UNSNAPPED fields,
- * which sat at Gemini's raw output position. v0.5.11's combined
- * change (snap-target shift + detection-time -5pt) double-shifted
- * snapped fields and left signatures untouched.
+ * v0.5.15 — paired with a height-aware detection-time correction in
+ * `geminiFieldDetector.ts`. Snapped and unsnapped text-on-a-line
+ * fields converge on the same target by construction:
+ *   - SNAPPED (this file): newY = strokeRow - height/2,
+ *     i.e. `bbox_center == strokeRow`.
+ *   - UNSNAPPED (mapToTemplateField pre-shift): rect.y -= height/2.
+ *     Gemini's raw bbox sits with `bbox_top ≈ strokeRow`, so after
+ *     the shift `bbox_center ≈ strokeRow` — the same target.
  *
- * v0.5.13 reverts the snap target to `bbox_center == strokeRow`.
- * The detection-time `-TEXT_BASELINE_BIAS_PT` correction in
- * `geminiFieldDetector.ts` stays — it pulls UNSNAPPED text up from
- * Gemini's raw output to the visually-correct position. Both paths
- * therefore converge on `bbox_center ≈ strokeRow` for every text-
- * typed field. Signatures are now included on both paths
- * (snap-eligible AND detection-time corrected), so a Cardholder
- * Signature snaps to its line the same way Billing Address does.
+ * History:
+ *   v0.5.11 attempted a typographic baseline calibration here by
+ *   subtracting a flat `TEXT_BASELINE_BIAS_PT = 5` from the snap
+ *   target. That over-corrected the already-correct fields the snap
+ *   was catching. v0.5.13 reverted the snap-side shift and kept a
+ *   flat -5pt detection-time correction for unsnapped fields. The
+ *   flat constant under-corrected typical 14-18pt heights (where
+ *   height/2 is 7-9pt), leaving fields ~3-5pt low — the v0.5.14
+ *   user report ("all fields still 5px too low"). v0.5.15 replaced
+ *   the constant with `height/2` so the geometry is self-aligning.
+ *
+ * Signatures are snap-eligible (added in v0.5.13) and receive the
+ * detection-time `-height/2` shift, so a Cardholder Signature snaps
+ * to its line whether or not the snap finds the underline.
  *
  * Why this exists:
  *   The v0.5.3 prompt rule and Pass-2 audit rule 4b ask the model to
@@ -564,19 +567,22 @@ function snapOneField(
   // sits exactly on the chosen stroke row — `bbox_center == strokeRow`.
   // This is the user's visual target ("perfect" in the v0.5.10 user
   // report) and is what the v0.5.10 snap was already doing for the
-  // fields it caught. v0.5.11 briefly subtracted TEXT_BASELINE_BIAS_PT
+  // fields it caught. v0.5.11 briefly subtracted a flat 5pt bias
   // here to push the bbox above the stroke; that over-corrected the
-  // already-correct snapped fields. v0.5.13 reverts to center-on-
-  // stroke. The detection-time `-TEXT_BASELINE_BIAS_PT` shift in
-  // `geminiFieldDetector.ts` handles UNSNAPPED fields independently.
+  // already-correct snapped fields. v0.5.13 reverted to center-on-
+  // stroke. v0.5.15's detection-time `-height/2` shift in
+  // `geminiFieldDetector.ts` handles UNSNAPPED fields, converging
+  // on the same target.
   //
   // Cap absolute movement at maxSnapPoints — anything bigger is
   // almost certainly the model having found a totally different
   // feature, in which case dragging the bbox onto it would damage
   // rather than fix the detection. The cap gates the snap delta
-  // only; it doesn't see the detection-time -5pt that already
+  // only; it doesn't see the detection-time -height/2 that already
   // happened during `mapToTemplateField` (which is fine — that's an
-  // independent post-processing layer applied before the snap).
+  // independent post-processing layer applied before the snap; with
+  // the v0.5.15 height-aware shift, the snap delta is typically near
+  // zero on accurate detections, since both targets coincide).
   const newCenterYPt = best.row * render.pdfPointsPerPixel;
   const newY = newCenterYPt - field.height / 2;
   const deltaPt = newY - field.y;

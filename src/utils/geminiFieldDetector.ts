@@ -94,7 +94,6 @@ import {
   snapFieldsToUnderlines,
   type PageRender,
 } from "@/utils/underlineSnap";
-import { TEXT_BASELINE_BIAS_PT } from "@/utils/typesetConstants";
 
 export {
   GeminiNotConfiguredError as ClaudeNotConfiguredError, // back-compat alias
@@ -671,6 +670,37 @@ function normalizeFieldKind(
 }
 
 /**
+ * Whether the per-field alignment diagnostic block in
+ * `mapToTemplateField` should print on this run. True in dev builds
+ * (`import.meta.env.DEV`) and whenever the user has set
+ * `localStorage.typeset.debug.alignment = "true"` from the production
+ * devtools. The localStorage path is the user-facing self-serve
+ * channel — see the comment at the diagnostic call-site for the
+ * one-line setter the user can paste into devtools.
+ *
+ * Wrapped in try/catch because:
+ *   - `import.meta.env` access can throw in some bundler test
+ *     harnesses;
+ *   - `localStorage` is unavailable in non-window contexts (e.g.
+ *     workers) and accessing it throws.
+ */
+function alignmentDebugEnabled(): boolean {
+  try {
+    if (import.meta.env?.DEV === true) return true;
+  } catch {
+    // ignore
+  }
+  try {
+    if (typeof localStorage !== "undefined") {
+      return localStorage.getItem("typeset.debug.alignment") === "true";
+    }
+  } catch {
+    // ignore
+  }
+  return false;
+}
+
+/**
  * Body-text patterns that don't have an explicit on-row label. Runs
  * BEFORE Gemini's `canonical_field_id` fallback so identical patterns
  * map identically across the document — language models are
@@ -889,6 +919,38 @@ function inferByLabel(
     return "ccv";
   }
 
+  // v0.5.15 — Name-label preflight. "Print Name" and similar
+  // person-name labels denote a cardholder/customer-name field
+  // unambiguously when they sit ON the label. They MUST short-circuit
+  // here so a neighboring "Date" sibling on the same row (which would
+  // otherwise hijack via `inferByPattern`'s `^date` regex on
+  // `context_after`) does not steal the canonical id.
+  //
+  // We deliberately do NOT add these as global aliases on
+  // `creditCardHolder` in the catalog: the catalog's alias index is
+  // also consulted by `inferCanonicalId` against
+  // `context_before + context_after` haystacks, where "print name"
+  // would match for the SIBLING blanks on the same row (Signature
+  // and Date) — exactly the cross-field hijack we're trying to
+  // prevent. Keeping these patterns local to `inferByLabel` makes
+  // them label-only signals.
+  //
+  // Triggers:
+  //   - `print name` (the v0.5.14 user report)
+  //   - `name` alone, or `name:` / `name.` (typographic variants)
+  //   - `first name`, `last name`, `full name`, `customer name`,
+  //     `cardholder name`, `card holder name` — covered for parity;
+  //     the existing alias index already catches some of these but
+  //     this preflight makes the precedence explicit.
+  if (
+    /^print\s+name$/.test(lbl) ||
+    /^(?:first|last|full|customer|cardholder|card\s+holder)\s+name$/.test(lbl) ||
+    lbl === "name" ||
+    /^name\s*[:.]$/.test(lbl)
+  ) {
+    return "creditCardHolder";
+  }
+
   // Ignore overly generic or too-short labels (e.g. "Date" alone is
   // ambiguous; we only return a canonical match when the alias is
   // specific enough). Use the same min-length guard as
@@ -1103,32 +1165,39 @@ function mapToTemplateField(
     pages.find((p) => p.pageNumber === pageNumber) ?? pages[0];
   if (!page) return null;
 
-  // Four-tier canonical-id resolution:
-  //   1. Alias match (context) — explicit-label rows hit a known
-  //      alias from `context_before` + `context_after`.
-  //   2. Alias match (label) — for label-BELOW layouts (v0.4.10+)
-  //      where the caption sits BELOW the writable area, the label
-  //      Gemini reports (e.g. "Phone Number", "Exp Date", "CVV#",
-  //      "Zip Code") is the actual field name. We run the same alias
-  //      index against it. Catches CVV#, EXP DATE, ZIP CODE,
-  //      CREDIT CARD NUMBER, etc. when the row context misses them.
-  //   3. Pattern match — common body-text patterns alias matching
-  //      can't see (e.g. `I, ___, authorize…`).
-  //   4. Model semantic — Gemini's canonical_field_id, last resort.
+  // Four-tier canonical-id resolution. v0.5.15 reordered so LABEL
+  // wins over context/pattern: the user's v0.5.14 "Print Name field
+  // detecting as a date field" report was a precedence bug — for a
+  // row like `Signature ____ Print Name ____ Date ____`, the Print
+  // Name blank's `context_after` starts with "Date", which made
+  // `inferByPattern`'s `^date` regex hijack the canonical id even
+  // though Gemini correctly returned `label: "Print Name"`. Labels
+  // are the most specific local signal Gemini gives us; trust them
+  // first, fall back to context only when the label is ambiguous.
+  //
+  //   1. Label alias / preflight — exact-label canonical match,
+  //      including the v0.5.15 name-label preflight that catches
+  //      "Print Name" / "First Name" / etc. directly.
+  //   2. Context alias — explicit-label rows whose label was empty
+  //      or generic, where `context_before + context_after` carries
+  //      the canonical signal.
+  //   3. Pattern match — body-text patterns alias matching can't see
+  //      (e.g. `I, ___, authorize…`).
+  //   4. Model semantic — Gemini's `canonical_field_id`, last resort.
+  const labelId = inferByLabel(raw.label, rawFieldType, raw.checkbox_value);
   const aliasId = inferCanonicalId(
     raw.context_before,
     raw.context_after,
     rawFieldType,
     raw.checkbox_value
   );
-  const labelId = inferByLabel(raw.label, rawFieldType, raw.checkbox_value);
   const patternId = inferByPattern(raw.context_before, raw.context_after, rawFieldType);
   const geminiId =
     raw.canonical_field_id && VALID_CANONICAL_IDS.has(raw.canonical_field_id)
       ? (raw.canonical_field_id as CanonicalFieldId)
       : undefined;
   const canonicalId: CanonicalFieldId | undefined =
-    aliasId ?? labelId ?? patternId ?? geminiId;
+    labelId ?? aliasId ?? patternId ?? geminiId;
 
   const canonicalDef = canonicalId
     ? CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === canonicalId)
@@ -1171,47 +1240,85 @@ function mapToTemplateField(
     return null;
   }
 
-  // v0.5.13 — typographic baseline calibration for unsnapped fields.
-  // The user's visual target is `bbox_center == strokeRow` (bbox
-  // vertically centered on the underline). The v0.5.5-v0.5.10 snap
-  // already produces that placement for the fields it catches. The
-  // fields the snap REJECTS (no stroke found, ambiguous, or beyond
-  // the maxSnapPoints cap) sit at Gemini's raw output position,
-  // which empirically lands ~5pt BELOW the stroke for text-on-a-line
-  // detections. We pre-shift those by `TEXT_BASELINE_BIAS_PT` here
-  // so unsnapped fields converge on the same visual target as
-  // snapped ones.
+  // v0.5.15 — height-aware baseline calibration for unsnapped fields.
   //
-  // Why this is safe alongside the snap: the snap REPLACES `y` from
-  // a stroke-anchored target — it does not ADD to the existing `y`,
-  // so snapped fields end at `bbox_center == strokeRow` regardless
-  // of whatever pre-shift we did here. Unsnapped fields keep this
-  // shifted `y`. Both paths converge on `bbox_center ≈ strokeRow`.
+  // Geometric reasoning (verified against the v0.5.13 cardholder
+  // evidence: snapped fields look correct):
   //
-  // Predicate is "text-on-a-line":
+  //   The snap target in `underlineSnap.ts` sets
+  //     newY = strokeRow_pt - height/2
+  //   so a snapped field ends up with `bbox_center == strokeRow`.
+  //   That is the user's visual target (cardholder signature now
+  //   snapping to its underline confirms it).
+  //
+  //   For UNSNAPPED text-on-a-line fields, Gemini's raw bbox sits
+  //   with its TOP (`bbox_top` ≈ `rect.y`) approximately on the
+  //   underline stroke and extends DOWNWARD. So `rect.y ≈ strokeRow`
+  //   and `bbox_center ≈ strokeRow + height/2` — the field renders
+  //   below the line, which is the "every field is too low" symptom
+  //   we kept seeing. To converge on the snap target we need
+  //     rect.y = strokeRow - height/2 = rect.y_raw - height/2
+  //   i.e. subtract HALF THE HEIGHT, not a flat constant.
+  //
+  //   v0.5.11 introduced a flat `TEXT_BASELINE_BIAS_PT = 5` here;
+  //   v0.5.13 kept it. That flat 5pt under-corrects typical 14-18pt
+  //   text/signature heights (where height/2 = 7-9pt) and leaves the
+  //   field 2-4pt low, which is exactly what the v0.5.14 user report
+  //   ("all fields still 5px too low") flagged. v0.5.15 replaces the
+  //   constant with `height/2` so unsnapped fields land at the same
+  //   y as snapped fields, by construction, regardless of font size.
+  //
+  // Why this is safe alongside the snap: the snap REPLACES `y` with
+  // its stroke-anchored target — it does not ADD to the existing
+  // `y`. So snapped fields end at `bbox_center == strokeRow`
+  // regardless of whatever pre-shift we did here. The pre-shift only
+  // matters for fields the snap REJECTS (no stroke found, ambiguous,
+  // beyond maxSnapPoints) — and on those the new `-height/2` shift
+  // produces the same target the snap would have produced.
+  //
+  // Predicate ("text-on-a-line"):
   //   - `text` field type: yes (every text-typed field).
   //   - `signature` field kind: yes — v0.5.13. Signatures sit on a
-  //     baseline like text and would otherwise hang ~5pt below
-  //     their line when the snap rejects them. v0.5.11 wrongly
-  //     excluded them.
+  //     baseline like text and were under-corrected by the flat 5pt
+  //     bias.
   //   - `multiline` field kind: NO. Multilines cover tall regions
   //     with no single underline stroke; their `y` represents the
-  //     top of a band, not a baseline, so a baseline shift here
+  //     top of a band, not a baseline, so a height/2 shift here
   //     would push the band up off its content.
   //   - `checkbox` field type: NO. Checkbox glyphs anchor on the
-  //     printed box, not on a baseline; they're already excluded by
-  //     the `fieldType === "text" || fieldKind === "signature"`
-  //     predicate (signature is always classified as `text`).
-  if (
+  //     printed box, not on a baseline; the predicate excludes
+  //     checkboxes via `fieldType === "text" || fieldKind === "signature"`.
+  const rawY = rect.y;
+  const correctionApplied =
     (fieldType === "text" || fieldKind === "signature") &&
-    fieldKind !== "multiline"
-  ) {
-    rect.y = Math.max(0, rect.y - TEXT_BASELINE_BIAS_PT);
+    fieldKind !== "multiline";
+  if (correctionApplied) {
+    rect.y = Math.max(0, rect.y - rect.height / 2);
   }
 
   console.log(
     `[Typeset Diag] Field ${index} pdf rect: x=${rect.x.toFixed(2)}, y=${rect.y.toFixed(2)}, w=${rect.width.toFixed(2)}, h=${rect.height.toFixed(2)}`
   );
+
+  // Per-field alignment diagnostics. Off by default in production
+  // (the regular `[Typeset Diag]` line above already covers the raw
+  // bbox + final rect). Users can enable detailed alignment
+  // diagnostics from the production devtools (Cmd+Option+I) by
+  // running:
+  //
+  //     localStorage.setItem("typeset.debug.alignment", "true")
+  //
+  // and reloading the app, then re-running detection. Disable with:
+  //
+  //     localStorage.removeItem("typeset.debug.alignment")
+  //
+  // Dev builds (`import.meta.env.DEV`) always print these so we
+  // see them locally without flipping the flag.
+  if (alignmentDebugEnabled()) {
+    console.log(
+      `[Typeset Align] field=${index} label="${(raw.label ?? "").slice(0, 32)}" type=${fieldType} kind=${fieldKind} raw_y=${rawY.toFixed(2)} corrected_y=${rect.y.toFixed(2)} corrected=${correctionApplied} height=${rect.height.toFixed(2)} (post-snap y reported separately by underlineSnap)`
+    );
+  }
 
   const isCardCheckbox = canonicalId && CREDIT_CARD_CHECKBOX_IDS.has(canonicalId);
   const isBooleanCheckbox = fieldType === "checkbox" && !isCardCheckbox;
