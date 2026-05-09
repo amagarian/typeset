@@ -1,29 +1,34 @@
 /**
- * Vertical-underline snap (v0.5.11).
+ * Vertical-underline snap (v0.5.13).
  *
  * Deterministic post-processor that nudges Gemini-detected text-field
- * bboxes so their CENTER LINE sits at the typographic-baseline target
- * (`strokeRow - TEXT_BASELINE_BIAS_PT`) for the writable underline
- * stroke actually drawn on the page. Runs AFTER `mapToTemplateField`
- * and the dedup pass, so it operates on already-trusted detections
- * — we never use this to invent or drop fields, only to shift `y`
- * by a few points when there is strong geometric evidence of a
- * stroke within the search band.
+ * bboxes so their CENTER LINE sits exactly on the writable underline
+ * stroke actually drawn on the page (`bbox_center == strokeRow`).
+ * Runs AFTER `mapToTemplateField` and the dedup pass, so it operates
+ * on already-trusted detections — we never use this to invent or
+ * drop fields, only to shift `y` by a few points when there is
+ * strong geometric evidence of a stroke within the search band.
  *
- * v0.5.11 — typographic baseline calibration. The v0.5.5-v0.5.10
- * snap target was `bbox center == strokeRow`, which puts the bbox
- * center exactly on the underline. That assumption is geometrically
- * wrong for typed text: a typed glyph on a writable line has its
- * BASELINE on the stroke, with most of the visible character
- * (cap height ~7pt, x-height ~5pt) extending UPWARD and only a
- * small descender dipping below. So a stroke-centered bbox renders
- * text ~5pt too LOW — the symptom in the v0.5.10 user report
- * (every text field 5px low, fix = ArrowUp ×5). The new snap
- * target is `bbox center == strokeRow - TEXT_BASELINE_BIAS_PT`
- * (5pt, defined in `typesetConstants.ts`). The bias is included in
- * the cap check (the cap continues to gate TOTAL movement, not
- * pre-bias movement) so a snap that would have been at the cap is
- * still at the cap with the bias applied.
+ * v0.5.13 — retarget calibration to the snap-anchored center.
+ * v0.5.11 attempted a typographic baseline calibration here by
+ * subtracting `TEXT_BASELINE_BIAS_PT` from the snap target so the
+ * bbox would sit ABOVE the stroke (baseline-on-stroke). That
+ * over-corrected the fields the snap was already catching: the
+ * v0.5.10 snap was producing exactly the user's visual target
+ * (bbox vertically centered on the underline) — the user called
+ * those "perfect". The 5pt-low complaint was about UNSNAPPED fields,
+ * which sat at Gemini's raw output position. v0.5.11's combined
+ * change (snap-target shift + detection-time -5pt) double-shifted
+ * snapped fields and left signatures untouched.
+ *
+ * v0.5.13 reverts the snap target to `bbox_center == strokeRow`.
+ * The detection-time `-TEXT_BASELINE_BIAS_PT` correction in
+ * `geminiFieldDetector.ts` stays — it pulls UNSNAPPED text up from
+ * Gemini's raw output to the visually-correct position. Both paths
+ * therefore converge on `bbox_center ≈ strokeRow` for every text-
+ * typed field. Signatures are now included on both paths
+ * (snap-eligible AND detection-time corrected), so a Cardholder
+ * Signature snaps to its line the same way Billing Address does.
  *
  * Why this exists:
  *   The v0.5.3 prompt rule and Pass-2 audit rule 4b ask the model to
@@ -41,18 +46,21 @@
  *   better than us at noticing that a faint box outline IS a writable
  *   region or that an inline-sentence blank exists. This module is
  *   the opposite: Gemini still detects everything; we only nudge Y
- *   when (a) the field is already a text field, (b) we find at least
- *   one row within ±searchRangePoints of the bbox center that scores
- *   above the dark-coverage threshold AND passes a vertical-thinness
- *   gate (the rows ~5px above and below are mostly light — text
- *   glyphs span ~10-25px vertically and fail this check), and
+ *   when (a) the field is already a text field (including signatures
+ *   as of v0.5.13), (b) we find at least one row within
+ *   ±searchRangePoints of the bbox center that scores above the
+ *   dark-coverage threshold AND passes a vertical-thinness gate
+ *   (the rows ~5px above and below are mostly light — text glyphs
+ *   span ~10-25px vertically and fail this check), and
  *   (c) the snap delta is ≤ maxSnapPoints. Otherwise we leave the
  *   field alone.
  *
- * The snap is a no-op for checkboxes, signatures, and multilines —
- * those don't have a single underline to snap to and snapping a
- * multiline (whose center is far from any one stroke) would be
- * actively destructive.
+ * The snap is a no-op for checkboxes and multilines — checkbox
+ * glyphs anchor on the box (not a baseline), and multilines span
+ * tall regions with no single underline to snap to (snapping one
+ * would be actively destructive). Signatures DO snap as of v0.5.13:
+ * a signature line is a horizontal stroke just like a text
+ * underline.
  *
  * v0.5.10 — thinness offset + cap widening. The v0.5.7 thinness gate
  * sampled rows ±3px from each candidate to verify it was a real
@@ -94,7 +102,6 @@
  */
 
 import type { TemplateField } from "@/types";
-import { TEXT_BASELINE_BIAS_PT } from "@/utils/typesetConstants";
 
 /**
  * One page's rasterized image, plus the page's PDF-space scale, fed
@@ -394,21 +401,26 @@ function snapOneField(
 ): TemplateField {
   const wantLog = verboseLogEnabled(opts);
 
-  // Step 1: only snap text-typed fields. Checkboxes, signatures, and
-  // multilines either don't have a single underline (signatures often
-  // sit above a long line that may or may not be visible; multilines
-  // span big regions) or shouldn't be moved at all (a checkbox glyph
-  // we shifted vertically would no longer cover the box).
+  // Step 1: only snap text-typed fields. Checkboxes don't have a
+  // single underline to snap to (a checkbox glyph we shifted
+  // vertically would no longer cover the box).
   if (field.fieldType !== "text") {
     counts.skippedNonText += 1;
     return field;
   }
-  // We additionally exclude `multiline` and `signature` field-kinds —
-  // both are typed as `text` in `fieldType` but their rendering
-  // semantics expect a tall region or a separate underline stroke
-  // that lives below a printed name line, not the centred-on-stroke
-  // layout typed-text uses.
-  if (field.fieldKind === "multiline" || field.fieldKind === "signature") {
+  // We additionally exclude `multiline` field-kinds — they cover
+  // tall regions with no single underline, and the closest stroke
+  // is often far from the bbox center, so a snap would drag the
+  // whole region off its intended writable area.
+  //
+  // v0.5.13: signatures ARE now eligible. A signature line is a
+  // horizontal stroke just like a text underline; the same snap
+  // produces the visually-correct placement (bbox center on the
+  // stroke). The `verticalNeighborMax`, `scoreThreshold`, and
+  // ambiguity guards still apply unchanged — false positives on
+  // signature rows would be filtered the same way they are for
+  // text rows.
+  if (field.fieldKind === "multiline") {
     counts.skippedNonText += 1;
     return field;
   }
@@ -549,23 +561,24 @@ function snapOneField(
   }
 
   // Step 8: compute the snap delta. We move the bbox so its CENTER
-  // sits `TEXT_BASELINE_BIAS_PT` ABOVE the chosen stroke row — the
-  // stroke is the typographic baseline, and the visible glyph
-  // extends ~5pt upward from the baseline (cap height ~7pt,
-  // x-height ~5pt, with a small descender below). Centering the
-  // bbox on the stroke (the v0.5.5-v0.5.10 behavior) leaves typed
-  // text rendered ~5pt below where it should sit on the line; the
-  // bias here is what fixes that.
+  // sits exactly on the chosen stroke row — `bbox_center == strokeRow`.
+  // This is the user's visual target ("perfect" in the v0.5.10 user
+  // report) and is what the v0.5.10 snap was already doing for the
+  // fields it caught. v0.5.11 briefly subtracted TEXT_BASELINE_BIAS_PT
+  // here to push the bbox above the stroke; that over-corrected the
+  // already-correct snapped fields. v0.5.13 reverts to center-on-
+  // stroke. The detection-time `-TEXT_BASELINE_BIAS_PT` shift in
+  // `geminiFieldDetector.ts` handles UNSNAPPED fields independently.
   //
   // Cap absolute movement at maxSnapPoints — anything bigger is
   // almost certainly the model having found a totally different
   // feature, in which case dragging the bbox onto it would damage
-  // rather than fix the detection. The bias is part of `newY`, so
-  // `deltaPt = newY - field.y` already includes it; the cap
-  // continues to gate TOTAL movement (not pre-bias movement), which
-  // is what the user perceives.
+  // rather than fix the detection. The cap gates the snap delta
+  // only; it doesn't see the detection-time -5pt that already
+  // happened during `mapToTemplateField` (which is fine — that's an
+  // independent post-processing layer applied before the snap).
   const newCenterYPt = best.row * render.pdfPointsPerPixel;
-  const newY = newCenterYPt - field.height / 2 - TEXT_BASELINE_BIAS_PT;
+  const newY = newCenterYPt - field.height / 2;
   const deltaPt = newY - field.y;
 
   if (Math.abs(deltaPt) > opts.maxSnapPoints) {
