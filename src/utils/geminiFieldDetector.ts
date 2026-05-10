@@ -858,6 +858,21 @@ function buildPass1SharedSystemPrompt(): string {
     "  Example: `Cardholder Name: ____________________`",
     "  → bbox covers ONLY the underscores / empty space to the right of the colon. NEVER covers the label `Cardholder Name:` itself.",
     "",
+    "### Layout A1 — LABEL-PREFIX-INSIDE-BOXED-CELL (grid / table forms — v0.6.11) — READ CAREFULLY",
+    "Many forms (e.g. credit-card authorization grids, vendor/account-application tables) draw a TABLE OF CELLS where each cell has the printed prefix label INSIDE the cell at the LEFT, with a writable area filling the rest of the cell to the right of the colon. The cell border is a drawn rectangle; the printed label and the writable area BOTH live inside the same rectangle.",
+    "  Visual fragment (one row of a 2-column grid, cell borders shown as `|` for clarity — do NOT include the borders in any bbox):",
+    "    | Cardholder's Name: ___________________________ | Signature: ____________________ |",
+    "    | Billing Address:    ___________________________ | __________________________ |",
+    "    | CVV2/Security Code: ___________________________ | EXP: __________________________ |",
+    "  → For EACH cell, emit ONE field whose bbox covers ONLY the writable area (everything from JUST AFTER the printed colon up to the cell's right border). The bbox MUST NOT cover the printed prefix label (`Cardholder's Name:`, `Billing Address:`, `CVV2/Security Code:`, `EXP:`). The bbox's left edge sits ~2-4pt to the right of the printed colon; its right edge sits ~2-4pt to the left of the cell's vertical border.",
+    "  → The bbox MUST NOT cross the cell's vertical borders. If a row contains TWO cells (e.g. `Cardholder's Name` and `Signature` side-by-side), emit TWO separate fields — one per cell — each with its bbox bounded by that cell's own borders. NEVER emit a single bbox that spans both cells.",
+    "  → COMMON FAILURE TO AVOID: emitting a bbox that covers the entire cell from the cell's left border to its right border. That places the printed label INSIDE the bbox and causes the renderer to draw the user's value on top of the printed label. Always shift the bbox's left edge PAST the colon.",
+    "",
+    "### Layout A2 — CARD-TYPE checkbox cell vs CARD NUMBER cell (grid forms — v0.6.11)",
+    "When a credit-card-authorization grid has a row with FOUR card-type checkboxes packed into the LEFT cell of the row (e.g. `☐ VISA  ☐ AMEX` on top sub-row, `☐ MC  ☐ DISCOVER` on bottom sub-row, all inside ONE bordered cell on the LEFT), and a SEPARATE cell on the RIGHT labelled `Card #:` (the actual writable area for the credit-card-number digits), emit fields like this:",
+    "  - FOUR `checkbox` fields, one per card-type label, each with a TIGHT bbox covering only that label's drawn `☐` glyph (NOT the label text, NOT the surrounding cell — just the small drawn square).",
+    "  - ONE `text` field for the `Card #:` cell on the RIGHT, with `canonical_field_id: 'creditCardNumber'`. Its bbox covers the writable area inside the right cell, starting JUST AFTER the printed `Card #:` colon and ending at the right cell's right border. The `creditCardNumber` bbox MUST NOT extend into the LEFT cell (the one containing the card-type checkboxes). Verify: a horizontal scan-line through the `creditCardNumber` bbox should NEVER cross the words `VISA`, `AMEX`, `MC`, or `DISCOVER` — if it does, the bbox is in the wrong cell.",
+    "",
     "### Layout B — label-ABOVE (header style)",
     "The label sits on the line ABOVE the blank, often centered or left-aligned in the column.",
     "  Example:",
@@ -2417,6 +2432,14 @@ function mapToTemplateField(
     optional: raw.optional ?? undefined,
     estimatedFontSize,
     contextSnippet: buildContextSnippet(raw.context_before, raw.context_after),
+    // v0.6.11 — keep the form's printed prefix label and the text just
+    // before the bbox so `pdfWriter` can detect label-inside-bbox
+    // (Layout A1) and shift the rendered value past the printed label.
+    printedLabel: geminiLabel.length > 0 ? geminiLabel : undefined,
+    contextBefore:
+      typeof raw.context_before === "string" && raw.context_before.trim().length > 0
+        ? raw.context_before.trim()
+        : undefined,
   };
 }
 

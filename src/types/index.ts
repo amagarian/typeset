@@ -416,6 +416,27 @@ export interface TemplateField {
    * script's row context.
    */
   contextSnippet?: string;
+  /**
+   * v0.6.11 — the form's PRINTED prefix label as Gemini reported it
+   * (`raw.label`), distinct from {@link label} which becomes the
+   * canonical's display label after a successful catalog match.
+   * Populated even when canonical resolution succeeds, so the renderer
+   * can detect label-prefix-inside-boxed-cell layouts (e.g. Keslow's
+   * `Cardholder's Name: ___` cells where the printed colon sits INSIDE
+   * the bbox) and shift the rendered value rightward past the printed
+   * label instead of writing on top of it. Optional because not every
+   * detection carries a meaningful label string.
+   */
+  printedLabel?: string;
+  /**
+   * v0.6.11 — the text immediately preceding the bbox (`raw.context_before`),
+   * lightly normalised. The renderer reads this together with
+   * {@link printedLabel} to gate the boxed-cell shift heuristic: when
+   * `contextBefore` is empty/whitespace AND `printedLabel` ends with a
+   * colon, the printed label most likely sits INSIDE the bbox (Layout
+   * A1). Optional and best-effort.
+   */
+  contextBefore?: string;
 }
 
 /**

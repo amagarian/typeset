@@ -57,6 +57,69 @@ function fitTextToWidth(text: string, width: number, font: any, fontSize: number
 }
 
 /**
+ * v0.6.11 — Layout-A1 (boxed-cell-with-prefix-label) mitigation. Some
+ * forms (e.g. Keslow's CC Authorization grid) draw a table where each
+ * cell has the printed label as a PREFIX inside the cell, with the
+ * writable area to the RIGHT of the colon — `| Cardholder's Name: __ |`.
+ * Gemini sometimes emits a bbox covering the WHOLE cell, which causes
+ * the renderer to drop the user's value on top of the printed label.
+ *
+ * Returns the leftward offset (pt, in PDF user-space) the renderer
+ * should use to skip past the printed prefix. Returns 0 (no shift)
+ * when there's no signal that the label sits inside the bbox.
+ *
+ * Triggers (ALL required):
+ *   1. Field is a regular text field (not checkbox/option-group/signature).
+ *   2. `printedLabel` is non-empty and ends with a colon (`:` or `：`).
+ *   3. Bbox is at least ~100pt wide — narrow bboxes are usually genuine
+ *      post-colon writable areas and must not be shifted.
+ *   4. `contextBefore` is either empty OR doesn't already echo the
+ *      prefix label. If `contextBefore` already carries the label
+ *      text, the label sits OUTSIDE the bbox and the bbox already
+ *      starts past the colon — shifting would push us off the right
+ *      edge.
+ *
+ * The shift width is `widthOf(printedLabel) + 4pt` for breathing room
+ * past the punctuation, clamped to `0.6 * field.width` so even when
+ * the heuristic fires on a wrong label we never push past the bbox
+ * midpoint.
+ */
+function computePrefixLabelShiftX(
+  field: TemplateField,
+  font: any,
+  fontSize: number
+): number {
+  if (
+    isCheckboxField(field) ||
+    isSignatureField(field) ||
+    isOptionGroupField(field)
+  ) {
+    return 0;
+  }
+  const printed = (field.printedLabel ?? "").trim();
+  if (!printed) return 0;
+  if (!/[:：]\s*$/.test(printed)) return 0;
+  if (field.width < 100) return 0;
+
+  const ctx = (field.contextBefore ?? "").trim().toLowerCase();
+  if (ctx.length > 0) {
+    const stem = printed
+      .toLowerCase()
+      .replace(/[:：]\s*$/, "")
+      .trim();
+    if (stem.length >= 4) {
+      const probe = stem.slice(0, Math.min(stem.length, 16));
+      if (ctx.includes(probe)) return 0;
+    }
+  }
+
+  const labelWidth = font.widthOfTextAtSize(printed, fontSize);
+  const shift = labelWidth + 4;
+  const ceiling = field.width * 0.6;
+  return Math.min(shift, ceiling);
+}
+
+/**
  * v0.6.8 — shrink the font down to a floor before resorting to
  * ellipsis-truncation. The Arrow CC Authorization Billing Address
  * single-line render at 9pt ran ~30pt past the right edge of the
@@ -403,7 +466,25 @@ export async function writeFilledPdfBytes(
       // typical caption tail like `(MM/YY)*` cleanly, and on wider
       // fields the value still has plenty of room before the right
       // edge.
-      const insetX = 10;
+      const baseInsetX = 10;
+
+      // v0.6.11 — pick the rendering font size up-front so the
+      // Layout-A1 prefix-label width measurement happens at the same
+      // size we'll actually draw at. Mirrors the shrink-on-fit logic
+      // below; the per-branch `baseFontSize` is recomputed inside
+      // each branch but starts from the same numbers.
+      let probeFontSize = defaultFontSize;
+      if (field.estimatedFontSize) {
+        probeFontSize = Math.max(
+          7,
+          Math.min(16, Math.round(field.estimatedFontSize * 1.5))
+        );
+      } else if (!isMultiline && field.height > 0) {
+        probeFontSize = Math.max(7, Math.min(12, Math.floor(field.height * 0.75)));
+      }
+
+      const prefixShift = computePrefixLabelShiftX(field, font, probeFontSize);
+      const insetX = Math.max(baseInsetX, prefixShift > 0 ? prefixShift : 0);
 
       if (isMultiline) {
         const lines = rawValue.split(/\r?\n/).filter((s) => s.length > 0);
@@ -418,7 +499,7 @@ export async function writeFilledPdfBytes(
         }
 
         let yBaseline = yPdfBottom + field.height - 1;
-        const usableWidth = field.width - (insetX - 3);
+        const usableWidth = Math.max(8, field.width - insetX - 3);
 
         for (const line of lines) {
           const { text: fitted, fontSize: actualFontSize } = fitWithShrink(
@@ -451,7 +532,7 @@ export async function writeFilledPdfBytes(
         baseFontSize = Math.max(7, Math.min(12, Math.floor(field.height * 0.75)));
       }
 
-      const usableWidth = field.width - (insetX - 3);
+      const usableWidth = Math.max(8, field.width - insetX - 3);
       const { text: value, fontSize: actualFontSize } = fitWithShrink(
         rawValue,
         usableWidth,
