@@ -6,8 +6,8 @@ import type {
   Template,
   TemplateField,
 } from "@/types";
-import { mockProjects } from "@/data/mockProjects";
 import { mockDraftTemplate } from "@/data/mockTemplates";
+import { useProjects } from "@/hooks/useProjects";
 import { AppShell } from "@/components/AppShell/AppShell";
 import { ProjectWorkspace } from "@/components/ProjectWorkspace/ProjectWorkspace";
 import { NewProjectView } from "@/components/NewProjectView/NewProjectView";
@@ -67,32 +67,41 @@ function isDropZoneWindow(): boolean {
 
 type View = "workspace" | "new-project" | "edit-project";
 
-function createEmptyProject(): Project {
-  const now = new Date().toISOString();
-  return {
-    id: `proj-${Date.now()}`,
-    label: "",
-    jobName: "",
-    jobNumber: "",
-    poNumber: "",
-    authorizationDate: "",
-    productionCompany: "",
-    billingAddress: "",
-    billingCity: "",
-    billingState: "",
-    billingZipCode: "",
-    producer: "",
-    email: "",
-    phone: "",
-    creditCardType: "",
-    creditCardHolder: "",
-    cardholderSignature: "",
-    creditCardNumber: "",
-    expDate: "",
-    ccv: "",
-    createdAt: now,
-    updatedAt: now,
-  };
+/**
+ * v0.5.28 — heuristic for "user opened New project then closed
+ * without typing anything". The new-project flow now creates a real
+ * Project up front (so all edits autosave through `useProjects`),
+ * which means an immediate close would otherwise leave a blank row
+ * in the sidebar forever. Treating an all-empty project as
+ * disposable on close reverses that without an explicit Cancel
+ * button. We deliberately scope this to the new-project view —
+ * editing an existing project and blanking every field shouldn't
+ * silently delete it.
+ */
+function isProjectEmpty(project: Project): boolean {
+  return (
+    [
+      project.label,
+      project.jobName,
+      project.jobNumber,
+      project.poNumber,
+      project.authorizationDate,
+      project.productionCompany,
+      project.billingAddress,
+      project.billingCity,
+      project.billingState,
+      project.billingZipCode,
+      project.producer,
+      project.email,
+      project.phone,
+      project.creditCardType,
+      project.creditCardHolder,
+      project.cardholderSignature,
+      project.creditCardNumber,
+      project.expDate,
+      project.ccv,
+    ].every((value) => !value || value.trim() === "")
+  );
 }
 
 function createEmptyDraftTemplate(fileName: string): Template {
@@ -256,11 +265,22 @@ export default function App() {
 }
 
 function MainApp() {
-  const [projects, setProjects] = useState<Project[]>(mockProjects);
+  // v0.5.28 — project state moved into `useProjects`, which owns the
+  // canonical list, autosaves to the encrypted on-disk store with a
+  // 500ms debounce, and exposes `saveStatus` for the "Saved ✓"
+  // indicator in the project edit view. Replaces the
+  // `useState<Project[]>(mockProjects)` that lived here through
+  // v0.5.27 — projects no longer dissolve on quit.
+  const {
+    projects,
+    createProject,
+    updateProject: updateProjectInStore,
+    deleteProject: deleteProjectInStore,
+    saveStatus,
+    error: projectsError,
+  } = useProjects();
   const [view, setView] = useState<View>("workspace");
-  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(
-    mockProjects[0]?.id ?? null
-  );
+  const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
   const [toast, setToast] = useState<ToastState | null>(null);
   const [templateModal, setTemplateModal] = useState<{ template: Template } | null>(null);
   const [templateUndoStack, setTemplateUndoStack] = useState<Template[]>([]);
@@ -283,7 +303,6 @@ function MainApp() {
     fileName: string;
     bytes: Uint8Array;
   } | null>(null);
-  const [newProjectDraft, setNewProjectDraft] = useState<Partial<Project>>({});
   const [promptValuesByTemplate, setPromptValuesByTemplate] = useState<
     Record<string, PromptFieldValues>
   >({});
@@ -310,6 +329,34 @@ function MainApp() {
   useEffect(() => {
     void fetchContributionStats();
   }, []);
+
+  // v0.5.28 — auto-select the most recent project once the on-disk
+  // store finishes loading. The hook starts at `projects = []`
+  // (loading state), so without this the workspace would render
+  // "Select or create a project" for one frame even when the user
+  // has saved projects. We only fire the auto-select on the
+  // transition out of empty selection, so deleting the last
+  // project (or arriving at an empty store on first launch)
+  // doesn't auto-jump back into a different project mid-session.
+  const didAutoSelectRef = useRef(false);
+  useEffect(() => {
+    if (didAutoSelectRef.current) return;
+    if (projects.length === 0) return;
+    didAutoSelectRef.current = true;
+    setSelectedProjectId((current) => current ?? projects[0].id);
+  }, [projects]);
+
+  // v0.5.28 — surface persistence errors (keychain denied, disk
+  // failure) as a toast. The hook keeps the in-memory list usable
+  // even when the disk write fails, so the user isn't blocked —
+  // but we want them to know something is wrong before they trust
+  // the app with more data. Dependency on `projectsError` re-fires
+  // only when the message itself changes.
+  useEffect(() => {
+    if (projectsError) {
+      setToast({ message: projectsError, type: "error" });
+    }
+  }, [projectsError]);
 
   // v0.5.27 — bridge for the native macOS menu bar's "Settings…"
   // item (⌘,). The Rust setup hook in `src-tauri/src/lib.rs`
@@ -395,15 +442,21 @@ function MainApp() {
     void updateTrayMenu(projectList).catch(() => {});
   }, [projects]);
 
-  const updateProject = useCallback((id: string, updates: Partial<Project>) => {
-    setProjects((prev) =>
-      prev.map((p) => (p.id === id ? { ...p, ...updates, updatedAt: new Date().toISOString() } : p))
-    );
-  }, []);
+  // v0.5.28 — every project mutation now flows through the
+  // `useProjects` store, which handles the optimistic in-memory
+  // update + the debounced encrypted-disk write. We keep this
+  // local indirection so the rest of the file's call sites stay
+  // identical to the v0.5.27 wiring (a `(id, patch)` shape).
+  const updateProject = useCallback(
+    (id: string, updates: Partial<Project>) => {
+      updateProjectInStore(id, updates);
+    },
+    [updateProjectInStore]
+  );
 
   const deleteProject = useCallback(
     (id: string) => {
-      setProjects((prev) => prev.filter((p) => p.id !== id));
+      deleteProjectInStore(id);
       setProjectDocuments((prev) => {
         const next = { ...prev };
         delete next[id];
@@ -414,7 +467,7 @@ function MainApp() {
         setView("workspace");
       }
     },
-    [selectedProjectId]
+    [deleteProjectInStore, selectedProjectId]
   );
 
   const addDocumentToProject = useCallback((projectId: string, doc: ProjectDocument) => {
@@ -1399,25 +1452,31 @@ function MainApp() {
     [beginFillAction, getTemplateById, pdfSource?.bytes, selectedProject, showToast]
   );
 
+  // v0.5.28 — "+ New project" now creates a real Project up front
+  // (with a stable UUID via `useProjects.createProject`) and drops
+  // straight into the autosave loop. The old flow accumulated edits
+  // in a transient `newProjectDraft` and committed via a "Create
+  // project" button at the bottom of the form — that button is
+  // gone, so we need an inserted-on-entry record for autosave to
+  // target. The "discard if empty on close" path lives in
+  // `handleCloseNewProject` so a misclick on "+ New project"
+  // doesn't permanently litter the sidebar.
   const handleNewProject = useCallback(() => {
-    setNewProjectDraft({});
+    const project = createProject();
+    setSelectedProjectId(project.id);
     setView("new-project");
-  }, []);
+  }, [createProject]);
 
-  const handleSaveNewProject = useCallback(() => {
-    const project = { ...createEmptyProject(), ...newProjectDraft };
-    if (project.label || project.jobName) {
-      setProjects((prev) => [...prev, project]);
-      setSelectedProjectId(project.id);
+  const handleCloseNewProject = useCallback(() => {
+    if (selectedProjectId) {
+      const current = projects.find((p) => p.id === selectedProjectId);
+      if (current && isProjectEmpty(current)) {
+        deleteProjectInStore(selectedProjectId);
+        setSelectedProjectId(null);
+      }
     }
-    setNewProjectDraft({});
     setView("workspace");
-  }, [newProjectDraft]);
-
-  const handleCancelNewProject = useCallback(() => {
-    setView("workspace");
-    setNewProjectDraft({});
-  }, []);
+  }, [deleteProjectInStore, projects, selectedProjectId]);
 
   const handleEditProject = useCallback(() => {
     setView("edit-project");
@@ -1440,10 +1499,12 @@ function MainApp() {
           showToast("No recognizable fields found in this PDF.", "info");
           return;
         }
-        if (view === "edit-project" && selectedProjectId) {
+        // v0.5.28 — both views now mutate a real project through
+        // the autosave store. The new-project view inserts an empty
+        // Project on entry, so PDF import here just patches it the
+        // same way an explicit edit would.
+        if ((view === "edit-project" || view === "new-project") && selectedProjectId) {
           updateProject(selectedProjectId, fields);
-        } else {
-          setNewProjectDraft((prev) => ({ ...prev, ...fields }));
         }
         showToast(
           `Imported ${fieldCount} field${fieldCount === 1 ? "" : "s"} from PDF.`,
@@ -1479,19 +1540,21 @@ function MainApp() {
         onOpenSettings={() => setSettingsOpen(true)}
         headerRight={<ContributionBadge />}
       >
-        {view === "new-project" || view === "edit-project" ? (
+        {(view === "new-project" || view === "edit-project") && selectedProject ? (
           <NewProjectView
-            initialProject={view === "edit-project" && selectedProject ? selectedProject : newProjectDraft}
+            initialProject={selectedProject}
             isEditing={view === "edit-project"}
+            saveStatus={saveStatus}
             onChange={(updates) => {
-              if (view === "edit-project" && selectedProjectId) {
+              if (selectedProjectId) {
                 updateProject(selectedProjectId, updates);
-              } else {
-                setNewProjectDraft((prev) => ({ ...prev, ...updates }));
               }
             }}
-            onSave={view === "edit-project" ? () => setView("workspace") : handleSaveNewProject}
-            onCancel={view === "edit-project" ? () => setView("workspace") : handleCancelNewProject}
+            onClose={
+              view === "new-project"
+                ? handleCloseNewProject
+                : () => setView("workspace")
+            }
             onImportPdf={importProjectFromPdf}
           />
         ) : (

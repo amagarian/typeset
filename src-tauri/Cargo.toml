@@ -32,3 +32,11 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 base64 = "0.22"
 thiserror = "2"
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
+
+# v0.5.28 — encrypted local project persistence (see `projects.rs`).
+# AES-256-GCM blob on disk, key in the OS keychain (reusing the
+# `keyring` entry above). `rand` is needed for the per-write
+# nonce + the one-time key generation; `aes-gcm` provides the AEAD.
+aes-gcm = "0.10"
+rand = "0.8"
+dirs = "6"

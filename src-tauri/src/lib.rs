@@ -1,5 +1,6 @@
 mod gemini;
 mod keychain;
+mod projects;
 
 #[cfg(target_os = "macos")]
 use tauri::{
@@ -36,6 +37,8 @@ pub fn run() {
             gemini::gemini_detect_fields,
             gemini::gemini_detect_fields_images,
             gemini::gemini_test_connection,
+            projects::read_projects,
+            projects::write_projects,
         ])
         .setup(|app| {
             // v0.5.27 — first pass at native macOS menu wiring.

@@ -116,6 +116,18 @@ export interface Project {
   ccv: string;
   createdAt: string;
   updatedAt: string;
+  /**
+   * v0.5.28 — last-modified timestamp in **ms epoch**.
+   *
+   * Distinct from `updatedAt` (which is an ISO string used for
+   * display + UI sort) because v0.5.29 cross-device sync needs a
+   * monotonic numeric clock for last-write-wins conflict resolution.
+   * Bumped on every autosave through `useProjects`. Optional only so
+   * older serialised state (or test fixtures) deserialise without a
+   * migration step; the persistence layer normalises missing values
+   * to `Date.now()` on load.
+   */
+  modifiedAt?: number;
 }
 
 /** A single field definition on a template (position + mapping) */
