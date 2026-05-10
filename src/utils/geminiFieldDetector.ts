@@ -2758,22 +2758,38 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
 
       const sameType = existing.fieldType === field.fieldType;
 
-      // v0.6.9 — aggressive same-row, same-type guard. If two text
-      // (or two checkbox / two option-group) fields share a horizontal
-      // band — vertical centres within 8pt AND any horizontal bbox
-      // overlap — they're almost always two model interpretations of
-      // the same writable line. Two fills on the same row produce the
-      // CC overlay we keep regressing on (creditCardHolder bbox
-      // landing on the creditCardNumber underline at IoU just under
-      // the previous 0.15 bar). Larger-area survivor wins, so the
-      // wider full-row bbox eats the narrower mis-mapped one.
+      // v0.6.10 — nuclear same-type overlap. After v0.6.9's 8pt
+      // vertical-centre guard still missed the recurring CC overlay
+      // (a `creditCardHolder` bbox landing on the `creditCardNumber`
+      // underline somewhere ~10-20pt off the cardnumber row's
+      // centre), we now drop ANY pair of same-fieldType detections
+      // on the same page whose bboxes have BOTH non-zero horizontal
+      // AND non-zero vertical overlap. Two text widgets legitimately
+      // intersecting at any meaningful area is vanishingly rare on
+      // real forms — what we keep seeing is the model emitting two
+      // bboxes that claim part of the same physical row. Larger-area
+      // wins, so the full-row band eats the smaller mis-mapped twin.
       if (sameType) {
-        const cyA = existing.y + existing.height / 2;
-        const cyB = field.y + field.height / 2;
+        const yOverlap =
+          Math.min(existing.y + existing.height, field.y + field.height) -
+          Math.max(existing.y, field.y);
         const xOverlap =
           Math.min(existing.x + existing.width, field.x + field.width) -
           Math.max(existing.x, field.x);
-        if (Math.abs(cyA - cyB) < 8 && xOverlap > 0) return true;
+        if (yOverlap > 0 && xOverlap > 0) {
+          if (
+            existing.canonicalFieldId &&
+            field.canonicalFieldId &&
+            existing.canonicalFieldId !== field.canonicalFieldId
+          ) {
+            console.warn(
+              `[Typeset detector] Same-type overlap dedup: keeping larger of ` +
+                `(${existing.canonicalFieldId}@${existing.x.toFixed(1)},${existing.y.toFixed(1)} ${existing.width.toFixed(1)}×${existing.height.toFixed(1)}) ` +
+                `vs (${field.canonicalFieldId}@${field.x.toFixed(1)},${field.y.toFixed(1)} ${field.width.toFixed(1)}×${field.height.toFixed(1)})`
+            );
+          }
+          return true;
+        }
       }
 
       if (sameType && iou >= 0.15) return true;

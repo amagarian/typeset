@@ -397,14 +397,13 @@ export async function writeFilledPdfBytes(
       // bbox instead of the geometric centre.
       const valueHasNewline = rawValue.includes("\n");
       const isMultiline = field.fieldKind === "multiline" || valueHasNewline;
-      // v0.6.9 — bumped left padding from 5pt to 7pt. 5pt was visibly
-      // tight on the Arrow CC Authorization Expiration Date row
-      // (`(MM/YY)01/31`) — model bboxes can start flush with or even
-      // overlap a printed caption like `(MM/YY)`, so the inset has to
-      // do the visual work. 7pt is wide enough to clear a typical
-      // 3-character caption tail; wider fields don't notice the
-      // difference because their right edge is far from the value.
-      const insetX = 7;
+      // v0.6.10 — bumped left padding from 7pt → 10pt. 7pt revealed
+      // the asterisk after `(MM/YY)` (which v0.6.7 had been covering)
+      // but the `01/31` still sat flush against it. 10pt clears a
+      // typical caption tail like `(MM/YY)*` cleanly, and on wider
+      // fields the value still has plenty of room before the right
+      // edge.
+      const insetX = 10;
 
       if (isMultiline) {
         const lines = rawValue.split(/\r?\n/).filter((s) => s.length > 0);
