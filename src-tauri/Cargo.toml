@@ -1,6 +1,6 @@
 [package]
 name = "typeset"
-version = "0.5.36"
+version = "0.5.37"
 description = "Film production PDF autofill powered by Gemini with local template caching"
 authors = ["Aiden Magarian"]
 edition = "2021"
