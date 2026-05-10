@@ -635,6 +635,38 @@ function buildPass1SharedSystemPrompt(): string {
     "",
     "  Negative example — what NOT to do: do NOT emit BOTH dates with `canonical_field_id: \"authorizationDate\"`. Conflating both onto the authorization canonical means the form filler will write today's date into the booking blank too, which is wrong. The booking date and the signing date are distinct semantic concepts and the post-processor REQUIRES the labels to differ to route them correctly.",
     "",
+    "## Date disambiguation rule (v0.5.34 — IMPORTANT for credit card / rental forms with mixed-content paragraphs)",
+    "",
+    "A blank in a sentence with booking/shoot/rental context is ONLY a `shootDate` if the blank itself is unambiguously a date input. Required signals (at least ONE must be present in the IMMEDIATE context, within ~10 chars before or after the blank):",
+    "",
+    "  - The literal text `(date)` immediately following the blank: `... at Beam Studios on ___ (date) ...`",
+    "  - The word `date` immediately preceding the blank: `Date: ___`, `Shoot date: ___`, `Booking date: ___`, `Date of shoot: ___`",
+    "  - A date format hint near the blank: `(MM/DD/YYYY)`, `(YYYY-MM-DD)`, `(date format)`, etc.",
+    "",
+    "**NEVER classify these as `shootDate` even if the surrounding paragraph mentions booking/shoot/rental:**",
+    "",
+    "  - **Dollar amounts.** A blank preceded by `$` or followed by `dollars`, `USD`, `processing fee`, `charge`, `rate`, `fee` is an AMOUNT, NOT a date. Example: `\"authorize an additional $___ plus a 3.3% processing fee\"` — the `$___` is an amount field with `field_kind: \"text\"` and a label like `\"Additional Charge Amount\"`, NOT a `shootDate`.",
+    "  - **Hour counts.** A blank followed by `hours`, `hrs`, `hour rounded`, `/ hour` is an HOUR COUNT, NOT a date. Example: `\"for ___ hours\"` — the blank is an hour count, label like `\"Hours\"` or `\"Booking Hours\"`, `field_kind: \"text\"`.",
+    "  - **Percentages.** A blank near `%`, `percent` is a percentage, not a date.",
+    "  - **Names.** A blank in `\"I, ___, authorize\"` is a name (cardholder name), not a date.",
+    "  - **Quantities.** A blank that's clearly counting items (cards, sessions, days, etc.) without a date format is a quantity.",
+    "",
+    "The booking paragraph on a typical CC authorization form contains 4-5 distinct field types in a SINGLE sentence (name, amount, date, hours, overtime rate). Each must be classified by its own immediate semantic role. Paragraph-level context is NOT sufficient to assign `shootDate`.",
+    "",
+    "  Few-shot example — same paragraph carries multiple distinct field types:",
+    "",
+    "    Form text:",
+    "      `\"I, ____ (cardholder name), authorize my credit card to be charged an additional $______ plus a 3.3% processing fee for my booking at Beam Studios on ______ (date) for ___ hours.\"`",
+    "",
+    "    Correct emission (5 separate fields, each with its own semantic role):",
+    "",
+    "      1. `label: \"Cardholder Name\"`, `canonical_field_id: \"creditCardHolder\"`, `field_kind: \"text\"` — `context_after` starts with `(cardholder name)`.",
+    "      2. `label: \"Additional Charge Amount\"`, `canonical_field_id: null`, `field_kind: \"text\"` — `context_before` ends with `additional $`. THIS IS NOT A DATE despite \"for my booking\" being in the broader sentence.",
+    "      3. `label: \"Booking Date\"`, `canonical_field_id: \"shootDate\"`, `field_kind: \"date\"` — `context_after` starts with `(date)`. The literal `(date)` marker is the trigger; without it, defaults to NOT `shootDate`.",
+    "      4. `label: \"Hours\"`, `canonical_field_id: null`, `field_kind: \"text\"` — `context_after` starts with ` hours`.",
+    "",
+    "  Anti-example — what NOT to do: do NOT emit field #2 or #4 as `shootDate`. Their immediate context lacks any date marker. The fact that the surrounding sentence says \"for my booking\" is irrelevant for fields that aren't themselves date inputs.",
+    "",
     "If you cannot precisely locate the writable area, OMIT the field. We strongly prefer 10 correctly-placed fields to 20 fields where half are sitting on labels.",
   ].join("\n");
 }
@@ -915,7 +947,8 @@ function alignmentDebugEnabled(): boolean {
 function inferByPattern(
   context: string | undefined,
   after: string | undefined,
-  fieldType: "text" | "checkbox" | "option-group"
+  fieldType: "text" | "checkbox" | "option-group",
+  fieldKind: TemplateFieldKind
 ): CanonicalFieldId | undefined {
   if (fieldType !== "text") return undefined;
   const ctx = (context ?? "").toLowerCase().trim();
@@ -946,12 +979,35 @@ function inferByPattern(
   // to `shootDate` and the standalone signature-row `Date:` line to
   // `authorizationDate`. The patterns are sourced from the canonical
   // catalog so additions stay centralised in `fieldCatalog.ts`.
-  const shootDef = CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === "shootDate");
-  if (shootDef?.patterns?.length) {
-    const haystack = `${ctx} ${aft}`;
-    for (const pattern of shootDef.patterns) {
-      if (pattern.test(haystack)) {
-        return "shootDate";
+  //
+  // v0.5.34 — gate on `fieldKind === "date"`. The shootDate patterns
+  // are evaluated against `context_before + " " + context_after`,
+  // which on a body-text paragraph like the Beam Studios CC AUTH
+  // booking sentence ("...authorize my credit card to be charged an
+  // additional $___ plus a 3.3% processing fee for my booking at Beam
+  // Studios on ___ (date) for ___ hours...") spans the WHOLE paragraph
+  // for every field. Without this gate, the dollar-amount blank
+  // (`$___`), the hour-count blank (`for ___ hours`), and the overtime
+  // rate blank (`additional $___ / hour`) all match the
+  // `\bfor\s+(?:my|our|the)\s+(?:booking|shoot|...)\b` pattern via
+  // their shared paragraph context and get hijacked into `shootDate`,
+  // which causes the form filler to write today's date into all four
+  // blanks. The user reported exactly this regression after v0.5.31:
+  // "well now it's just recognizing way too much as shoot date. those
+  // should be dollar amounts." Only fields that are unambiguously
+  // dates (i.e. Gemini emitted `field_kind: "date"`) are eligible to
+  // be promoted to `shootDate` here. Dollar amounts, hour counts,
+  // names, etc. that happen to share a sentence with booking/shoot/
+  // rental context must NOT be promoted just because the haystack
+  // matches a paragraph-level pattern.
+  if (fieldKind === "date") {
+    const shootDef = CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === "shootDate");
+    if (shootDef?.patterns?.length) {
+      const haystack = `${ctx} ${aft}`;
+      for (const pattern of shootDef.patterns) {
+        if (pattern.test(haystack)) {
+          return "shootDate";
+        }
       }
     }
   }
@@ -1495,7 +1551,21 @@ function mapToTemplateField(
     raw.checkbox_value,
     raw.options
   );
-  const patternId = inferByPattern(raw.context_before, raw.context_after, rawFieldType);
+  // v0.5.34 — compute the raw field kind (as Gemini emitted it,
+  // normalised against `rawFieldType`) BEFORE the four-tier ladder so
+  // `inferByPattern` can gate its shootDate preflight on
+  // `fieldKind === "date"`. We deliberately pass `rawFieldType` (not
+  // the post-coercion `fieldType` computed below) because the gate is
+  // about Gemini's own classification of the blank, not the canonical
+  // type override that the ladder may apply later. See the gating
+  // comment inside `inferByPattern` for the rationale.
+  const rawFieldKind = normalizeFieldKind(raw.field_kind, rawFieldType);
+  const patternId = inferByPattern(
+    raw.context_before,
+    raw.context_after,
+    rawFieldType,
+    rawFieldKind
+  );
   const geminiId =
     raw.canonical_field_id && VALID_CANONICAL_IDS.has(raw.canonical_field_id)
       ? (raw.canonical_field_id as CanonicalFieldId)
