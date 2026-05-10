@@ -18,6 +18,8 @@ import { MatchStatusModal } from "@/components/MatchStatusModal/MatchStatusModal
 import { SettingsModal } from "@/components/SettingsModal/SettingsModal";
 import { Toast, type ToastState } from "@/components/Toast/Toast";
 import { TrayDropZone } from "@/components/TrayDropZone/TrayDropZone";
+import { UpdateBanner } from "@/components/UpdateBanner/UpdateBanner";
+import { useAutoUpdate } from "@/hooks/useAutoUpdate";
 import { getPromptFields, type PromptFieldValues } from "@/utils/fill";
 import { writeFilledPdfBytes } from "@/utils/pdfWriter";
 import { exportPdfBytes, type PdfExportMode } from "@/utils/exportPdf";
@@ -282,6 +284,21 @@ function MainApp() {
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [matchModal, setMatchModal] = useState<PdfMatchResult | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+
+  // v0.5.23 — drives the auto-update banner. Hook also schedules the
+  // launch-time check and the focus-triggered (debounced) re-check. Mounted
+  // exactly once here; the dropzone webview renders <TrayDropZone /> from
+  // <App /> above and never reaches this component.
+  const { banner: updateBanner, dismissBanner: dismissUpdateBanner } = useAutoUpdate();
+
+  const handleRelaunch = useCallback(async () => {
+    try {
+      const { relaunch } = await import("@tauri-apps/plugin-process");
+      await relaunch();
+    } catch (err) {
+      console.warn("[AutoUpdate] relaunch failed", err);
+    }
+  }, []);
 
   const selectedProject = selectedProjectId
     ? projects.find((p) => p.id === selectedProjectId) ?? null
@@ -1685,6 +1702,14 @@ function MainApp() {
       />
 
       <Toast toast={toast} onDismiss={() => setToast(null)} />
+
+      {updateBanner && (
+        <UpdateBanner
+          version={updateBanner.version}
+          onRelaunch={handleRelaunch}
+          onDismiss={dismissUpdateBanner}
+        />
+      )}
     </>
   );
 }

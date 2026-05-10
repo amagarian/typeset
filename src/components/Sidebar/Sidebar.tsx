@@ -1,5 +1,6 @@
 import { useState, useCallback } from "react";
 import { ProjectList } from "../ProjectList/ProjectList";
+import { isUpdateInstalled, runUpdateCheck } from "@/utils/autoUpdate";
 import styles from "./Sidebar.module.css";
 
 interface SidebarProps {
@@ -12,43 +13,58 @@ interface SidebarProps {
 
 export function Sidebar({ projects, selectedId, onSelect, onNewProject, onOpenSettings }: SidebarProps) {
   const [search, setSearch] = useState("");
-  const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "downloading" | "upToDate" | "error">("idle");
+  const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "upToDate" | "error">("idle");
   const [errorDetail, setErrorDetail] = useState<string | null>(null);
 
   const filtered = search.trim()
     ? projects.filter((p) => p.label.toLowerCase().includes(search.toLowerCase()))
     : projects;
 
+  // v0.5.23 — manual "Check for updates" funnels through the shared
+  // helper alongside the launch/focus auto-checks. The helper handles
+  // the silent download + install; on success it notifies the
+  // useAutoUpdate hook (mounted in App.tsx) which raises the
+  // relaunch banner. We just surface lightweight status text here.
   const checkForUpdates = useCallback(async () => {
+    if (isUpdateInstalled()) {
+      // Auto-flow already installed and the banner is showing.
+      // No-op per the v0.5.23 behaviour spec.
+      console.log("[AutoUpdate] manual click ignored — update already installed this session");
+      return;
+    }
     setUpdateStatus("checking");
     setErrorDetail(null);
-    try {
-      const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check();
-      if (update) {
-        setUpdateStatus("downloading");
-        await update.downloadAndInstall();
-        const { relaunch } = await import("@tauri-apps/plugin-process");
-        await relaunch();
-      } else {
+    const result = await runUpdateCheck({ source: "manual" });
+    switch (result.kind) {
+      case "installed":
+      case "already-installed":
+        // Banner is now (or was already) visible; clear any sidebar status.
+        setUpdateStatus("idle");
+        break;
+      case "no-update":
         setUpdateStatus("upToDate");
         setTimeout(() => setUpdateStatus("idle"), 3000);
+        break;
+      case "error": {
+        const msg = result.error instanceof Error ? result.error.message : String(result.error);
+        setErrorDetail(msg);
+        setUpdateStatus("error");
+        setTimeout(() => {
+          setUpdateStatus("idle");
+          setErrorDetail(null);
+        }, 8000);
+        break;
       }
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setErrorDetail(msg);
-      setUpdateStatus("error");
-      setTimeout(() => { setUpdateStatus("idle"); setErrorDetail(null); }, 8000);
+      case "debounced":
+        // Manual source never returns 'debounced' from the helper, but
+        // the discriminated union forces us to handle it. Reset to idle.
+        setUpdateStatus("idle");
+        break;
     }
   }, []);
 
-  // Note: silent auto-check on boot was removed. It would silently call relaunch()
-  // when an update was found, causing the dev binary to vanish without warning.
-  // Updates now run only when the user clicks "Check for updates" below.
-
   const updateLabel =
     updateStatus === "checking" ? "Checking…" :
-    updateStatus === "downloading" ? "Downloading update…" :
     updateStatus === "upToDate" ? "Up to date" :
     updateStatus === "error" ? (errorDetail ? `Error: ${errorDetail}` : "Update check failed") :
     "Check for updates";
@@ -92,7 +108,7 @@ export function Sidebar({ projects, selectedId, onSelect, onNewProject, onOpenSe
           type="button"
           className={styles.updateBtn}
           onClick={checkForUpdates}
-          disabled={updateStatus === "checking" || updateStatus === "downloading"}
+          disabled={updateStatus === "checking"}
         >
           {updateLabel}
         </button>
