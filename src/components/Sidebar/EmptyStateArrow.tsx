@@ -23,18 +23,18 @@ export function EmptyStateArrow() {
   return (
     <svg
       className={styles.arrow}
-      width="180"
-      height="360"
+      width="160"
+      height="320"
       viewBox="0 0 200 400"
       fill="none"
       stroke="currentColor"
-      strokeWidth="1.5"
+      strokeWidth="2.25"
       strokeLinecap="round"
       strokeLinejoin="round"
       aria-hidden="true"
     >
-      <path d="M 140 80 Q 80 200, 100 280 T 40 380" />
-      <path d="M 29 365 L 40 380 L 52 367" />
+      <path d="M 160 60 Q 70 170, 95 290 T 48 365" />
+      <path d="M 22 340 L 48 365 L 72 332" />
     </svg>
   );
 }
