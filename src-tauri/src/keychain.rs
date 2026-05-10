@@ -17,14 +17,8 @@
 //! Earlier versions stored an Anthropic key under `anthropic-api-key`;
 //! we don't migrate it because the keys are not interchangeable.
 //!
-//! v0.5.37 — the Gemini API key itself is now baked into the binary
-//! (see `gemini.rs::HARDCODED_GEMINI_API_KEY`) for the closed beta.
-//! The `set_gemini_key` / `get_gemini_key` / `has_gemini_key` /
-//! `clear_gemini_key` Tauri commands are still wired up so the
-//! frontend's back-compat callsites keep compiling, and so users
-//! upgrading from earlier versions can still clean up their old
-//! keychain entry if they want to. The detection path no longer
-//! calls `read_api_key`.
+//! Gemini API keys live in the keychain (`gemini-api-key`). Use
+//! Settings → Gemini to set or rotate; never commit keys to git.
 
 use keyring::Entry;
 
@@ -72,11 +66,7 @@ fn delete_secret(account: &str) -> Result<(), String> {
 // Gemini API key
 // ---------------------------------------------------------------------------
 
-/// Internal helper that used to feed the Gemini command. As of
-/// v0.5.37 the Gemini key is baked into the binary, so this is only
-/// retained for diagnostic / cleanup tooling. Marked `#[allow(dead_code)]`
-/// so the unused-function lint stays quiet on production builds.
-#[allow(dead_code)]
+/// Read the Gemini API key for `gemini.rs` detection commands.
 pub fn read_api_key() -> Option<String> {
     read_secret(GEMINI_ACCOUNT)
 }

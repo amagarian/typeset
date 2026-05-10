@@ -522,12 +522,9 @@ function MainApp() {
     [updateDocumentInProject, projects]
   );
 
-  // v0.5.37 — the Gemini API key is now baked into the binary so the
-  // "is the user configured?" gate is unconditionally satisfied.
-  // Keeping the wrapper (rather than deleting it) so the existing
-  // call sites stay readable as "we're about to spend an API call".
   const ensureClaudeConfigured = useCallback(async (): Promise<boolean> => {
-    return true;
+    const { hasApiKey } = await import("@/services/geminiClient");
+    return await hasApiKey();
   }, []);
 
   const processDroppedPdf = useCallback(
@@ -717,9 +714,8 @@ function MainApp() {
         console.warn("[Typeset] Registry lookup failed; falling back to Gemini:", err);
       }
 
-      // Step 2: nothing in cache or registry — fall straight through
-      // to Gemini detection. v0.5.37 bakes the API key into the
-      // binary, so there's no "configured?" gate anymore.
+      // Step 2: nothing in cache or registry — Gemini detection (unless
+      // AcroForm already satisfied the doc). Requires a key in Settings.
 
       // Step 3: Gemini detection.
       const setDocProcessing = (msg: string, progress?: number) => {
@@ -769,6 +765,15 @@ function MainApp() {
 
       try {
         if (!acroformDetectionUsed) {
+          const configured = await ensureClaudeConfigured();
+          if (!configured) {
+            if (!options.silentToasts) {
+              showToast("Add a Gemini API key in Settings (⌘,) to detect fields.", "info");
+            }
+            setSettingsOpen(true);
+            updateDocumentInProject(effectiveProjectId, docId, { status: "pending" });
+            return "no-key";
+          }
           detectedFields = await detectFieldsWithClaude(bytes, 1, setDocProcessing, {
             projectHint: effectiveProject,
             filename: file.name,
@@ -836,9 +841,11 @@ function MainApp() {
     [
       addDocumentToProject,
       autoFillDocument,
+      ensureClaudeConfigured,
       projects,
       selectedProject,
       selectedProjectId,
+      setSettingsOpen,
       showToast,
       updateDocumentInProject,
     ]

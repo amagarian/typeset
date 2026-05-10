@@ -1,27 +1,14 @@
 /**
- * Locked Gemini runtime settings.
+ * Locked Gemini runtime settings (model + accuracy).
  *
- * Up to v0.5.36 these were user-tunable: the renderer persisted a
- * `model` string and an `accuracy` mode in localStorage and the
- * SettingsModal exposed both as form controls. v0.5.37 strips that
- * configurability surface — beta testers get a single, paved-path
- * experience: drop a PDF, get fields back. The values are baked in
- * here so any remaining call site (the detector, the project-import
- * helper, the DocumentList progress estimator) keeps compiling
- * without spreading the constants around the codebase.
+ * The API key is stored in the OS keychain via Settings (v0.6.2+).
+ * Model and accuracy stay fixed here so every call site shares one id.
  */
 
 /**
- * Locked Gemini model id for v0.5.37+.
+ * Locked Gemini model id.
  *
- * Picks the cheapest tier (Flash-Lite) on the assumption that the
- * user (Aiden) is paying for every detection during the closed beta.
- * The 3.x generation's spatial reasoning is a noticeable lift over
- * 2.5, and Flash-Lite still delivers usable bbox precision on the
- * production-paperwork forms Typeset is calibrated for.
- *
- * The string matches the existing `gemini-3.1-flash-lite` preset id
- * from the v0.5.36 model dropdown; no API-side change is needed.
+ * Flash-Lite tier for cost/latency; spatial calibration targets production paperwork.
  */
 export const LOCKED_MODEL = "gemini-3.1-flash-lite";
 

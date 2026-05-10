@@ -93,6 +93,16 @@
   line-height: 1.45;
 }
 
+.inlineLink {
+  color: var(--text);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.inlineLink:hover {
+  color: var(--border-focus);
+}
+
 .input,
 .select {
   width: 100%;

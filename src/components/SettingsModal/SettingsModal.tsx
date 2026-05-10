@@ -2,6 +2,13 @@ import { useEffect, useState, useCallback, useRef } from "react";
 import { writeLocalTemplates } from "@/services/templateCache";
 import { isUpdateInstalled, runUpdateCheck } from "@/utils/autoUpdate";
 import { useAuth, useAuthEvents } from "@/hooks/useAuth";
+import {
+  hasApiKey,
+  setApiKey,
+  clearApiKey,
+  testGeminiConnection,
+} from "@/services/geminiClient";
+import { LOCKED_MODEL } from "@/services/geminiSettings";
 import packageJson from "../../../package.json";
 import styles from "./SettingsModal.module.css";
 
@@ -20,12 +27,8 @@ interface SettingsModalProps {
 /**
  * Settings panel.
  *
- * v0.5.37 strips the entire Gemini configuration surface — the API
- * key is baked into the binary (see `src-tauri/src/gemini.rs`) and
- * the model + accuracy mode are locked to "Gemini 3.1 Flash-Lite"
- * single-pass detection (see `src/services/geminiSettings.ts`). Beta
- * testers don't have to provision anything; what's left here is just
- * Account, Local data, and the About footer.
+ * Gemini: API key in macOS keychain (v0.6.2+). Model and accuracy stay
+ * locked in `geminiSettings.ts`. Account, local data, About unchanged.
  *
  * Since v0.5.9 the public template registry is a passive,
  * fingerprint-driven backend with no UI surface here. Drop a PDF
@@ -72,6 +75,12 @@ export function SettingsModal({
   // started from the same panel; only one should ever be in flight.
   const [applePending, setApplePending] = useState(false);
 
+  const [geminiHasKey, setGeminiHasKey] = useState(false);
+  const [geminiKeyInput, setGeminiKeyInput] = useState("");
+  const [geminiBusy, setGeminiBusy] = useState(false);
+  const [geminiError, setGeminiError] = useState<string | null>(null);
+  const [geminiOk, setGeminiOk] = useState<string | null>(null);
+
   // Bubble verifyOtp / token-rejected errors into the modal as toast-
   // style copy. Local state (not the global Toast) because the modal
   // is the user's current focus — they need feedback at the action
@@ -97,6 +106,10 @@ export function SettingsModal({
     setEmailInput("");
     setSignInStatus("idle");
     setSignInError(null);
+    setGeminiKeyInput("");
+    setGeminiError(null);
+    setGeminiOk(null);
+    void hasApiKey().then(setGeminiHasKey);
   }, [open]);
 
   useEffect(() => {
@@ -195,6 +208,57 @@ export function SettingsModal({
     }
   }, [signOut]);
 
+  const handleSaveGeminiKey = useCallback(async () => {
+    const key = geminiKeyInput.trim();
+    if (!key) return;
+    setGeminiBusy(true);
+    setGeminiError(null);
+    setGeminiOk(null);
+    try {
+      await setApiKey(key);
+      setGeminiHasKey(true);
+      setGeminiKeyInput("");
+      setGeminiOk("API key saved to your keychain.");
+      window.setTimeout(() => setGeminiOk(null), 4000);
+    } catch (err) {
+      setGeminiError(err instanceof Error ? err.message : "Couldn't save the key.");
+    } finally {
+      setGeminiBusy(false);
+    }
+  }, [geminiKeyInput]);
+
+  const handleClearGeminiKey = useCallback(async () => {
+    setGeminiBusy(true);
+    setGeminiError(null);
+    setGeminiOk(null);
+    try {
+      await clearApiKey();
+      setGeminiHasKey(false);
+      setGeminiKeyInput("");
+      setGeminiOk("API key removed.");
+      window.setTimeout(() => setGeminiOk(null), 3000);
+    } catch (err) {
+      setGeminiError(err instanceof Error ? err.message : "Couldn't remove the key.");
+    } finally {
+      setGeminiBusy(false);
+    }
+  }, []);
+
+  const handleTestGemini = useCallback(async () => {
+    setGeminiBusy(true);
+    setGeminiError(null);
+    setGeminiOk(null);
+    try {
+      await testGeminiConnection(LOCKED_MODEL);
+      setGeminiOk("Connection OK.");
+      window.setTimeout(() => setGeminiOk(null), 4000);
+    } catch (err) {
+      setGeminiError(err instanceof Error ? err.message : "Connection failed.");
+    } finally {
+      setGeminiBusy(false);
+    }
+  }, []);
+
   const handleResetLocalTemplates = useCallback(() => {
     writeLocalTemplates([]);
     setResetConfirming(false);
@@ -232,6 +296,71 @@ export function SettingsModal({
         </header>
 
         <div className={styles.body}>
+          <div className={styles.section}>
+            <span className={styles.label}>Gemini</span>
+            <p className={styles.helpText}>
+              Field detection uses the Gemini API. Create a key in{" "}
+              <a
+                href="https://aistudio.google.com/apikey"
+                target="_blank"
+                rel="noreferrer"
+                className={styles.inlineLink}
+              >
+                Google AI Studio
+              </a>
+              . It is stored in your macOS keychain only.
+            </p>
+            {geminiHasKey && (
+              <p className={styles.helpText}>A key is on file. Paste below to replace it.</p>
+            )}
+            <input
+              type="password"
+              className={styles.input}
+              placeholder={geminiHasKey ? "New API key (optional)" : "Paste API key"}
+              value={geminiKeyInput}
+              onChange={(e) => setGeminiKeyInput(e.target.value)}
+              autoComplete="off"
+              spellCheck={false}
+              disabled={geminiBusy}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && geminiKeyInput.trim() && !geminiBusy) {
+                  e.preventDefault();
+                  void handleSaveGeminiKey();
+                }
+              }}
+            />
+            <div className={styles.inputRow}>
+              <button
+                type="button"
+                className={styles.signInBtn}
+                disabled={geminiBusy || !geminiKeyInput.trim()}
+                onClick={() => void handleSaveGeminiKey()}
+              >
+                {geminiBusy ? "Saving…" : "Save key"}
+              </button>
+              <button
+                type="button"
+                className={styles.testBtn}
+                disabled={geminiBusy || !geminiHasKey}
+                onClick={() => void handleTestGemini()}
+              >
+                Test connection
+              </button>
+              <button
+                type="button"
+                className={styles.clearBtn}
+                disabled={geminiBusy || !geminiHasKey}
+                onClick={() => void handleClearGeminiKey()}
+              >
+                Remove key
+              </button>
+            </div>
+            {geminiError && (
+              <span className={styles.statusError}>{geminiError}</span>
+            )}
+            {geminiOk && <span className={styles.statusOk}>{geminiOk}</span>}
+          </div>
+
           {/*
             v0.5.35 — Account section.
 
