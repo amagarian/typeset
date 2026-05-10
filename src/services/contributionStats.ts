@@ -47,6 +47,7 @@
 
 import { getRegistryClient } from "./templateRegistry";
 import { getDeviceId } from "./deviceId";
+import { getAuthClient } from "./authClient";
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -189,17 +190,44 @@ async function fetchFromServer(): Promise<ContributionStats> {
   const client = getRegistryClient();
   const deviceId = getDeviceId();
 
-  // Pull the rows owned by this device, newest first. We fetch a
-  // bounded set rather than a count-only RPC so the popover has the
-  // submission detail it needs without a second round-trip — at the
-  // cardinalities we're targeting (single-digit hundreds maximum
-  // per device) the payload is trivial.
-  const { data, error } = await client
+  // v0.5.35 — when signed in, the user's contributions span both
+  // (a) legacy rows still keyed only on `publisher_device_id` from
+  // this or any other device they used pre-sign-in (the
+  // `link_anonymous_device` RPC will have stamped them with their
+  // user_id at sign-in time, but we OR on device_id too so a
+  // pending sign-in or a missed RPC call doesn't drop the count to
+  // zero), and (b) all rows where `user_id` matches their auth uid.
+  //
+  // For anonymous users (no session) we keep the device-only filter
+  // — `or` on a missing field would 400 the request, so we branch
+  // explicitly.
+  let userId: string | null = null;
+  try {
+    const { data } = await getAuthClient().auth.getSession();
+    userId = data.session?.user.id ?? null;
+  } catch {
+    /* no auth client available (web preview) */
+  }
+
+  let query = client
     .from("template_submissions")
     .select("id, name, fingerprint_hash, created_at")
-    .eq("publisher_device_id", deviceId)
     .order("created_at", { ascending: false })
     .limit(200);
+
+  if (userId) {
+    // PostgREST `.or()` syntax — comma-separated leaf filters,
+    // wrapped in parens for grouping. We escape the device id /
+    // user id as quoted strings to be safe even though both are
+    // UUID-shaped today.
+    query = query.or(
+      `publisher_device_id.eq."${deviceId}",user_id.eq."${userId}"`
+    );
+  } else {
+    query = query.eq("publisher_device_id", deviceId);
+  }
+
+  const { data, error } = await query;
 
   if (error) throw error;
 
@@ -207,7 +235,10 @@ async function fetchFromServer(): Promise<ContributionStats> {
 
   // Dedupe by fingerprint_hash, preserving the newest row per group.
   // Rows are already ordered desc by created_at so the first time we
-  // see a fingerprint is the row we want to keep.
+  // see a fingerprint is the row we want to keep. (Same fingerprint
+  // could legitimately appear twice when a row published anonymously
+  // on this device and a row published from another device under the
+  // user's account both match — we still only count the form once.)
   const seen = new Set<string>();
   const submissions: ContributionSubmission[] = [];
   for (const row of rows) {

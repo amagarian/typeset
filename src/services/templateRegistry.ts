@@ -32,6 +32,7 @@
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Template, TemplateField, TemplateFingerprint } from "@/types";
 import { getDeviceId } from "./deviceId";
+import { getAuthClient } from "./authClient";
 import { scoreFingerprintMatch } from "@/utils/templateFingerprint";
 
 // ---------------------------------------------------------------------------
@@ -68,17 +69,72 @@ function buildClient(): SupabaseClient {
   // to gate UPDATE / DELETE on template_submissions and ownership of
   // votes/flags. We set it once on the client and let supabase-js
   // attach it to every request automatically.
+  //
+  // v0.5.35 — additional `Authorization: Bearer <access_token>`
+  // header is attached at request time (not here) via a custom
+  // fetch wrapper. We can't bake the access token in at construction
+  // because (a) the auth client may not have hydrated yet and (b)
+  // the token rotates on refresh. The wrapper reads
+  // `getAuthClient().auth.getSession()` per-request — supabase-js
+  // serves that out of memory after the first hydrate, so the
+  // overhead is negligible (no network round-trip).
   return createClient(REGISTRY_URL, REGISTRY_KEY, {
     global: {
       headers: {
         "x-device-id": getDeviceId(),
       },
+      fetch: registryFetch,
     },
     auth: {
       persistSession: false,
       autoRefreshToken: false,
     },
   });
+}
+
+/**
+ * Custom fetch wrapper: add `Authorization: Bearer <token>` when an
+ * auth session exists, otherwise fall through to the publishable
+ * key + device id auth surface (which is enough for anonymous read
+ * + device-bound write under the existing RLS).
+ *
+ * Anonymous-friendly: if `getAuthClient().auth.getSession()`
+ * resolves to null (signed-out user, or web preview) we just
+ * return the original request unmodified.
+ */
+async function registryFetch(
+  input: Request | URL | string,
+  init?: RequestInit
+): Promise<Response> {
+  let session = null;
+  try {
+    const auth = getAuthClient();
+    const { data } = await auth.auth.getSession();
+    session = data.session;
+  } catch {
+    // If the auth client isn't available (test, web preview, etc.)
+    // we proceed with the anonymous request — the registry has
+    // always supported that and continues to in v0.5.35.
+  }
+
+  if (!session) {
+    return fetch(input, init);
+  }
+
+  // Merge an Authorization header on top of whatever supabase-js
+  // already wrote (which is `apikey: <publishable>` and our
+  // `x-device-id`). Authorization wins server-side: when present,
+  // RLS evaluates `auth.uid()` from the JWT instead of the
+  // anonymous role. We keep `x-device-id` so legacy device-bound
+  // policies (like `votes` / `flags` in the original schema) keep
+  // working.
+  const merged = new Headers(init?.headers);
+  // Don't clobber a caller-supplied Authorization header — they
+  // probably know better than we do (e.g. a service-role one-off).
+  if (!merged.has("Authorization")) {
+    merged.set("Authorization", `Bearer ${session.access_token}`);
+  }
+  return fetch(input, { ...init, headers: merged });
 }
 
 /**
@@ -376,9 +432,17 @@ export async function publishTemplateAuto(
     return { updated: true, id: data.id, registryRow: rowToTemplate(data) };
   }
 
+  // v0.5.35 — when signed in, stamp the row with `user_id` so
+  // (a) the contribution count includes user-attributed rows from
+  // any device, not just this device id, and (b) the new RLS
+  // policies can authorise UPDATE / DELETE by user_id without
+  // requiring the original device id. Anonymous users (no session)
+  // skip this and the row stays device-bound, exactly as today.
+  const userId = await getCurrentUserIdForRegistry();
   const insertPayload = {
     ...payload,
     publisher_device_id: deviceId,
+    ...(userId ? { user_id: userId } : {}),
   };
   const { data, error } = await client
     .from(SUBMISSIONS_TABLE)
@@ -388,6 +452,15 @@ export async function publishTemplateAuto(
   if (error) throw new Error(`Publish failed: ${error.message}`);
   if (!data) throw new Error("Publish failed: empty response.");
   return { created: true, id: data.id, registryRow: rowToTemplate(data) };
+}
+
+async function getCurrentUserIdForRegistry(): Promise<string | null> {
+  try {
+    const { data } = await getAuthClient().auth.getSession();
+    return data.session?.user.id ?? null;
+  } catch {
+    return null;
+  }
 }
 
 /** Delete a template you own. RLS enforces ownership. */
