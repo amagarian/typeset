@@ -21,6 +21,7 @@
     "fs:allow-read-file",
     "fs:allow-write-file",
     "fs:allow-exists",
+    "deep-link:default",
     {
       "identifier": "fs:scope",
       "allow": [

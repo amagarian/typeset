@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  v0.5.35 — partial Info.plist merged into the bundled Info.plist by
+  Tauri's macOS bundler (Tauri v2 looks for `Info.plist` next to
+  `tauri.conf.json` automatically).
+
+  Only purpose: register the `typeset://` URL scheme so Supabase
+  magic-link callbacks of the form
+  `typeset://auth/callback?token_hash=…&type=magiclink` are routed
+  back into the running Typeset app via tauri-plugin-deep-link.
+
+  CFBundleURLName intentionally distinct from the app bundle id
+  (`com.typeset.app`) so a future second URL family (e.g. tokenless
+  `typeset://open/<projectId>` deeplinks) can be registered as a
+  sibling type without disturbing this one.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>app.typeset.auth</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>typeset</string>
+            </array>
+        </dict>
+    </array>
+</dict>
+</plist>

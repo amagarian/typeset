@@ -13,6 +13,7 @@
     "@pdf-lib/fontkit": "^1.1.1",
     "@supabase/supabase-js": "^2.105.4",
     "@tauri-apps/api": "^2.0.0",
+    "@tauri-apps/plugin-deep-link": "^2.4.9",
     "@tauri-apps/plugin-dialog": "^2.6.0",
     "@tauri-apps/plugin-fs": "^2.4.5",
     "@tauri-apps/plugin-notification": "^2.3.3",

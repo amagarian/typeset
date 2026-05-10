@@ -332,3 +332,104 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
+/*
+ * v0.5.35 — Account section. Sign-in / signed-in state for the
+ * Supabase magic-link flow. Visually quieter than the Gemini /
+ * Model / Accuracy sections above it (no nested input row chrome,
+ * no radio cards) — the section is a status surface, not a
+ * configuration surface.
+ */
+.accountState {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.accountEmail {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  word-break: break-all;
+}
+
+.accountStatusLine {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.45;
+}
+
+.accountActions {
+  display: flex;
+  gap: 6px;
+  margin-top: 4px;
+}
+
+.signInBtn {
+  padding: 7px 14px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--bg-panel);
+  background: var(--text);
+  border: none;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.signInBtn:hover:not(:disabled) {
+  opacity: 0.85;
+}
+
+.signInBtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.signOutBtn {
+  padding: 7px 14px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+}
+
+.signOutBtn:hover:not(:disabled) {
+  background: var(--bg-input);
+  border-color: var(--border-focus);
+}
+
+.signOutBtn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+/*
+ * "Check your email" empty-state shown after a magic link is
+ * dispatched. We deliberately stay in the modal rather than
+ * closing it — the user is mid-task (sign in) and the modal
+ * itself is the state surface.
+ */
+.checkEmailNote {
+  font-size: 12px;
+  color: var(--text);
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  line-height: 1.5;
+}
+
+.checkEmailNote strong {
+  font-weight: 500;
+}
+
+.syncDisclosure {
+  font-size: 10.5px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin: 0;
+}

@@ -23,6 +23,12 @@ serde_json = "1"
 serde = { version = "1", features = ["derive"] }
 tauri-plugin-notification = "2.3.3"
 
+# v0.5.35 — magic-link auth callbacks. Supabase emails the user a link
+# of the form `typeset://auth/callback?token_hash=…&type=magiclink`,
+# the OS hands it to the running app via this plugin, and we forward
+# the URL to the React layer as a Tauri event.
+tauri-plugin-deep-link = "2"
+
 # Google Gemini integration. We talk to the public Generative Language
 # API directly (no Vertex SDK) so the only third-party deps are an HTTP
 # client (reqwest), the keychain wrapper for the API key, base64 for

@@ -1,12 +1,21 @@
+mod auth;
 mod gemini;
 mod keychain;
 mod projects;
+mod sync;
+
+use tauri::Emitter;
 
 #[cfg(target_os = "macos")]
-use tauri::{
-    menu::{AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder},
-    Emitter,
-};
+use tauri::menu::{AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
+
+/// v0.5.35 — Tauri event emitted whenever the OS hands us a deep
+/// link (e.g. `typeset://auth/callback?token_hash=…&type=magiclink`).
+/// The frontend `authClient` listens for this and feeds the URL
+/// into `supabase.auth.verifyOtp(...)` to complete the magic-link
+/// sign-in handshake. Centralised so the Rust emit and the TS
+/// listener can't drift.
+const DEEP_LINK_EVENT: &str = "deep-link:url";
 
 /// v0.5.27 — menu item id for the Settings entry under the app
 /// submenu. Bound to the standard macOS shortcut (`Cmd+,`) and
@@ -20,6 +29,9 @@ const SETTINGS_MENU_ID: &str = "menu-settings";
 #[cfg(target_os = "macos")]
 const SETTINGS_EVENT: &str = "menu:open-settings";
 
+use tauri::Manager;
+use tauri_plugin_deep_link::DeepLinkExt;
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -29,6 +41,7 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_deep_link::init())
         .invoke_handler(tauri::generate_handler![
             keychain::set_gemini_key,
             keychain::get_gemini_key,
@@ -39,8 +52,52 @@ pub fn run() {
             gemini::gemini_test_connection,
             projects::read_projects,
             projects::write_projects,
+            auth::auth_save_session,
+            auth::auth_load_session,
+            auth::auth_clear_session,
+            sync::sync_save_key,
+            sync::sync_load_key,
+            sync::sync_clear_key,
         ])
         .setup(|app| {
+            // v0.5.35 — magic-link callbacks.
+            //
+            // Supabase emails the user a link of the form
+            // `typeset://auth/callback?token_hash=…&type=magiclink`.
+            // macOS hands the URL to `tauri-plugin-deep-link` which
+            // fires this callback. We forward each URL to the
+            // renderer as a `deep-link:url` event, then surface the
+            // main window so the user lands on the open SettingsModal
+            // and can see the "Signed in" state instead of an
+            // already-completed flow they never saw. The renderer
+            // listener (services/authClient.ts) does the actual
+            // verifyOtp + session persistence.
+            //
+            // The OnOpenUrl callback also fires for cold-start deep
+            // links — `getCurrent()` from the JS side is what handles
+            // that on the renderer's side, since the listener won't
+            // be attached yet at the moment the URL arrives. So this
+            // emit is the warm-start path; the cold-start path is
+            // handled in TS via `getCurrent()`.
+            let app_handle_for_deep_link = app.handle().clone();
+            app.deep_link().on_open_url(move |event| {
+                let urls: Vec<String> = event
+                    .urls()
+                    .iter()
+                    .map(|url| url.to_string())
+                    .collect();
+                if urls.is_empty() {
+                    return;
+                }
+                if let Some(window) = app_handle_for_deep_link.get_webview_window("main") {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                    let _ = window.unminimize();
+                }
+                if let Err(err) = app_handle_for_deep_link.emit(DEEP_LINK_EVENT, urls) {
+                    eprintln!("[Typeset] failed to emit deep link event: {err}");
+                }
+            });
             // v0.5.27 — first pass at native macOS menu wiring.
             //
             // Up to v0.5.26 the app shipped without a custom menu, so

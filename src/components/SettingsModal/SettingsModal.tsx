@@ -19,6 +19,7 @@ import {
 } from "@/services/geminiSettings";
 import { writeLocalTemplates } from "@/services/templateCache";
 import { isUpdateInstalled, runUpdateCheck } from "@/utils/autoUpdate";
+import { useAuth, useAuthEvents } from "@/hooks/useAuth";
 import packageJson from "../../../package.json";
 import styles from "./SettingsModal.module.css";
 
@@ -78,6 +79,34 @@ export function SettingsModal({
   >("idle");
   const [updateError, setUpdateError] = useState<string | null>(null);
 
+  // v0.5.35 — magic-link auth state. `isLoading` only matters on
+  // cold start; once we know whether the user is signed in we
+  // render the corresponding section. The two locally-tracked
+  // statuses (`signInPending` and `signInError`) are scoped to
+  // the in-modal flow — they live and die with the modal close.
+  const { user, isSignedIn, signIn, signOut, isLoading: authLoading } = useAuth();
+  const [emailInput, setEmailInput] = useState("");
+  const [signInStatus, setSignInStatus] = useState<
+    "idle" | "sending" | "sent" | "error"
+  >("idle");
+  const [signInError, setSignInError] = useState<string | null>(null);
+  const [signOutPending, setSignOutPending] = useState(false);
+
+  // Bubble verifyOtp / token-rejected errors into the modal as toast-
+  // style copy. Local state (not the global Toast) because the modal
+  // is the user's current focus — they need feedback at the action
+  // surface, not a corner.
+  useAuthEvents((event) => {
+    if (event.kind === "error") {
+      setSignInError(event.message);
+      setSignInStatus("error");
+    } else if (event.kind === "signed-in") {
+      setSignInStatus("idle");
+      setSignInError(null);
+      setEmailInput("");
+    }
+  });
+
   useEffect(() => {
     if (!open) return;
     let cancelled = false;
@@ -101,6 +130,12 @@ export function SettingsModal({
       setSaveError(null);
       setResetConfirming(false);
       setResetStatus(null);
+      // v0.5.35 — reset the in-modal auth flow state every time the
+      // modal opens so the previous "Check your email" panel
+      // doesn't linger across opens.
+      setEmailInput("");
+      setSignInStatus("idle");
+      setSignInError(null);
     })();
     return () => {
       cancelled = true;
@@ -194,6 +229,32 @@ export function SettingsModal({
         break;
     }
   }, []);
+
+  const handleSendMagicLink = useCallback(async () => {
+    const email = emailInput.trim();
+    if (!email) return;
+    setSignInStatus("sending");
+    setSignInError(null);
+    try {
+      await signIn(email);
+      setSignInStatus("sent");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Couldn't send the link.";
+      setSignInError(message);
+      setSignInStatus("error");
+    }
+  }, [emailInput, signIn]);
+
+  const handleSignOut = useCallback(async () => {
+    setSignOutPending(true);
+    try {
+      await signOut();
+    } catch (err) {
+      console.warn("[Settings] sign-out failed:", err);
+    } finally {
+      setSignOutPending(false);
+    }
+  }, [signOut]);
 
   const handleResetLocalTemplates = useCallback(() => {
     writeLocalTemplates([]);
@@ -362,6 +423,129 @@ export function SettingsModal({
           </div>
 
           {saveError && <span className={styles.statusError}>{saveError}</span>}
+
+          {/*
+            v0.5.35 — Account section.
+
+            States:
+              1. authLoading: render nothing (cold-start hydration in
+                 flight; we're about to know which side of the fence
+                 we're on, so flashing "Sign in" first is a worse UX
+                 than a brief blank).
+              2. !isSignedIn && status !== "sent": email input +
+                 "Send magic link" button.
+              3. !isSignedIn && status === "sent": "Check your email"
+                 confirmation. The user clicks the link in their email,
+                 which deep-links back into the app and flips
+                 isSignedIn → true via the auth state subscription.
+              4. isSignedIn: email + "Sign out" button.
+          */}
+          {!authLoading && (
+            <div className={styles.section}>
+              <span className={styles.label}>Account</span>
+
+              {!isSignedIn && signInStatus !== "sent" && (
+                <>
+                  <p className={styles.helpText}>
+                    Sign in with your email to sync projects across
+                    devices and keep your community contributions
+                    attributed when you switch machines. We&apos;ll send a
+                    one-time magic link — no password.
+                  </p>
+                  <input
+                    type="email"
+                    className={styles.input}
+                    placeholder="you@studio.com"
+                    value={emailInput}
+                    onChange={(e) => setEmailInput(e.target.value)}
+                    autoComplete="email"
+                    spellCheck={false}
+                    onKeyDown={(e) => {
+                      if (
+                        e.key === "Enter" &&
+                        emailInput.trim().length > 0 &&
+                        signInStatus !== "sending"
+                      ) {
+                        e.preventDefault();
+                        void handleSendMagicLink();
+                      }
+                    }}
+                  />
+                  <div className={styles.accountActions}>
+                    <button
+                      type="button"
+                      className={styles.signInBtn}
+                      onClick={handleSendMagicLink}
+                      disabled={
+                        emailInput.trim().length === 0 ||
+                        signInStatus === "sending"
+                      }
+                    >
+                      {signInStatus === "sending"
+                        ? "Sending…"
+                        : "Send magic link"}
+                    </button>
+                  </div>
+                  {signInStatus === "error" && signInError && (
+                    <span className={styles.statusError}>{signInError}</span>
+                  )}
+                  <p className={styles.syncDisclosure}>
+                    Project data is encrypted on your device before
+                    upload (AES-256-GCM). The encryption key is stored
+                    in your account so you can decrypt on a fresh
+                    device — Supabase, our backend, has theoretical
+                    access to that key. A future update will offer an
+                    optional passphrase for full zero-knowledge sync.
+                  </p>
+                </>
+              )}
+
+              {!isSignedIn && signInStatus === "sent" && (
+                <>
+                  <p className={styles.checkEmailNote}>
+                    Check your email — we sent a sign-in link to{" "}
+                    <strong>{emailInput.trim()}</strong>. Click the
+                    link in the message and Typeset will pick it up
+                    automatically.
+                  </p>
+                  <div className={styles.accountActions}>
+                    <button
+                      type="button"
+                      className={styles.signOutBtn}
+                      onClick={() => {
+                        setSignInStatus("idle");
+                        setSignInError(null);
+                      }}
+                    >
+                      Use a different email
+                    </button>
+                  </div>
+                </>
+              )}
+
+              {isSignedIn && user && (
+                <>
+                  <span className={styles.accountEmail}>
+                    {user.email ?? "(no email on file)"}
+                  </span>
+                  <span className={styles.accountStatusLine}>
+                    Signed in. Projects sync to your account; community
+                    submissions are attributed to you.
+                  </span>
+                  <div className={styles.accountActions}>
+                    <button
+                      type="button"
+                      className={styles.signOutBtn}
+                      onClick={handleSignOut}
+                      disabled={signOutPending}
+                    >
+                      {signOutPending ? "Signing out…" : "Sign out"}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+          )}
 
           <div className={styles.section}>
             <span className={styles.label}>Local data</span>
