@@ -44,19 +44,18 @@
 }
 
 /*
- * v0.5.29 — icon-only "+" trigger. Lives at the bottom-left of
- * the sidebar where Settings used to sit. The button itself is
- * still the container (no wrapping `.footer` panel, no nested
- * border). A single top hairline divides it from the project
- * list above. Difference from v0.5.27: the "New project"
- * word-mark is dropped, the glyph is centered on both axes,
- * and the *primary* visual feedback on hover is the row-wide
- * background fade — not the icon color. Background still fades
- * to var(--bg-input), the same surface the Import-from-PDF
- * button paints, so the two CTAs read from the same design
- * system. Color tightens to var(--text) on hover as a subtle
- * secondary cue (mirrors Import-from-PDF) but the bg fill is
- * what the eye lands on.
+ * v0.5.30 — icon-only "+" trigger at the bottom-left of the
+ * sidebar (where Settings used to sit). The button itself is
+ * the container (no wrapping `.footer` panel, no nested
+ * border); a single top hairline divides it from the project
+ * list above. Hover/focus feedback is *only* the row-wide
+ * background fade to var(--bg-input) — the same surface the
+ * Import-from-PDF button paints, so the two CTAs read from the
+ * same design system. The glyph color is intentionally held at
+ * var(--text-muted) in every state: v0.5.29 also tinted the
+ * icon to var(--text) on hover via inheritance, which read as a
+ * second, distracting animation. Keeping the icon static makes
+ * the background-only fade the single, clear affordance.
  */
 .newProjectBtn {
   display: flex;
@@ -70,17 +69,15 @@
   border-top: 1px solid var(--border);
   border-radius: 0;
   cursor: pointer;
-  transition: color 0.15s, background-color 0.15s ease;
+  transition: background-color 0.15s ease;
 }
 
 .newProjectBtn:hover {
-  color: var(--text);
   background-color: var(--bg-input);
 }
 
 .newProjectBtn:focus-visible {
   outline: none;
-  color: var(--text);
   background-color: var(--bg-input);
 }
 
