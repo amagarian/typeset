@@ -2749,26 +2749,35 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
     const overlapIdx = result.findIndex((existing) => {
       if (existing.pageNumber !== field.pageNumber) return false;
       const iou = bboxIoU(existing, field);
-      // v0.6.8 — thresholds tightened after another regression where a
-      // `creditCardHolder` bbox landed just shy of the previous
-      // 0.25-IoU same-fieldType bar but still painted over the
-      // `creditCardNumber` underline. Now ANY two text bboxes on the
-      // same page with IoU ≥ 0.15 (or one mostly-inside the other) get
-      // collapsed regardless of canonical id, with the larger-area
-      // survivor kept. Cross-fieldType (text vs checkbox, etc.) still
-      // requires the stricter 0.5/0.7 bar so we don't fuse a checkbox
-      // sitting on top of a text-field underline.
-      if (iou >= 0.5) return true;
       const containAB = bboxContainment(existing, field);
       const containBA = bboxContainment(field, existing);
+
+      // Strong, type-agnostic overlap → always dedupe.
+      if (iou >= 0.5) return true;
       if (Math.max(containAB, containBA) >= 0.5) return true;
-      if (existing.fieldType === field.fieldType && iou >= 0.15) return true;
-      if (
-        existing.fieldType === field.fieldType &&
-        Math.max(containAB, containBA) >= 0.35
-      ) {
-        return true;
+
+      const sameType = existing.fieldType === field.fieldType;
+
+      // v0.6.9 — aggressive same-row, same-type guard. If two text
+      // (or two checkbox / two option-group) fields share a horizontal
+      // band — vertical centres within 8pt AND any horizontal bbox
+      // overlap — they're almost always two model interpretations of
+      // the same writable line. Two fills on the same row produce the
+      // CC overlay we keep regressing on (creditCardHolder bbox
+      // landing on the creditCardNumber underline at IoU just under
+      // the previous 0.15 bar). Larger-area survivor wins, so the
+      // wider full-row bbox eats the narrower mis-mapped one.
+      if (sameType) {
+        const cyA = existing.y + existing.height / 2;
+        const cyB = field.y + field.height / 2;
+        const xOverlap =
+          Math.min(existing.x + existing.width, field.x + field.width) -
+          Math.max(existing.x, field.x);
+        if (Math.abs(cyA - cyB) < 8 && xOverlap > 0) return true;
       }
+
+      if (sameType && iou >= 0.15) return true;
+      if (sameType && Math.max(containAB, containBA) >= 0.35) return true;
       if (
         existing.canonicalFieldId &&
         existing.canonicalFieldId === field.canonicalFieldId &&
@@ -2777,7 +2786,7 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
         return true;
       }
       return (
-        existing.fieldType === field.fieldType &&
+        sameType &&
         Math.abs(existing.x - field.x) < 12 &&
         Math.abs(existing.y - field.y) < 12
       );
