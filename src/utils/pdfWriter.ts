@@ -1,5 +1,14 @@
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import * as pdfjsLib from "pdfjs-dist";
 import type { Project, Template, TemplateField } from "@/types";
+
+// v0.6.14 — pdfjs worker setup. Matches the lazy-init pattern in
+// `geminiFieldDetector.ts` so a fill triggered without prior
+// detection (e.g. opening a saved template and clicking Fill
+// without re-rendering the canvas) still finds the worker.
+if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+}
 import {
   getOptionGroupSelection,
   getTemplateFieldValue,
@@ -10,6 +19,163 @@ import {
 import { normalizeCardTypeLabel } from "@/utils/fieldCatalog";
 
 import { trimSignatureDataUrl } from "@/utils/signatureImageTrim";
+
+/**
+ * v0.6.14 — printed-text rectangle extracted from the source PDF via
+ * pdfjs-dist. Coordinates are in PDF user-space points, TOP-DOWN
+ * convention to match `TemplateField.x` / `.y` storage (origin at
+ * the top-left corner, y increases downward).
+ */
+interface PrintedTextRect {
+  /** Left edge of the text item's bbox, pt. */
+  x: number;
+  /** Top edge of the text item's bbox, pt (top-down). */
+  y: number;
+  /** Width of the text item's bbox, pt. */
+  width: number;
+  /** Height of the text item's bbox, pt. */
+  height: number;
+  /** The text content. */
+  str: string;
+}
+
+/**
+ * v0.6.14 — load the source PDF with pdfjs-dist and extract every
+ * printed-text item's bbox, keyed by 1-based page number. Used at
+ * fill time to deterministically detect printed labels that sit
+ * INSIDE the bbox Gemini emitted (Layout A1 boxed-cell-prefix case),
+ * regardless of whether the system prompt change took effect on the
+ * specific form.
+ *
+ * Returns an empty record on failure. Callers must treat the absence
+ * of an entry as "no printed text known" and fall back to the
+ * canonical-id-based heuristic (PATH B).
+ */
+async function extractPrintedTextByPage(
+  pdfBytes: Uint8Array
+): Promise<Record<number, PrintedTextRect[]>> {
+  const result: Record<number, PrintedTextRect[]> = {};
+  try {
+    // pdfjs mutates the bytes during parse, so feed it a copy.
+    const copy = pdfBytes.slice();
+    const loadingTask = pdfjsLib.getDocument({
+      data: copy,
+      // No worker — we're already on a background thread in the
+      // Tauri-side write path, and the worker setup adds complexity
+      // for marginal speed gain on a 1-2 page form.
+      disableFontFace: true,
+      isEvalSupported: false,
+    });
+    const doc = await loadingTask.promise;
+    for (let pageIdx = 1; pageIdx <= doc.numPages; pageIdx++) {
+      const page = await doc.getPage(pageIdx);
+      const viewport = page.getViewport({ scale: 1 });
+      const pageHeightPt = viewport.height;
+      const textContent = await page.getTextContent();
+      const rects: PrintedTextRect[] = [];
+      type RawTextItem = {
+        str?: string;
+        transform?: number[];
+        width?: number;
+        height?: number;
+      };
+      for (const raw of textContent.items as RawTextItem[]) {
+        const str = (raw.str ?? "").replace(/\s+/g, " ");
+        if (!str.trim()) continue;
+        const transform = raw.transform;
+        if (!Array.isArray(transform) || transform.length < 6) continue;
+        const xUserSpace = transform[4];
+        const yBottomUp = transform[5];
+        const w = typeof raw.width === "number" ? raw.width : 0;
+        // pdfjs encodes the rendered font size in transform[3]; use
+        // its absolute value as a generous height proxy for vertical
+        // overlap checks. Fallback to raw.height or 10pt if missing.
+        const h =
+          typeof raw.height === "number" && raw.height > 0
+            ? raw.height
+            : Math.abs(transform[3] ?? 10);
+        if (!Number.isFinite(xUserSpace) || !Number.isFinite(yBottomUp)) continue;
+        // Convert bottom-up baseline → top-down top-of-bbox.
+        // Baseline sits ~0.8 × cap-height below the bbox top; we use
+        // h directly as a conservative top-of-bbox proxy.
+        const yTopDown = pageHeightPt - yBottomUp - h;
+        rects.push({ x: xUserSpace, y: yTopDown, width: w, height: h, str });
+      }
+      result[pageIdx] = rects;
+    }
+    try {
+      await doc.cleanup();
+      await doc.destroy();
+    } catch {
+      // Cleanup is best-effort; ignore failures.
+    }
+  } catch (err) {
+    console.warn(
+      "[pdfWriter] Failed to extract printed text; falling back to heuristic shift only.",
+      err
+    );
+  }
+  return result;
+}
+
+/**
+ * v0.6.14 — find the rightmost edge of any printed text inside a
+ * field's bbox whose center sits in the LEFT 60% of the bbox. The
+ * "left 60%" gate ensures we only grab printed PREFIX labels (which
+ * sit at the bbox's left edge by definition) rather than printed
+ * suffix tails like `per rental` on a `Charge up to a limit of $___
+ * per rental` row — those sit at the right edge and would yield a
+ * misleading shift target.
+ *
+ * Vertical overlap uses simple bbox intersection; horizontal overlap
+ * requires the text item's left edge to be inside the field's bbox.
+ *
+ * Returns the rightmost rightX of any matching text item, in PDF
+ * user-space points (top-down convention, same as field.x). Returns
+ * null when no qualifying printed text is present — caller falls
+ * back to the canonical-id heuristic (PATH B).
+ */
+function findInternalLabelRightEdge(
+  printedRects: PrintedTextRect[],
+  field: TemplateField
+): number | null {
+  if (printedRects.length === 0) return null;
+  const fieldLeft = field.x;
+  const fieldRight = field.x + field.width;
+  const fieldTop = field.y;
+  const fieldBottom = field.y + field.height;
+  // Allow text items to extend slightly above/below the bbox; form
+  // labels often sit with a baseline very close to the bbox bottom.
+  const vTol = Math.max(2, field.height * 0.25);
+
+  // Only treat text items as "internal labels" when their LEFT edge
+  // sits inside the LEFT 60% of the field bbox. Items further right
+  // are likely value-tail decoration ("per rental", "(date)") that
+  // shouldn't anchor a shift.
+  const leftHalfRight = field.x + field.width * 0.6;
+
+  let rightmost: number | null = null;
+  for (const rect of printedRects) {
+    if (!rect.str.trim()) continue;
+    const itemLeft = rect.x;
+    const itemRight = rect.x + rect.width;
+    const itemTop = rect.y;
+    const itemBottom = rect.y + rect.height;
+    // Vertical band check (with tolerance both sides).
+    if (itemBottom < fieldTop - vTol) continue;
+    if (itemTop > fieldBottom + vTol) continue;
+    // Horizontal: item must START inside the field's left half AND
+    // overlap horizontally with the field bbox.
+    if (itemLeft < fieldLeft - 1) continue;
+    if (itemLeft > leftHalfRight) continue;
+    if (itemRight > fieldRight + 1) continue;
+
+    if (rightmost === null || itemRight > rightmost) {
+      rightmost = itemRight;
+    }
+  }
+  return rightmost;
+}
 
 function isCheckboxField(field: TemplateField): boolean {
   return (
@@ -242,6 +408,12 @@ export async function writeFilledPdfBytes(
   options: WritePdfOptions = {}
 ): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.load(sourcePdfBytes);
+  // v0.6.14 — extract every printed-text rectangle from the source
+  // PDF up front so the per-field loop can deterministically
+  // shift the rendered value past any printed prefix label sitting
+  // INSIDE the bbox (Layout A1 boxed-cell-prefix forms). This runs
+  // ONCE per fill, not per field, and falls back to {} on failure.
+  const printedTextByPage = await extractPrintedTextByPage(sourcePdfBytes);
 
   // Flatten existing AcroForm fields so they don't cover our drawn text.
   // Interactive widgets render on top of page content in PDF viewers,
@@ -563,8 +735,33 @@ export async function writeFilledPdfBytes(
         probeFontSize = Math.max(7, Math.min(12, Math.floor(field.height * 0.75)));
       }
 
-      const prefixShift = computePrefixLabelShiftX(field, font, probeFontSize);
-      const insetX = Math.max(baseInsetX, prefixShift > 0 ? prefixShift : 0);
+      // v0.6.14 — deterministic shift from extracted printed text.
+      // If pdfjs found any printed text item inside the field's bbox
+      // whose left edge sits in the LEFT 60% of the bbox, the value
+      // MUST render past the rightmost such item. This is the
+      // strongest signal we can get for boxed-cell prefix labels and
+      // it works even when Gemini emits a bbox that engulfs the
+      // printed label (the case the v0.6.11 system prompt fix
+      // failed to correct reliably on the Keslow form).
+      const pagePrinted = printedTextByPage[field.pageNumber] ?? [];
+      const printedRightEdge = isCheckboxField(field) || isSignatureField(field) || isOptionGroupField(field)
+        ? null
+        : findInternalLabelRightEdge(pagePrinted, field);
+      const printedShift =
+        printedRightEdge !== null
+          ? Math.max(0, printedRightEdge - field.x + 4)
+          : 0;
+
+      const heuristicShift = computePrefixLabelShiftX(field, font, probeFontSize);
+      // Whichever shift is larger wins. Clamp to 60% of width as a
+      // hard upper bound so a wildly-wrong measurement (e.g. pdfjs
+      // returning a stray decoration item) cannot push past the bbox
+      // midpoint.
+      const combinedShift = Math.min(
+        field.width * 0.6,
+        Math.max(printedShift, heuristicShift)
+      );
+      const insetX = Math.max(baseInsetX, combinedShift > 0 ? combinedShift : 0);
 
       if (isMultiline) {
         const lines = rawValue.split(/\r?\n/).filter((s) => s.length > 0);
