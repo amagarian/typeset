@@ -1,13 +1,69 @@
 /**
- * Vertical-underline snap (v0.5.18).
+ * Underline snap (v0.5.19).
  *
  * Deterministic post-processor that nudges Gemini-detected text-field
  * bboxes so their BOTTOM EDGE sits exactly on the writable underline
- * stroke actually drawn on the page (`bbox_bottom == strokeRow`).
- * Runs AFTER `mapToTemplateField` and the dedup pass, so it operates
- * on already-trusted detections — we never use this to invent or
- * drop fields, only to shift `y` by a few points when there is
- * strong geometric evidence of a stroke within the search band.
+ * stroke actually drawn on the page (`bbox_bottom == strokeRow`) AND
+ * so their LEFT/RIGHT edges align with the actual horizontal endpoints
+ * of the stroke they snapped onto (`bbox_left == strokeLeft`,
+ * `bbox_right == strokeRight`). Runs AFTER `mapToTemplateField` and
+ * the dedup pass, so it operates on already-trusted detections — we
+ * never use this to invent or drop fields, only to shift `y` (and
+ * refine `x`/`width`) by a few points when there is strong geometric
+ * evidence of a stroke within the search band.
+ *
+ * v0.5.19 — adds a horizontal underline snap that runs ONLY on
+ * fields the vertical snap successfully moved. The vertical snap
+ * tells us the exact image row of the chosen stroke; the horizontal
+ * snap then traces that row's continuous dark-pixel run starting
+ * from the bbox's horizontal center, and aligns the bbox's `x` and
+ * `x + width` to the run's left/right endpoints. Gemini's `x` and
+ * `width` come straight through `bboxToPdfRect` with zero post-
+ * processing and are noticeably off on some fields (real-user
+ * v0.5.18 evidence: bottom-row "Cardholder Name" / Print Name
+ * shifted right and not spanning the full underline width). The
+ * horizontal snap cleans those up without touching the vertical
+ * geometry — the v0.5.18 vertical algorithm and its threshold
+ * rationale are preserved verbatim.
+ *
+ * Three safety caps on the horizontal snap, all designed to fail
+ * conservatively (leave x/width alone rather than invent a wrong
+ * extent):
+ *   - `maxHorizontalDeltaPoints` (30pt) — if either edge would move
+ *     more than this, abort. Mirrors `maxSnapPoints` for vertical.
+ *     30pt is generous enough to cover the worst observed Gemini
+ *     drift on a normal label, but rejects pathological cases where
+ *     the run-walk escapes onto an adjacent stroke.
+ *   - `minWidthPoints` (12pt) — if the run is shorter than this, the
+ *     center column is probably under a label glyph that happens to
+ *     intersect the snap row, not on a real underline; abort. 12pt
+ *     ≈ one or two characters of body text, well below any real
+ *     fillable underline width.
+ *   - `maxWidthRatio` (1.5×) — if the run is more than 1.5× the
+ *     original bbox width, abort. Prevents a short field (e.g.
+ *     "Date") from being extended across an entire row's underline
+ *     when the model meant only a fragment of it.
+ *
+ * Why the dependency on a successful vertical snap: horizontal snap
+ * needs a known stroke row to walk along. Without a vertical snap
+ * we don't know which image row IS the underline (the bbox center
+ * could land anywhere in label text or in whitespace), and walking
+ * the wrong row would produce arbitrary x/width changes — the exact
+ * failure mode this module exists to avoid. This is also why we
+ * additionally reject a horizontal snap whose center column is
+ * light on the snap row (`hSkippedNoStroke`): the vertical snap can
+ * occasionally land on a stroke that doesn't extend horizontally
+ * under the bbox center (e.g. an adjacent field's stroke that
+ * happened to be the closest qualifying row), and we don't want to
+ * drag the bbox off into that stroke.
+ *
+ * Signatures are excluded from horizontal snap (but remain eligible
+ * for vertical snap). Signature lines are typically intentionally
+ * extensible (the writer assumes the user can scrawl past the
+ * printed stroke endpoints), and clamping the bbox to the printed
+ * line endpoints would constrict the writable area. The horizontal-
+ * snap skip list therefore includes signatures on top of the
+ * vertical-snap skip list (checkboxes + multilines).
  *
  * v0.5.18 — snap target stays `bbox_bottom == strokeRow` (Step 8,
  * line below — v0.5.16's geometrically correct text-baseline
@@ -80,12 +136,28 @@
  *   itself by `-height/2`, so the v0.5.17 pre-shift took the search
  *   center an extra `-height/2` past the stroke; Billing Address +
  *   Stylist Designer Name still snapped to the row above on tight
- *   rows. v0.5.18 (this) — removes the detection-time pre-shift
- *   entirely. The prompt does the placement work; the snap acts as
- *   a verifier/corrector against the same anchor. Snapped and
+ *   rows. v0.5.18 — removed the detection-time pre-shift entirely.
+ *   The prompt does the placement work; the snap acts as a
+ *   verifier/corrector against the same anchor. Snapped and
  *   unsnapped paths both converge on `bbox_bottom == strokeRow`
  *   (the v0.5.16 design intent without v0.5.16's search-center
- *   drift).
+ *   drift). v0.5.19 (this) — adds a horizontal underline snap on
+ *   top of the v0.5.18 vertical pipeline. Vertical behaviour is
+ *   unchanged; the horizontal pass runs only on fields that just
+ *   successfully snapped vertically, traces the chosen stroke row's
+ *   continuous dark-pixel run from the bbox center, and aligns the
+ *   bbox's left/right edges to the run endpoints. Three safety caps
+ *   (`maxHorizontalDeltaPoints` 30pt, `minWidthPoints` 12pt,
+ *   `maxWidthRatio` 1.5×) keep the snap from escaping onto adjacent
+ *   strokes, snapping onto a label-glyph crossing, or extending a
+ *   short field across an entire row's underline. Real-user
+ *   v0.5.18 evidence: bottom-row "Cardholder Name" (Print Name)
+ *   bbox shifted right and not spanning the full underline width
+ *   — fixed by the horizontal snap reading the actual stroke
+ *   endpoints off the same render pass already plumbed in for
+ *   vertical snap. Signatures are excluded from the horizontal
+ *   pass (their lines are intentionally extensible); checkboxes
+ *   and multilines are excluded by the same gate as vertical snap.
  *
  * Signatures are snap-eligible (added in v0.5.13). They follow the
  * same prompt rule (bottom edge on stroke), receive no detection-
@@ -277,6 +349,58 @@ export interface SnapOptions {
    */
   ambiguityGapPoints?: number;
   /**
+   * Maximum distance (in PDF points) the horizontal snap may move
+   * EITHER the left or right edge of the bbox. Mirrors
+   * `maxSnapPoints` for the vertical snap: anything bigger is
+   * almost certainly the run-walk having escaped onto a different
+   * stroke (e.g. the underline of an adjacent field on the same
+   * row, joined to ours by a thin connecting line), so we leave
+   * `x`/`width` alone rather than drag the bbox into a wrong
+   * extent. Default: 30pt.
+   *
+   * 30pt is generous: the worst-observed Gemini drift on a normal
+   * label is ~20pt, and 30pt easily absorbs that while still
+   * rejecting whole-row extensions on a US-Letter form (typical
+   * row underlines are 80-300pt wide, far past this cap on
+   * either side).
+   *
+   * Introduced in v0.5.19 alongside the horizontal snap.
+   */
+  maxHorizontalDeltaPoints?: number;
+  /**
+   * Minimum width (in PDF points) of the horizontal-snap run for the
+   * snap to be applied. If the continuous dark run starting at the
+   * bbox center is shorter than this, the center column is probably
+   * sitting on a label glyph that happens to intersect the snap row
+   * (rather than on a real underline), so we abort the horizontal
+   * snap. Default: 12pt.
+   *
+   * 12pt ≈ one or two characters of typical 10–11pt body text;
+   * even the shortest realistic fillable underline (a single-digit
+   * "Date" segment) is wider than that, so the cap rejects only
+   * pathological label-glyph crossings.
+   *
+   * Introduced in v0.5.19 alongside the horizontal snap.
+   */
+  minWidthPoints?: number;
+  /**
+   * Maximum ratio of new horizontal-snap width to the original bbox
+   * width. If the run is more than `maxWidthRatio × original
+   * width`, abort. Default: 1.5.
+   *
+   * Prevents a short field (e.g. "Date") from being extended across
+   * an entire row's underline when the row is one continuous stroke
+   * the model deliberately chunked into multiple bboxes. The
+   * complementary cap on shrinkage is implicit: shrinkage cannot
+   * happen here because the run-walk starts AT the bbox center and
+   * extends outward, so the new width is always ≥ 0; the
+   * `minWidthPoints` cap above handles the case where the run is
+   * just a glyph slice.
+   *
+   * Introduced in v0.5.19 alongside the horizontal snap.
+   */
+  maxWidthRatio?: number;
+  /**
    * If true AND the build is in development mode (`import.meta.env.DEV`),
    * log per-field snap decisions to the console. Used by the
    * detector's diagnostic dumps and ignored in production builds so
@@ -292,6 +416,9 @@ const DEFAULT_OPTIONS: Required<SnapOptions> = {
   darkLuminance: 80,
   verticalNeighborMax: 0.4,
   ambiguityGapPoints: 8,
+  maxHorizontalDeltaPoints: 30,
+  minWidthPoints: 12,
+  maxWidthRatio: 1.5,
   verbose: false,
 };
 
@@ -323,6 +450,14 @@ const THINNESS_NEIGHBOR_OFFSET_PX = 5;
 /**
  * Aggregate counters for one snap pass — surfaced via the
  * `[underlineSnap]` log line in `detectFieldsImpl`.
+ *
+ * The `h*` counters (v0.5.19) cover the horizontal-snap stage, which
+ * runs only on fields that successfully snapped vertically. They sum
+ * to ≤ `snapped`; any field counted in `snapped` either had its
+ * x/width updated (`hSnapped`), was skipped by one of the four
+ * horizontal-skip gates (`hSkipped*`), or — for signatures — was
+ * not eligible for the horizontal pass at all (no horizontal
+ * counter incremented; signatures keep their vertical-snapped y).
  */
 interface SnapCounts {
   total: number;
@@ -332,6 +467,11 @@ interface SnapCounts {
   tooFar: number;
   skippedNonText: number;
   skippedNoPage: number;
+  hSnapped: number;
+  hSkippedNoStroke: number;
+  hSkippedTooFar: number;
+  hSkippedTooNarrow: number;
+  hSkippedTooWide: number;
 }
 
 /**
@@ -433,6 +573,114 @@ function rowStrokeScore(
 }
 
 /**
+ * Trace the continuous dark-pixel run on `row` that contains
+ * `centerCol`, walking outward in both directions, and return its
+ * left/right pixel endpoints. Allows the same `MAX_GAP = 2` light-
+ * pixel tolerance used by {@link rowStrokeScore} so that PDF anti-
+ * aliasing artefacts in the middle of an otherwise solid stroke
+ * don't terminate the walk early.
+ *
+ * Returns `null` when there is no dark pixel under (or within
+ * `MAX_GAP` of) the center column on `row`. This is the
+ * "no-stroke-at-center" guard used by {@link tryHorizontalSnap}:
+ * the vertical snap can occasionally land on a stroke that doesn't
+ * extend horizontally under the bbox center (e.g. an adjacent
+ * field's stroke that happened to be the closest qualifying row),
+ * and we don't want to pretend we found a run when we didn't.
+ *
+ * Out-of-bounds `row` or `centerCol` also returns `null`. This
+ * is a column-walking cousin of {@link rowStrokeScore} (which is
+ * row-internal and integrates dark coverage as a fraction of bbox
+ * width); the two share the same dark-luminance and gap-tolerance
+ * conventions on purpose so the horizontal and vertical passes
+ * agree on what "stroke pixel" means.
+ *
+ * Introduced in v0.5.19 for the horizontal underline snap.
+ */
+function findHorizontalRun(
+  imageData: ImageData,
+  row: number,
+  centerCol: number,
+  darkLuminance: number
+): { leftPx: number; rightPx: number } | null {
+  const width = imageData.width;
+  const height = imageData.height;
+  if (row < 0 || row >= height) return null;
+
+  const center = Math.round(centerCol);
+  if (center < 0 || center >= width) return null;
+
+  const data = imageData.data;
+  const rowOffset = row * width * 4;
+  const MAX_GAP = 2;
+
+  const isDark = (col: number): boolean => {
+    if (col < 0 || col >= width) return false;
+    const idx = rowOffset + col * 4;
+    const a = data[idx + 3];
+    if (a < 128) return false;
+    const lum =
+      0.299 * data[idx] + 0.587 * data[idx + 1] + 0.114 * data[idx + 2];
+    return lum < darkLuminance;
+  };
+
+  // Confirm the center column actually sits on (or within MAX_GAP
+  // of) a stroke. Without this guard, an off-stroke vertical snap
+  // would still find a "run" by walking left/right far enough to
+  // hit some unrelated dark pixel; the horizontal snap would then
+  // drag x/width arbitrarily. If center is light, accept only if
+  // there's a dark pixel within MAX_GAP on either side (i.e. the
+  // center landed in the stroke's anti-alias gap, not off-stroke).
+  let centerOnStroke = isDark(center);
+  if (!centerOnStroke) {
+    for (let off = 1; off <= MAX_GAP; off += 1) {
+      if (isDark(center - off) || isDark(center + off)) {
+        centerOnStroke = true;
+        break;
+      }
+    }
+  }
+  if (!centerOnStroke) return null;
+
+  // Walk left from center, allowing up to MAX_GAP consecutive light
+  // pixels before terminating. `leftPx` tracks the leftmost dark
+  // pixel observed so far; the trailing gap is intentionally NOT
+  // included in the run (it's only tolerated for continuation).
+  let leftPx = isDark(center) ? center : center;
+  let gap = 0;
+  for (let col = center - 1; col >= 0; col -= 1) {
+    if (isDark(col)) {
+      leftPx = col;
+      gap = 0;
+    } else {
+      gap += 1;
+      if (gap > MAX_GAP) break;
+    }
+  }
+
+  // Walk right from center, mirroring the left walk.
+  let rightPx = isDark(center) ? center : center;
+  gap = 0;
+  for (let col = center + 1; col < width; col += 1) {
+    if (isDark(col)) {
+      rightPx = col;
+      gap = 0;
+    } else {
+      gap += 1;
+      if (gap > MAX_GAP) break;
+    }
+  }
+
+  // If the center column itself was light (we accepted it because a
+  // dark pixel sat within MAX_GAP), make sure the resolved endpoints
+  // bracket the center. Without this, a center landing just past
+  // the right edge of a short stroke could yield rightPx < leftPx.
+  if (rightPx < leftPx) return null;
+
+  return { leftPx, rightPx };
+}
+
+/**
  * Format a per-field snap decision in the canonical
  * `[underlineSnap] field=… page=… result=… deltaY=…pt strokeRow=…`
  * form. Centralised so every code path (snap / skip-no-stroke /
@@ -453,9 +701,159 @@ function logDecision(
 }
 
 /**
+ * Horizontal underline snap (v0.5.19). Called from
+ * {@link snapOneField} ONLY after a successful vertical snap, with
+ * `strokeRow` being the image row the vertical snap chose. Returns
+ * the new `{ x, width }` in PDF points if the snap fires, or
+ * `null` if any of the four skip gates trips (in which case the
+ * caller leaves x/width alone).
+ *
+ * The algorithm:
+ *   1. Find the continuous dark-pixel run on `strokeRow` that
+ *      contains the bbox's horizontal center
+ *      ({@link findHorizontalRun}). Returns null → no stroke at
+ *      center → abort (`hSkippedNoStroke`). Guards against the
+ *      case where the vertical snap landed on a stroke that
+ *      doesn't extend horizontally under the bbox (e.g. an
+ *      adjacent field's stroke that happened to be the closest
+ *      qualifying row).
+ *   2. Convert the run endpoints to PDF points and compute new
+ *      `x`/`width`.
+ *   3. Apply three safety caps in order:
+ *        - `maxHorizontalDeltaPoints` (`hSkippedTooFar`):
+ *          either edge moving > N pt almost certainly means the
+ *          run-walk escaped onto an adjacent stroke.
+ *        - `minWidthPoints` (`hSkippedTooNarrow`): a run shorter
+ *          than N pt is probably under a label glyph crossing
+ *          the snap row, not on a real underline.
+ *        - `maxWidthRatio` (`hSkippedTooWide`): a run wider than
+ *          N× the original bbox almost certainly means the bbox
+ *          was meant for a fragment of a continuous row underline,
+ *          not the whole row.
+ *
+ * Skip list — signatures are excluded BEFORE step 1. Their
+ * underlines are intentionally extensible (the writer assumes the
+ * user can scrawl past the printed line endpoints) and clamping
+ * x/width to the printed extent would constrict the writable area.
+ * Checkboxes and multilines are already filtered upstream by the
+ * vertical-snap eligibility gate; they cannot reach this function
+ * because horizontal snap only runs on fields that just snapped
+ * vertically.
+ */
+function tryHorizontalSnap(
+  field: TemplateField,
+  render: PageRender,
+  strokeRow: number,
+  opts: Required<SnapOptions>,
+  counts: SnapCounts,
+  wantLog: boolean
+): { x: number; width: number } | null {
+  if (field.fieldKind === "signature") {
+    if (wantLog) {
+      console.log(
+        `[underlineSnap] field=${field.id} hSnap=skipped:signature (signatures keep their bbox extent — line is user-extensible)`
+      );
+    }
+    return null;
+  }
+
+  const pixelsPerPoint = 1 / Math.max(1e-6, render.pdfPointsPerPixel);
+  const bboxCenterXPx = (field.x + field.width / 2) * pixelsPerPoint;
+
+  const run = findHorizontalRun(
+    render.imageData,
+    strokeRow,
+    bboxCenterXPx,
+    opts.darkLuminance
+  );
+
+  if (!run) {
+    counts.hSkippedNoStroke += 1;
+    if (wantLog) {
+      console.log(
+        `[underlineSnap] field=${field.id} hSnap=skipped:no-stroke (centerCol=${Math.round(bboxCenterXPx)} on strokeRow=${strokeRow} is light)`
+      );
+    }
+    return null;
+  }
+
+  // Run endpoints in PDF points. `+1` on the width converts
+  // inclusive pixel endpoints to a half-open span (matches the
+  // `bboxToPdfRect` convention upstream: width = pixel count).
+  const newX = run.leftPx * render.pdfPointsPerPixel;
+  const newWidth =
+    (run.rightPx - run.leftPx + 1) * render.pdfPointsPerPixel;
+  const newRight = newX + newWidth;
+  const oldRight = field.x + field.width;
+
+  const leftDeltaPt = newX - field.x;
+  const rightDeltaPt = newRight - oldRight;
+
+  // Cap 1: maxHorizontalDeltaPoints — guard against the run-walk
+  // escaping onto an adjacent stroke. Either edge moving > 30pt
+  // (default) is well outside any plausible Gemini drift on a
+  // label and almost always means we walked into a different
+  // field's underline.
+  if (
+    Math.abs(leftDeltaPt) > opts.maxHorizontalDeltaPoints ||
+    Math.abs(rightDeltaPt) > opts.maxHorizontalDeltaPoints
+  ) {
+    counts.hSkippedTooFar += 1;
+    if (wantLog) {
+      console.log(
+        `[underlineSnap] field=${field.id} hSnap=skipped:too-far (leftΔ=${leftDeltaPt.toFixed(2)}pt rightΔ=${rightDeltaPt.toFixed(2)}pt > ±${opts.maxHorizontalDeltaPoints}pt)`
+      );
+    }
+    return null;
+  }
+
+  // Cap 2: minWidthPoints — a run shorter than 12pt (default) is
+  // probably under a label glyph that happens to intersect the
+  // snap row, not a real underline. Real fillable underlines are
+  // wider than this even for single-character entries.
+  if (newWidth < opts.minWidthPoints) {
+    counts.hSkippedTooNarrow += 1;
+    if (wantLog) {
+      console.log(
+        `[underlineSnap] field=${field.id} hSnap=skipped:too-narrow (newWidth=${newWidth.toFixed(2)}pt < ${opts.minWidthPoints}pt)`
+      );
+    }
+    return null;
+  }
+
+  // Cap 3: maxWidthRatio — a run more than 1.5× (default) the
+  // original bbox width almost certainly means the bbox was meant
+  // for a fragment of a continuous row underline (e.g. a "Date"
+  // segment of a long combined line). Extending across the whole
+  // row would overlap adjacent fields and damage the layout.
+  if (newWidth > field.width * opts.maxWidthRatio) {
+    counts.hSkippedTooWide += 1;
+    if (wantLog) {
+      console.log(
+        `[underlineSnap] field=${field.id} hSnap=skipped:too-wide (newWidth=${newWidth.toFixed(2)}pt > ${(field.width * opts.maxWidthRatio).toFixed(2)}pt = ${opts.maxWidthRatio}× original ${field.width.toFixed(2)}pt)`
+      );
+    }
+    return null;
+  }
+
+  counts.hSnapped += 1;
+  if (wantLog) {
+    console.log(
+      `[underlineSnap] field=${field.id} hSnap=snapped (x: ${field.x.toFixed(2)}→${newX.toFixed(2)}pt [Δ=${leftDeltaPt.toFixed(2)}pt], width: ${field.width.toFixed(2)}→${newWidth.toFixed(2)}pt, right: ${oldRight.toFixed(2)}→${newRight.toFixed(2)}pt [Δ=${rightDeltaPt.toFixed(2)}pt], runPx=[${run.leftPx},${run.rightPx}])`
+    );
+  }
+
+  return { x: newX, width: newWidth };
+}
+
+/**
  * Vertical-underline snap, one field at a time. See module header
  * for the full algorithm rationale; comments inline annotate each
- * step of the pipeline.
+ * step of the pipeline. v0.5.19 layers a horizontal snap on top:
+ * after the vertical snap fires (Step 8), {@link tryHorizontalSnap}
+ * traces the chosen stroke's row to refine `x`/`width`. The
+ * vertical pipeline is unchanged — every threshold, gate, and
+ * snap-target equation is preserved verbatim from v0.5.18.
  */
 function snapOneField(
   field: TemplateField,
@@ -711,7 +1109,25 @@ function snapOneField(
     );
   }
 
-  // Preserve every other property — we only touch `y`.
+  // v0.5.19: horizontal snap. Runs only on fields that just
+  // successfully snapped vertically (above), using `best.row` as
+  // the chosen stroke row. Returns `null` if any of the four skip
+  // gates trips, in which case x/width pass through untouched.
+  // Vertical y is unaffected either way.
+  const hResult = tryHorizontalSnap(
+    field,
+    render,
+    best.row,
+    opts,
+    counts,
+    wantLog
+  );
+
+  if (hResult) {
+    return { ...field, x: hResult.x, y: newY, width: hResult.width };
+  }
+  // Vertical-only snap (v0.5.18 behaviour): preserve every other
+  // property — we only touch `y`.
   return { ...field, y: newY };
 }
 
@@ -739,6 +1155,11 @@ export function snapFieldsToUnderlines(
     tooFar: 0,
     skippedNonText: 0,
     skippedNoPage: 0,
+    hSnapped: 0,
+    hSkippedNoStroke: 0,
+    hSkippedTooFar: 0,
+    hSkippedTooNarrow: 0,
+    hSkippedTooWide: 0,
   };
 
   const out = fields.map((f) => snapOneField(f, pageRenders, opts, counts));
@@ -749,11 +1170,19 @@ export function snapFieldsToUnderlines(
   const textConsidered =
     counts.total - counts.skippedNonText - counts.skippedNoPage;
 
+  // v0.5.19 — append horizontal-snap counters after the vertical
+  // ones, separated by `|` for grep-friendliness. The horizontal
+  // snap can only fire on fields that successfully snapped
+  // vertically, so its denominator is `counts.snapped` (NOT
+  // `textConsidered`). Ratios above sum to ≤ snapped because
+  // signatures pass through the horizontal stage without
+  // incrementing any horizontal counter.
   console.log(
     `[underlineSnap] snapped ${counts.snapped}/${textConsidered} text fields, skipped ${counts.noStroke} (no stroke), ${counts.ambiguous} (ambiguous), ${counts.tooFar} (too far)` +
       (counts.skippedNonText > 0 || counts.skippedNoPage > 0
         ? ` — ignored ${counts.skippedNonText} non-text + ${counts.skippedNoPage} unrendered`
-        : "")
+        : "") +
+      ` | hSnap ${counts.hSnapped}/${counts.snapped}, hSkipped ${counts.hSkippedNoStroke} (no stroke), ${counts.hSkippedTooFar} (too far), ${counts.hSkippedTooNarrow} (too narrow), ${counts.hSkippedTooWide} (too wide)`
   );
 
   return out;
