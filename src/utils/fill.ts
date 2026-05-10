@@ -182,18 +182,19 @@ function stripAddressParts(
 }
 
 /**
- * v0.6.6 — when a `billingAddress` widget is the ONLY billing-related
+ * v0.6.7 — when a `billingAddress` widget is the ONLY billing-related
  * widget on the form (no separate City/State/Zip widgets to fill in
- * their own targets), compose the project's city/state/zip onto a
- * second line so the Arrow CC Authorization-style "address block on
- * two underlines" pattern renders street + city/state/zip across the
- * available lines instead of dropping just the street and leaving the
- * second line blank (or, pre-merge, painting the street on every line).
+ * their own targets), compose the project's city/state/zip onto the
+ * SAME line as the street so the Arrow CC Authorization-style
+ * "address block on two underlines" pattern renders the full address
+ * on the first writable line instead of fighting baseline alignment
+ * across stacked underlines. The merged bbox can absorb the extra
+ * length and the writer top-aligns it onto the first underline.
  *
- * Output shape: `123 Main St\nLos Angeles, CA 90026`. Empty pieces are
- * skipped — no trailing commas / orphaned ZIPs.
+ * Output shape: `123 Main St, Los Angeles, CA 90026`. Empty pieces
+ * are skipped — no trailing commas / orphaned ZIPs.
  */
-function composeMultilineAddress(value: string, project: Project): string {
+function composeFullAddress(value: string, project: Project): string {
   const trimmed = value.trim();
   const cityState = [project.billingCity, project.billingState]
     .map((s) => (s ?? "").trim())
@@ -203,7 +204,7 @@ function composeMultilineAddress(value: string, project: Project): string {
   const cityStateZip = [cityState, zip].filter((s) => s.length > 0).join(" ");
   if (!cityStateZip) return trimmed;
   if (!trimmed) return cityStateZip;
-  return `${trimmed}\n${cityStateZip}`;
+  return `${trimmed}, ${cityStateZip}`;
 }
 
 export function getTemplateFieldValue(
@@ -275,7 +276,7 @@ export function getTemplateFieldValue(
     if (hasSiblings && siblingMappedKeys) {
       return stripAddressParts(value, project, siblingMappedKeys);
     }
-    return composeMultilineAddress(value, project);
+    return composeFullAddress(value, project);
   }
 
   return value;

@@ -353,46 +353,56 @@ export async function writeFilledPdfBytes(
         });
       }
     } else {
-      // v0.6.5 — multiline-aware rendering. v0.6.6 broadened the trigger
-      // from `fieldKind === "multiline"` to ALSO include any single-line
-      // field whose value contains an explicit newline. That covers the
-      // Arrow CC Authorization billing-address case where the
-      // `mergeStackedBillingAddress` pass didn't fire (gap was just
-      // outside threshold) so we still have two un-merged single-line
-      // widgets, and `composeMultilineAddress` produced
-      // `street\nCity, ST ZIP` — the second un-merged widget needs to
-      // render the second line of that value rather than truncating it.
+      // v0.6.5 — multiline-aware rendering. v0.6.6 broadened the
+      // trigger from `fieldKind === "multiline"` to also include any
+      // single-line field whose value contains a newline.
+      // v0.6.7 rebuilt the baseline math: line 1's baseline sits
+      // ~1pt below the TOP edge of the bbox (treating the bbox top as
+      // the first underline level — which matches how detection
+      // emits address-block bboxes), and subsequent lines step down
+      // by a `rowHeight` estimated from either the bbox-vs-line-count
+      // ratio or `fontSize × 1.25`, whichever is larger. This keeps
+      // a single-line value on the FIRST underline of a tall merged
+      // bbox instead of the geometric centre.
       const valueHasNewline = rawValue.includes("\n");
       const isMultiline = field.fieldKind === "multiline" || valueHasNewline;
+      // v0.6.7 — bumped left padding from 3pt to 5pt. The Arrow CC
+      // Authorization Expiration Date row reads `Expiration Date
+      // (MM/YY)____` with the writable bbox starting RIGHT after
+      // `)`; a 3pt inset rendered `01/31` crashed-into the closing
+      // paren. 5pt is comfortable without pushing too far right on
+      // wider fields.
+      const insetX = 5;
 
       if (isMultiline) {
-        const lineHeightFactor = 1.25;
         const lines = rawValue.split(/\r?\n/).filter((s) => s.length > 0);
         if (lines.length === 0) continue;
 
-        const heightPerLine = field.height / Math.max(1, lines.length);
         let fontSize: number;
         if (field.estimatedFontSize) {
           fontSize = Math.max(7, Math.min(16, Math.round(field.estimatedFontSize * 1.5)));
         } else {
-          fontSize = Math.max(7, Math.min(12, Math.floor(heightPerLine * 0.6)));
+          const perLine = field.height / Math.max(1, lines.length);
+          fontSize = Math.max(7, Math.min(12, Math.floor(perLine * 0.6)));
         }
-        const lineGap = fontSize * lineHeightFactor;
+        const rowHeight = Math.max(
+          fontSize * 1.25,
+          field.height / Math.max(lines.length, 1)
+        );
 
-        const inset = Math.max(2, Math.min(4, fontSize * 0.25));
-        let yTopBaseline = yPdfBottom + field.height - fontSize - inset;
+        let yBaseline = yPdfBottom + field.height - 1;
 
         for (const line of lines) {
-          if (yTopBaseline < yPdfBottom) break;
-          const fitted = fitTextToWidth(line, field.width, font, fontSize);
+          const fitted = fitTextToWidth(line, field.width - (insetX - 3), font, fontSize);
           page.drawText(fitted, {
-            x: x + 3,
-            y: yTopBaseline,
+            x: x + insetX,
+            y: yBaseline,
             size: fontSize,
             font,
             color: rgb(0.1, 0.1, 0.1),
           });
-          yTopBaseline -= lineGap;
+          yBaseline -= rowHeight;
+          if (yBaseline < yPdfBottom - fontSize) break;
         }
         continue;
       }
@@ -404,10 +414,10 @@ export async function writeFilledPdfBytes(
         fontSize = Math.max(7, Math.min(12, Math.floor(field.height * 0.75)));
       }
 
-      const value = fitTextToWidth(rawValue, field.width, font, fontSize);
+      const value = fitTextToWidth(rawValue, field.width - (insetX - 3), font, fontSize);
 
       page.drawText(value, {
-        x: x + 3,
+        x: x + insetX,
         y: yPdfBottom + Math.max(4, (field.height - fontSize) / 2) + 2,
         size: fontSize,
         font,
