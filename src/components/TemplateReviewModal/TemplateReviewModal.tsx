@@ -46,6 +46,12 @@ function isCheckboxField(field: TemplateField): boolean {
   );
 }
 
+function isOptionGroupField(field: TemplateField): boolean {
+  return (
+    field.fieldType === "option-group" || field.fieldKind === "option-group"
+  );
+}
+
 // v0.5.3 — render-time zoom bounds. Field coords stay in PDF
 // user-space on disk; zoom is purely cosmetic, applied via the
 // PdfPageCanvas's `zoomFactor` prop (which also scales the reported
@@ -605,10 +611,35 @@ export function TemplateReviewModal({
                         {PROJECT_KEY_LABELS[key]}
                       </option>
                     ))}
-                    {!isCheckboxField(f) && <option value="__custom__">Custom value</option>}
-                    {!isCheckboxField(f) && <option value="__prompt__">Prompt at fill time</option>}
+                    {!isCheckboxField(f) && !isOptionGroupField(f) && (
+                      <option value="__custom__">Custom value</option>
+                    )}
+                    {!isCheckboxField(f) && !isOptionGroupField(f) && (
+                      <option value="__prompt__">Prompt at fill time</option>
+                    )}
                   </select>
-                  {!isCheckboxField(f) && f.mappedProjectKey === "__custom__" && (
+                  {isOptionGroupField(f) && (
+                    <select
+                      className={styles.select}
+                      value={f.selectedOption ?? ""}
+                      onClick={(e) => e.stopPropagation()}
+                      onChange={(e) => {
+                        onBeginFieldEdit();
+                        onFieldChange(f.id, {
+                          selectedOption: e.target.value || null,
+                        });
+                      }}
+                      title="Default selection (overridden at fill time)"
+                    >
+                      <option value="">— No default selection —</option>
+                      {(f.options ?? []).map((opt) => (
+                        <option key={opt.label} value={opt.label}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+                  {!isCheckboxField(f) && !isOptionGroupField(f) && f.mappedProjectKey === "__custom__" && (
                     <input
                       type="text"
                       className={styles.input}
@@ -621,7 +652,7 @@ export function TemplateReviewModal({
                       }}
                     />
                   )}
-                  {!isCheckboxField(f) && f.mappedProjectKey === "__prompt__" && (
+                  {!isCheckboxField(f) && !isOptionGroupField(f) && f.mappedProjectKey === "__prompt__" && (
                     <input
                       type="text"
                       className={styles.input}

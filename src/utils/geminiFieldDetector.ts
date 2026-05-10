@@ -83,12 +83,16 @@ if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
 import { getAccuracyMode, getModelPreference } from "@/services/geminiSettings";
 import {
   type CanonicalFieldId,
+  type FieldOption,
   type Project,
   type TemplateField,
   type TemplateFieldKind,
   type TemplateMappedProjectKey,
 } from "@/types";
-import { CANONICAL_FIELD_DEFINITIONS } from "@/utils/fieldCatalog";
+import {
+  CANONICAL_FIELD_DEFINITIONS,
+  normalizeCardTypeLabel,
+} from "@/utils/fieldCatalog";
 import { normalizeCardType } from "@/utils/fill";
 import {
   snapFieldsToUnderlines,
@@ -130,6 +134,15 @@ interface RenderedPage {
    * pages built inside the QC pass don't carry pixels.
    */
   imageData?: ImageData;
+  /**
+   * v0.5.25 — per-page text-row geometry extracted from pdf.js. Used
+   * by the underline-snap text-row fallback (`tryTextRowSnap` in
+   * `underlineSnap.ts`) when a field has no detectable underline
+   * stroke nearby — we align the bbox bottom to the baseline of the
+   * surrounding text row instead. Coordinates are in PDF user-space
+   * points, top-down origin (matching `TemplateField` rect storage).
+   */
+  textRows?: Array<{ yBottom: number; xMin: number; xMax: number }>;
 }
 
 interface RawGeminiField {
@@ -166,6 +179,14 @@ interface RawGeminiField {
   context_before?: string;
   /** Words IMMEDIATELY after the blank on the same row. */
   context_after?: string;
+  /**
+   * For `option-group` fields (v0.5.25): the per-option entries.
+   * Each entry has a `label` (the option's display text) and a
+   * `bbox` in Gemini's normalized 0-1000 `[y_min, x_min, y_max, x_max]`
+   * coordinate frame, sized tightly around just that option's label
+   * text.
+   */
+  options?: Array<{ label?: string; bbox?: number[] }>;
 }
 
 interface RawGeminiResponse {
@@ -189,6 +210,7 @@ const VALID_FIELD_KINDS = new Set<TemplateFieldKind>([
   "signature",
   "checkbox-group",
   "boolean-checkbox",
+  "option-group",
 ]);
 
 const CREDIT_CARD_CHECKBOX_IDS = new Set<CanonicalFieldId>([
@@ -296,6 +318,23 @@ async function renderPagesToPng(
         );
       }
 
+      // v0.5.25 — pull text-row geometry off the same page object
+      // (one extra `getTextContent` call per page; cheap relative to
+      // the canvas render). Used by the underline-snap text-row
+      // fallback when a field has no detectable underline.
+      let textRows:
+        | Array<{ yBottom: number; xMin: number; xMax: number }>
+        | undefined;
+      try {
+        textRows = await extractTextRows(page, baseViewport.height);
+      } catch (err) {
+        console.warn(
+          `[Typeset Diag] Could not extract text-row geometry for page ${pageNumber}; text-row fallback will skip this page. (${
+            err instanceof Error ? err.message : String(err)
+          })`
+        );
+      }
+
       const blob = await new Promise<Blob | null>((resolve) =>
         canvas.toBlob((b) => resolve(b), "image/png")
       );
@@ -314,6 +353,7 @@ async function renderPagesToPng(
         pageWidthPt: Math.round(baseViewport.width),
         pageHeightPt: Math.round(baseViewport.height),
         imageData,
+        textRows,
       });
     }
   } finally {
@@ -321,6 +361,81 @@ async function renderPagesToPng(
   }
 
   return rendered;
+}
+
+/**
+ * v0.5.25 — extract text rows from a pdf.js page. A "row" is a
+ * cluster of text items at approximately the same baseline (we
+ * round `transform[5]` to within 2pt). For each row we report:
+ *   - `yBottom`: the baseline y-coordinate in PDF user-space points,
+ *     TOP-DOWN origin (matching `TemplateField.y` storage).
+ *   - `xMin` / `xMax`: the horizontal extent of the row's combined
+ *     text items, in PDF user-space points.
+ *
+ * pdf.js text items expose a `transform` array whose `[4]`/`[5]`
+ * elements are the item's PDF user-space x and BOTTOM-UP y. We flip
+ * the y to top-down by subtracting from the page height, so a row
+ * whose printed text reads near the top of the page yields a small
+ * `yBottom` and a row near the bottom yields a large one — matching
+ * how `TemplateField.y` is stored.
+ *
+ * Empty / whitespace-only items are skipped (they have no x extent
+ * worth aligning to). Items whose `width` is 0 or negative are also
+ * skipped (degenerate metadata items pdf.js occasionally emits for
+ * actual mark sequences inside form fields).
+ */
+async function extractTextRows(
+  page: pdfjsLib.PDFPageProxy,
+  pageHeightPt: number
+): Promise<Array<{ yBottom: number; xMin: number; xMax: number }>> {
+  const textContent = await page.getTextContent();
+  // Build a per-row accumulator keyed by rounded baseline y (in
+  // bottom-up PDF user-space). 2pt rounding handles the slight jitter
+  // between adjacent items on the same baseline (kerned glyphs,
+  // superscripts) without merging actual adjacent rows on dense
+  // forms (typical row spacing ≥ 10pt, so 2pt rounding never
+  // collapses them).
+  const ROW_KEY_PT = 2;
+  const rows = new Map<
+    number,
+    { yBottomBottomUp: number; xMin: number; xMax: number }
+  >();
+
+  type TextItem = {
+    str?: string;
+    transform?: number[];
+    width?: number;
+  };
+
+  for (const item of textContent.items as TextItem[]) {
+    const str = (item.str ?? "").trim();
+    if (!str) continue;
+    const transform = item.transform;
+    if (!Array.isArray(transform) || transform.length < 6) continue;
+    const x = transform[4];
+    const yBottomUp = transform[5];
+    const width = typeof item.width === "number" ? item.width : 0;
+    if (!Number.isFinite(x) || !Number.isFinite(yBottomUp) || width <= 0) continue;
+
+    const key = Math.round(yBottomUp / ROW_KEY_PT) * ROW_KEY_PT;
+    const existing = rows.get(key);
+    if (existing) {
+      existing.xMin = Math.min(existing.xMin, x);
+      existing.xMax = Math.max(existing.xMax, x + width);
+    } else {
+      rows.set(key, {
+        yBottomBottomUp: yBottomUp,
+        xMin: x,
+        xMax: x + width,
+      });
+    }
+  }
+
+  return Array.from(rows.values()).map((row) => ({
+    yBottom: pageHeightPt - row.yBottomBottomUp,
+    xMin: row.xMin,
+    xMax: row.xMax,
+  }));
 }
 
 
@@ -459,8 +574,27 @@ function buildPass1SharedSystemPrompt(): string {
     "  - If a field's surrounding text contains 'CVV', 'CVV2', 'CVC', 'security code', 'verification code', '3 digit', or '4 digit', the field is **always** `text` and `canonical_field_id: 'ccv'`. Do NOT classify it as a credit-card-type checkbox even if 'AMEX' or 'Visa' appears nearby — those words are part of the CVV instructional sentence.",
     "  - CVV / CVV2 / security code / `3 digit number` / `4 digits on front` → always `text`, NEVER `checkbox`. The blank may be drawn with a box outline, but the user types digits in it.",
     "  - Card number, expiration date, signature, name, address, phone, email → always `text`.",
-    "  - Visa / MasterCard / Discover / AMEX selector boxes → `checkbox`.",
+    "  - Visa / MasterCard / Discover / AMEX selector boxes (each with a drawn ☐ checkbox or radio circle next to the label) → `checkbox`.",
     "  - Any ☐ glyph or empty square the size of one letter → `checkbox`.",
+    "",
+    "## Option-group rule (v0.5.25) — horizontal label list with NO drawn checkboxes",
+    "When you see a horizontal list of mutually-exclusive labels (e.g. `Visa  MasterCard  AMEX  Discover  Other`), where there are NO checkboxes/circles/radio buttons drawn next to each label and the user is expected to circle, underline, or otherwise mark ONE of them — emit a SINGLE field with `field_type: 'option-group'`, `field_kind: 'option-group'`, and an `options` array. Each option entry MUST include:",
+    "  - `label`: the option's printed text (Title Case, e.g. `\"Visa\"`, `\"MasterCard\"`, `\"AMEX\"`, `\"Discover\"`, `\"Other\"`).",
+    "  - `bbox`: a TIGHT bbox around just THAT option's label text, in normalized 0-1000 `[y_min, x_min, y_max, x_max]` coordinates with the same 2-3pt of padding you would use for any tight label crop.",
+    "Do NOT emit individual `checkbox` fields for each label. Do NOT emit five separate `text` fields for the row. ONE field with a populated `options` array. The PARENT bbox covers the entire row of labels (including the leading caption like `Card Type:` if present? — NO: the parent bbox covers ONLY the option labels' horizontal extent, NOT the caption).",
+    "",
+    "If the row has a trailing `Other:___` continuation line (a writable blank after the `Other` option), emit the option-group as described AND ALSO emit a SEPARATE text field for the `Other:___` blank line. The `Other` option's bbox covers the printed word `Other`; the trailing `___` is its own field.",
+    "",
+    "Set `canonical_field_id: 'cardType'` when the option set matches the credit-card brand pattern (≥ 3 of {Visa, MasterCard, AMEX, Discover, Other}, case-insensitive synonyms allowed: `Mastercard`, `Master Card`, `Amex`, `American Express`, `Discover Card`).",
+    "",
+    "Few-shot examples for option-group:",
+    "  Form text: `Card Type:  Visa  MasterCard  AMEX  Discover  Other:_______`",
+    "    → emit ONE field with `field_type: 'option-group'`, `field_kind: 'option-group'`, `canonical_field_id: 'cardType'`, `label: 'Card Type'`, and `options: [{label: 'Visa', bbox: [...]}, {label: 'MasterCard', bbox: [...]}, {label: 'AMEX', bbox: [...]}, {label: 'Discover', bbox: [...]}, {label: 'Other', bbox: [...]}]` — five option entries, each bbox tight around the corresponding label text. The parent `bbox` covers the entire row of options. Do NOT emit four credit-card-checkbox fields.",
+    "    → ALSO emit one separate field with `field_type: 'text'`, `label: 'Other Card Type'`, covering the `_______` underscores after `Other:` (this is the user-typed continuation line, distinct from the option-group itself).",
+    "  Form text: `Method:  Cash  Check  Wire  Other` (no boxes drawn next to any label)",
+    "    → emit ONE field with `field_type: 'option-group'`, `field_kind: 'option-group'`, `label: 'Method'`, `options: [{label: 'Cash', bbox: [...]}, {label: 'Check', bbox: [...]}, {label: 'Wire', bbox: [...]}, {label: 'Other', bbox: [...]}]`. `canonical_field_id: null` (not a card-type pattern).",
+    "  Form text with drawn boxes: `☐ Visa  ☐ MasterCard  ☐ AMEX  ☐ Discover`",
+    "    → KEEP existing behaviour: emit four separate `field_type: 'checkbox'` fields, NOT an option-group. The drawn ☐ glyphs are the writable area.",
     "",
     "If you cannot precisely locate the writable area, OMIT the field. We strongly prefer 10 correctly-placed fields to 20 fields where half are sitting on labels.",
   ].join("\n");
@@ -606,6 +740,7 @@ const RESPONSE_SCHEMA: Record<string, unknown> = {
           "group_id",
           "optional",
           "estimated_font_size",
+          "options",
         ],
         required: ["page_number", "bbox", "field_type", "label"],
         properties: {
@@ -618,7 +753,10 @@ const RESPONSE_SCHEMA: Record<string, unknown> = {
             minItems: 4,
             maxItems: 4,
           },
-          field_type: { type: "string", enum: ["text", "checkbox"] },
+          field_type: {
+            type: "string",
+            enum: ["text", "checkbox", "option-group"],
+          },
           field_kind: {
             type: "string",
             enum: [
@@ -628,6 +766,7 @@ const RESPONSE_SCHEMA: Record<string, unknown> = {
               "signature",
               "checkbox-group",
               "boolean-checkbox",
+              "option-group",
             ],
           },
           label: { type: "string" },
@@ -643,6 +782,29 @@ const RESPONSE_SCHEMA: Record<string, unknown> = {
           group_id: { type: "string", nullable: true },
           optional: { type: "boolean" },
           estimated_font_size: { type: "number", nullable: true },
+          // v0.5.25 — option-group sub-rectangles. Required only when
+          // `field_type === "option-group"`. Each entry's `bbox` uses
+          // the same 0-1000 normalized [y_min, x_min, y_max, x_max]
+          // coordinate frame as the parent field's bbox.
+          options: {
+            type: "array",
+            description:
+              "For option-group fields: per-option entries. Each entry has a `label` and a tight `bbox` around just that label's text in normalized 0-1000 coords.",
+            nullable: true,
+            items: {
+              type: "object",
+              required: ["label", "bbox"],
+              properties: {
+                label: { type: "string" },
+                bbox: {
+                  type: "array",
+                  items: { type: "integer", minimum: 0, maximum: 1000 },
+                  minItems: 4,
+                  maxItems: 4,
+                },
+              },
+            },
+          },
         },
       },
     },
@@ -661,12 +823,14 @@ function clampNumber(value: number, min: number, max: number): number {
 
 function normalizeFieldKind(
   raw: string | undefined,
-  fieldType: "text" | "checkbox"
+  fieldType: "text" | "checkbox" | "option-group"
 ): TemplateFieldKind {
   if (raw && VALID_FIELD_KINDS.has(raw as TemplateFieldKind)) {
     return raw as TemplateFieldKind;
   }
-  return fieldType === "checkbox" ? "boolean-checkbox" : "text";
+  if (fieldType === "checkbox") return "boolean-checkbox";
+  if (fieldType === "option-group") return "option-group";
+  return "text";
 }
 
 /**
@@ -712,7 +876,7 @@ function alignmentDebugEnabled(): boolean {
 function inferByPattern(
   context: string | undefined,
   after: string | undefined,
-  fieldType: "text" | "checkbox"
+  fieldType: "text" | "checkbox" | "option-group"
 ): CanonicalFieldId | undefined {
   if (fieldType !== "text") return undefined;
   const ctx = (context ?? "").toLowerCase().trim();
@@ -760,11 +924,27 @@ function inferByPattern(
 function inferCanonicalId(
   context: string | undefined,
   after: string | undefined,
-  fieldType: "text" | "checkbox",
-  checkboxValue: string | null | undefined
+  fieldType: "text" | "checkbox" | "option-group",
+  checkboxValue: string | null | undefined,
+  options?: Array<{ label?: string }>
 ): CanonicalFieldId | undefined {
   const ctx = (context ?? "").toLowerCase();
   const aft = (after ?? "").toLowerCase();
+
+  // v0.5.25 — option-group preflight. If the field carries ≥ 3
+  // option labels matching the credit-card brand pattern (Visa,
+  // MasterCard, AMEX, Discover, Other), force canonical = `cardType`
+  // regardless of label match. The user-confirmed render is a
+  // hand-drawn-style oval around the chosen option; the option
+  // sub-bboxes are already tight on each label, so no further
+  // catalog mapping is needed.
+  if (fieldType === "option-group" && Array.isArray(options)) {
+    let cardTypeHits = 0;
+    for (const opt of options) {
+      if (normalizeCardTypeLabel(opt?.label)) cardTypeHits += 1;
+    }
+    if (cardTypeHits >= 3) return "cardType";
+  }
 
   if (fieldType === "checkbox") {
     // CVV/CVV2/security-code rows are sometimes drawn as a small box
@@ -902,7 +1082,7 @@ function inferCanonicalId(
  */
 function inferByLabel(
   label: string | undefined,
-  fieldType: "text" | "checkbox",
+  fieldType: "text" | "checkbox" | "option-group",
   checkboxValue: string | null | undefined
 ): CanonicalFieldId | undefined {
   const lbl = (label ?? "").toLowerCase().trim();
@@ -1084,7 +1264,7 @@ function cleanLabel(context: string | undefined, fallback: string): string {
 function bboxToPdfRect(
   bbox: number[] | undefined,
   page: RenderedPage,
-  fieldType: "text" | "checkbox"
+  fieldType: "text" | "checkbox" | "option-group"
 ): { x: number; y: number; width: number; height: number } | null {
   if (!Array.isArray(bbox) || bbox.length !== 4) return null;
   const [yMin, xMin, yMax, xMax] = bbox.map((n) =>
@@ -1154,8 +1334,17 @@ function mapToTemplateField(
 ): TemplateField | null {
   if (!raw || typeof raw !== "object") return null;
 
-  const rawFieldType: "text" | "checkbox" =
-    raw.field_type === "checkbox" ? "checkbox" : "text";
+  // v0.5.25 — option-group joins text/checkbox as a top-level field
+  // type. The model emits `field_type: "option-group"` along with an
+  // `options` array; downstream the snap pipeline skips option-group
+  // entirely (option sub-bboxes are already locked to label text and
+  // there's no underline stroke to snap to).
+  const rawFieldType: "text" | "checkbox" | "option-group" =
+    raw.field_type === "checkbox"
+      ? "checkbox"
+      : raw.field_type === "option-group"
+        ? "option-group"
+        : "text";
 
   // v0.5.22 — defensive page-number clamp. Gemini is supposed to
   // return `page_number` in `[1, pdf.numPages]` (the prompt says
@@ -1238,7 +1427,8 @@ function mapToTemplateField(
     raw.context_before,
     raw.context_after,
     rawFieldType,
-    raw.checkbox_value
+    raw.checkbox_value,
+    raw.options
   );
   const patternId = inferByPattern(raw.context_before, raw.context_after, rawFieldType);
   const geminiId =
@@ -1301,13 +1491,20 @@ function mapToTemplateField(
   // checkbox because the form draws a small box around the underline
   // — this override fixes it without trusting the model. Only kicks
   // in when we're confident in the canonical id.
-  const expectedType = canonicalDef
+  //
+  // v0.5.25 — option-group joins checkbox/text as a third expected
+  // type. The `cardType` canonical maps to option-group; coercion
+  // both directions (text → option-group, checkbox → option-group)
+  // happens here when the canonical id is sure.
+  const expectedType: "text" | "checkbox" | "option-group" | null = canonicalDef
     ? canonicalDef.fieldKind === "checkbox-group" ||
       canonicalDef.fieldKind === "boolean-checkbox"
       ? "checkbox"
-      : "text"
+      : canonicalDef.fieldKind === "option-group"
+        ? "option-group"
+        : "text"
     : null;
-  const fieldType: "text" | "checkbox" =
+  const fieldType: "text" | "checkbox" | "option-group" =
     expectedType && expectedType !== rawFieldType ? expectedType : rawFieldType;
   const fieldKind = normalizeFieldKind(raw.field_kind, fieldType);
 
@@ -1442,6 +1639,28 @@ function mapToTemplateField(
 
   const isCardCheckbox = canonicalId && CREDIT_CARD_CHECKBOX_IDS.has(canonicalId);
   const isBooleanCheckbox = fieldType === "checkbox" && !isCardCheckbox;
+  // v0.5.25 — option-group field. Convert each option's normalized
+  // 0-1000 bbox into PDF user-space points using the same
+  // `bboxToPdfRect` helper as the parent rect. We pass `"text"` for
+  // the option-level minDim because option labels are short text, not
+  // checkboxes, and the 12pt min-dim absorbs degenerate (zero-area)
+  // crops without distorting real label rects.
+  const isOptionGroup = fieldType === "option-group";
+  const fieldOptions: FieldOption[] | undefined = isOptionGroup
+    ? (Array.isArray(raw.options) ? raw.options : [])
+        .map((opt) => {
+          if (!opt || typeof opt !== "object") return null;
+          const label = (opt.label ?? "").trim();
+          if (!label) return null;
+          const optRect = bboxToPdfRect(opt.bbox, page, "text");
+          if (!optRect) return null;
+          return {
+            label,
+            bbox: optRect,
+          } as FieldOption;
+        })
+        .filter((o): o is FieldOption => o !== null)
+    : undefined;
 
   // v0.5.22 — height-gated canonical multiline override. Some
   // canonicals (currently only `billingAddress`) carry
@@ -1492,6 +1711,13 @@ function mapToTemplateField(
   let resolvedFieldKind: TemplateFieldKind;
   if (isBooleanCheckbox) {
     resolvedFieldKind = "boolean-checkbox";
+  } else if (isOptionGroup) {
+    // v0.5.25 — option-group is a top-level kind; it never falls back
+    // to text/checkbox-group. The catalog override is only meaningful
+    // when an option-group field also carries a canonical id (e.g.
+    // `cardType`) and that canonical's `fieldKind` is `"option-group"`
+    // — already the expected value.
+    resolvedFieldKind = "option-group";
   } else if (
     canonicalDef?.fieldKind === "multiline" &&
     fieldKind !== "multiline" &&
@@ -1568,9 +1794,18 @@ function mapToTemplateField(
         ? geminiLabel
         : cleanLabel(raw.context_before, `Field ${index + 1}`));
 
-  const isUnmappedText = !isBooleanCheckbox && !isCardCheckbox && !catalogKey;
+  // v0.5.25 — option-group fields map to `creditCardType` when the
+  // canonical is `cardType`, falling back to `__prompt__` for any
+  // option-group with no canonical match (e.g. a Cash/Check/Wire
+  // selector). The selected option label is captured at fill time
+  // via `selectedOption` rather than via the project value, so the
+  // mapping is mostly a hint for the UI's "what does this field
+  // bind to" copy.
+  const isUnmappedOptionGroup = isOptionGroup && !catalogKey;
+  const isUnmappedText =
+    !isBooleanCheckbox && !isCardCheckbox && !isOptionGroup && !catalogKey;
   const mappedKey: TemplateMappedProjectKey =
-    isBooleanCheckbox || isUnmappedText
+    isBooleanCheckbox || isUnmappedText || isUnmappedOptionGroup
       ? "__prompt__"
       : ((catalogKey || "") as TemplateMappedProjectKey);
 
@@ -1607,12 +1842,157 @@ function mapToTemplateField(
     fieldKind: resolvedFieldKind,
     detectionSource: "gemini",
     checkboxValue,
+    options: fieldOptions,
+    selectedOption: isOptionGroup ? null : undefined,
     groupId: raw.group_id ?? canonicalDef?.groupId ?? undefined,
-    promptLabel: isBooleanCheckbox || isUnmappedText ? fieldLabel : undefined,
+    promptLabel:
+      isBooleanCheckbox || isUnmappedText || isUnmappedOptionGroup
+        ? fieldLabel
+        : undefined,
     optional: raw.optional ?? undefined,
     estimatedFontSize,
     contextSnippet: buildContextSnippet(raw.context_before, raw.context_after),
   };
+}
+
+/**
+ * v0.5.25 — option-group merge pass. Catches the regression case where
+ * Gemini emits a card-type row as 3-5 separate text/checkbox fields
+ * instead of one option-group field. We merge them back into a single
+ * option-group when:
+ *
+ *   1. ≥ 3 of the candidate fields' labels normalise to a card-type
+ *      label (Visa, MasterCard, AMEX, Discover, Other).
+ *   2. They sit on the same page and approximately the same row
+ *      (vertical center within 8pt).
+ *   3. They are horizontally adjacent — the merged horizontal extent
+ *      is no more than 1.5× the sum of individual widths plus gaps,
+ *      which weeds out cases where a stray "Visa" elsewhere on the
+ *      form gets mixed in.
+ *
+ * The merged option-group inherits the union bbox (min x, min y,
+ * max x+w, max y+h) as its parent rect; each option carries its
+ * own per-label bbox derived from the original field's rect. The
+ * merged field is canonical = `cardType` (the option-group preflight
+ * in `inferCanonicalId` would have picked the same id). Original
+ * fields are dropped from the output.
+ *
+ * Conservative scope: only triggers when ≥ 3 card-type labels are
+ * detected. Two-label rows (e.g. just `Visa  MasterCard`) are too
+ * easy to false-positive against unrelated horizontal lists, and the
+ * detector almost never emits exactly two card-type fields on a real
+ * card-type row anyway — most credit-card forms list at least
+ * Visa/MC/AMEX or Visa/MC/AMEX/Discover.
+ *
+ * Runs BEFORE `dedupeFields` so the dedup pass operates on the
+ * already-merged shape. The merge does not interact with
+ * `__prompt__` mapping (the resulting field maps to `creditCardType`
+ * via the `cardType` canonical's catalog entry).
+ */
+function mergeCardTypeOptionGroup(fields: TemplateField[]): TemplateField[] {
+  const byPage = new Map<number, TemplateField[]>();
+  for (const f of fields) {
+    const list = byPage.get(f.pageNumber) ?? [];
+    list.push(f);
+    byPage.set(f.pageNumber, list);
+  }
+
+  const merged: TemplateField[] = [];
+  const consumed = new Set<string>();
+
+  for (const [, pageFields] of byPage) {
+    // Find candidate card-type labels on this page.
+    const cardCandidates = pageFields
+      .map((field) => {
+        const norm = normalizeCardTypeLabel(field.label);
+        return norm ? { field, normalized: norm } : null;
+      })
+      .filter((x): x is { field: TemplateField; normalized: string } => x !== null);
+
+    if (cardCandidates.length < 3) continue;
+
+    // Group by row: cluster candidates whose vertical centers are
+    // within 8pt of each other (same row on a normal form).
+    const rows: Array<Array<{ field: TemplateField; normalized: string }>> = [];
+    for (const cand of cardCandidates) {
+      const cy = cand.field.y + cand.field.height / 2;
+      const row = rows.find((r) => {
+        const refCy = r[0].field.y + r[0].field.height / 2;
+        return Math.abs(refCy - cy) <= 8;
+      });
+      if (row) row.push(cand);
+      else rows.push([cand]);
+    }
+
+    for (const row of rows) {
+      if (row.length < 3) continue;
+
+      // Sort by x — left-to-right reading order.
+      row.sort((a, b) => a.field.x - b.field.x);
+
+      // Pick the FIRST occurrence of each canonical label so we don't
+      // create duplicate options when (e.g.) two Visa text fields
+      // were emitted for one row.
+      const seen = new Set<string>();
+      const picked: typeof row = [];
+      for (const cand of row) {
+        if (seen.has(cand.normalized)) continue;
+        seen.add(cand.normalized);
+        picked.push(cand);
+      }
+      if (picked.length < 3) continue;
+
+      // Sanity guard: refuse to merge if the row spans more than
+      // 75% of a typical US-Letter page width (≈ 460pt). Real
+      // card-type rows on real forms span 200–360pt; anything wider
+      // is almost certainly a false-positive cluster of unrelated
+      // labels with `Visa` somewhere in the form copy.
+      const minX = Math.min(...picked.map((p) => p.field.x));
+      const maxX = Math.max(...picked.map((p) => p.field.x + p.field.width));
+      const minY = Math.min(...picked.map((p) => p.field.y));
+      const maxY = Math.max(...picked.map((p) => p.field.y + p.field.height));
+      if (maxX - minX > 460) continue;
+
+      const options: FieldOption[] = picked.map((p) => ({
+        label: p.normalized,
+        bbox: {
+          x: p.field.x,
+          y: p.field.y,
+          width: p.field.width,
+          height: p.field.height,
+        },
+      }));
+
+      const firstField = picked[0].field;
+      const mergedField: TemplateField = {
+        id: `option-group-cardType-${firstField.pageNumber}-${Math.round(minX)}-${Math.round(minY)}`,
+        label: "Card Type",
+        mappedProjectKey: "creditCardType",
+        canonicalFieldId: "cardType",
+        pageNumber: firstField.pageNumber,
+        x: minX,
+        y: minY,
+        width: maxX - minX,
+        height: maxY - minY,
+        confidence: 0.85,
+        fieldType: "option-group",
+        fieldKind: "option-group",
+        detectionSource: "gemini",
+        options,
+        selectedOption: null,
+      };
+      merged.push(mergedField);
+      for (const p of picked) consumed.add(p.field.id);
+
+      console.log(
+        `[Typeset Gemini] Merged ${picked.length} sibling fields into one option-group cardType field (${picked.map((p) => p.normalized).join(", ")}) on page ${firstField.pageNumber}.`
+      );
+    }
+  }
+
+  if (consumed.size === 0) return fields;
+  const out = fields.filter((f) => !consumed.has(f.id));
+  return [...out, ...merged];
 }
 
 /**
@@ -2075,7 +2455,11 @@ function mapPass1RawFields(
       rawByFieldId.set(field.id, raw);
     }
   }
-  const deduped = dedupeFields(mapped);
+  // v0.5.25 — option-group merge runs BEFORE dedup so the merged
+  // cardType field is the one that participates in dedup overlap
+  // checks (the original 4-5 sibling text/checkbox fields disappear).
+  const groupMerged = mergeCardTypeOptionGroup(mapped);
+  const deduped = dedupeFields(groupMerged);
 
   // Drop any raw entries whose mapped field got dedup'd away — the QC
   // pass should only audit fields we actually kept.
@@ -2303,6 +2687,11 @@ async function detectFieldsImpl(
       width: p.widthPx,
       height: p.heightPx,
       pdfPointsPerPixel: p.pageWidthPt / Math.max(1, p.widthPx),
+      // v0.5.25 — pass through the text-row geometry pulled in
+      // `renderPagesToPng` so the snap's text-row fallback has
+      // something to work with on fields whose stroke search comes
+      // up empty.
+      textRows: p.textRows,
     };
   }
 
@@ -2486,6 +2875,9 @@ function buildQualityControlSystemPrompt(): string {
     "  (b) the printed card name appears IMMEDIATELY to the right of the box on the same horizontal scan line, AND",
     "  (c) the row context does NOT mention CVV / CVC / security / verification code / 'digit'.",
     "If those conditions don't hold, the field is not a card-type checkbox. Fix it accordingly.",
+    "",
+    "### 3b. Option-group misses (v0.5.25)",
+    "If Pass 1 emitted four or five SEPARATE checkbox fields for a card-type row but there are NO drawn ☐/circle glyphs next to each label on the page (the labels are just bare horizontal text the user is meant to circle), the row should have been ONE `option-group` field, not four checkboxes. Action: `keep` each of the existing fields (do NOT drop them — Pass 1 is a separate pass and the merge happens deterministically downstream). Mark Pass-1's misclassification by leaving them as `keep` and trust the post-processing merge step. Symmetric: if Pass 1 emitted ONE `option-group` field for a row that DOES have drawn ☐ glyphs next to each label, mark each as `keep` — the merge step is one-way (split → group). The post-processing merge runs in `geminiFieldDetector.ts` regardless of Pass 2's output.",
     "",
     "### 4. Duplicates — IoU > 0.5 AND same canonical id",
     "Only treat two fields as duplicates when ALL of the following hold:",

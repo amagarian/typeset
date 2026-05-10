@@ -1713,6 +1713,7 @@ function MainApp() {
         <FillPromptModal
           template={fillPromptModal.template}
           pdfBytes={fillPromptModal.sourceBytes}
+          project={selectedProject}
           mode={fillPromptModal.mode}
           initialValues={promptValuesByTemplate[fillPromptModal.template.id] ?? {}}
           onClose={() => setFillPromptModal(null)}

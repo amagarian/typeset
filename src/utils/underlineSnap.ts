@@ -346,6 +346,27 @@ export interface PageRender {
    * pixels — `pixelsPerPoint = 1 / pdfPointsPerPixel`.
    */
   pdfPointsPerPixel: number;
+  /**
+   * v0.5.25 — per-page text-row geometry pulled from pdf.js, used by
+   * the {@link tryTextRowSnap} fallback that runs when the stroke
+   * search reports `skipped:no-stroke`. Each row carries a baseline
+   * y-coordinate (`yBottom`) and horizontal extent (`xMin`/`xMax`)
+   * in PDF user-space points, top-down origin (matching
+   * `TemplateField.y` / `TemplateField.x`). Optional — the snap
+   * pipeline degrades gracefully (skipped:no-stroke) when text rows
+   * are missing.
+   */
+  textRows?: Array<{ yBottom: number; xMin: number; xMax: number }>;
+}
+
+/**
+ * v0.5.25 — single text row, exported for upstream callers that
+ * extract their own geometry. Same shape as `PageRender.textRows[i]`.
+ */
+export interface TextRow {
+  yBottom: number;
+  xMin: number;
+  xMax: number;
 }
 
 export interface SnapOptions {
@@ -522,6 +543,28 @@ export interface SnapOptions {
    */
   maxWidthRatio?: number;
   /**
+   * v0.5.25 — text-row fallback (vertical-only). When the stroke
+   * search reports `skipped:no-stroke`, a secondary pass tries to
+   * align the bbox bottom to the baseline of the surrounding text
+   * row. Settings:
+   *   - `textRowMaxDeltaPoints` (default 12pt): the baseline must be
+   *     within this many points of the field's current bbox bottom
+   *     for the fallback to trigger. Bigger deltas are almost always
+   *     a wrong row pick (e.g. one paragraph above or below).
+   *   - `textRowMinHorizontalOverlap` (default 0.25): the row's
+   *     horizontal extent must overlap the field's `x` range by at
+   *     least this fraction of the field's width. Filters out rows
+   *     on the other side of the page that happen to share a
+   *     baseline (multi-column forms).
+   *   - `textRowEligibleKinds` is the set of field kinds the
+   *     fallback applies to. By default text/multiline/date — NOT
+   *     signatures (signatures should stay where Gemini placed them
+   *     since they often sit above an extensible line that may or
+   *     may not have a printed stroke).
+   */
+  textRowMaxDeltaPoints?: number;
+  textRowMinHorizontalOverlap?: number;
+  /**
    * If true, log per-field snap decisions to the console when
    * EITHER `localStorage["typeset.debug.alignment"] === "true"` OR
    * the build is in DEV mode (`import.meta.env.DEV`). The
@@ -550,6 +593,8 @@ const DEFAULT_OPTIONS: Required<SnapOptions> = {
   maxHorizontalDeltaPoints: 30,
   minWidthPoints: 12,
   maxWidthRatio: 1.5,
+  textRowMaxDeltaPoints: 12,
+  textRowMinHorizontalOverlap: 0.25,
   verbose: false,
 };
 
@@ -606,6 +651,22 @@ interface SnapCounts {
   tooFar: number;
   skippedNonText: number;
   skippedNoPage: number;
+  /**
+   * v0.5.25 — text-row fallback fired. Counts fields where the
+   * stroke search reported `skipped:no-stroke` AND a nearby text
+   * row baseline was found within the `textRowMaxDeltaPoints`
+   * window. The field's `y` is shifted so `bbox_bottom = textRow.yBottom`.
+   */
+  textRowSnapped: number;
+  /**
+   * v0.5.25 — counter for fields where BOTH the stroke search and
+   * the text-row fallback failed. Distinct from `noStroke` because
+   * we want to know how often the fallback couldn't find anything
+   * usable (vs how often the fallback succeeded). The sum
+   * `noStroke + textRowSnapped + textRowNoMatch` equals the total
+   * stroke-skipped count on the old reporting axis.
+   */
+  textRowNoMatch: number;
   /**
    * Horizontal snap fired AND the new run substantially
    * overlapped (≥ 50% on both old and new) the original bbox —
@@ -1206,13 +1267,93 @@ function tryHorizontalSnap(
 }
 
 /**
+ * v0.5.25 — text-row fallback eligibility. The fallback runs only on
+ * text-typed fields (the outer `fieldType !== "text"` guard already
+ * excludes checkboxes / option-groups before this is consulted) and
+ * skips signatures. Signatures often sit above an EXTENSIBLE printed
+ * line that may or may not have a corresponding text-layer baseline;
+ * aligning them to a text row would force-clamp the writable area,
+ * negating the user-extensible nature of signature lines.
+ *
+ * Multiline kinds reach this point too (the snap currently early-
+ * returns on multiline, but the fallback gate stays open in case a
+ * future revision allows multiline to pass), so we accept them
+ * explicitly.
+ */
+function isTextRowEligible(field: TemplateField): boolean {
+  if (field.fieldKind === "signature") return false;
+  if (field.fieldKind === "option-group") return false;
+  return true;
+}
+
+/**
+ * v0.5.25 — text-row fallback. Find the text row whose baseline
+ * `yBottom` is closest to the field's current `bbox_bottom`, within
+ * `textRowMaxDeltaPoints` of the field. Filter to rows whose
+ * horizontal extent overlaps the field's `x` range by at least
+ * `textRowMinHorizontalOverlap × field.width`. If a candidate is
+ * found, return the corrected `y` so `bbox_bottom = row.yBottom`.
+ *
+ * Returns `null` if:
+ *   - The field is not eligible (signature, option-group).
+ *   - No text rows are available on this page.
+ *   - No text row is within the vertical / horizontal-overlap
+ *     gates.
+ *
+ * The caller is responsible for incrementing the appropriate
+ * counter and logging.
+ */
+function tryTextRowSnap(
+  field: TemplateField,
+  render: PageRender,
+  opts: Required<SnapOptions>,
+  wantLog: boolean
+): { newY: number; row: { yBottom: number; xMin: number; xMax: number } } | null {
+  if (!isTextRowEligible(field)) return null;
+  const textRows = render.textRows;
+  if (!Array.isArray(textRows) || textRows.length === 0) return null;
+
+  const fieldBottom = field.y + field.height;
+  const fieldLeft = field.x;
+  const fieldRight = field.x + field.width;
+  const fieldWidth = Math.max(1, field.width);
+
+  let best: { row: typeof textRows[number]; absDelta: number } | null = null;
+  for (const row of textRows) {
+    const absDelta = Math.abs(row.yBottom - fieldBottom);
+    if (absDelta > opts.textRowMaxDeltaPoints) continue;
+    const overlapLeft = Math.max(fieldLeft, row.xMin);
+    const overlapRight = Math.min(fieldRight, row.xMax);
+    const overlap = Math.max(0, overlapRight - overlapLeft);
+    if (overlap / fieldWidth < opts.textRowMinHorizontalOverlap) continue;
+    if (!best || absDelta < best.absDelta) {
+      best = { row, absDelta };
+    }
+  }
+
+  if (!best) return null;
+
+  const newY = best.row.yBottom - field.height;
+  const deltaY = newY - field.y;
+  if (wantLog) {
+    console.log(
+      `[underlineSnap] field=${field.id} page=${field.pageNumber} result=snapped-text-row deltaY=${deltaY.toFixed(2)}pt textRowY=${best.row.yBottom.toFixed(2)} (no stroke nearby; aligned to text baseline; |Δ|=${best.absDelta.toFixed(2)}pt ≤ ${opts.textRowMaxDeltaPoints}pt)`
+    );
+  }
+  return { newY, row: best.row };
+}
+
+/**
  * Vertical-underline snap, one field at a time. See module header
  * for the full algorithm rationale; comments inline annotate each
  * step of the pipeline. v0.5.19 layers a horizontal snap on top:
  * after the vertical snap fires (Step 8), {@link tryHorizontalSnap}
  * traces the chosen stroke's row to refine `x`/`width`. The
  * vertical pipeline is unchanged — every threshold, gate, and
- * snap-target equation is preserved verbatim from v0.5.18.
+ * snap-target equation is preserved verbatim from v0.5.18. v0.5.25
+ * adds a {@link tryTextRowSnap} fallback that runs when the stroke
+ * search reports `skipped:no-stroke`, aligning `bbox_bottom` to the
+ * baseline of the nearest text row in the PDF text layer.
  */
 function snapOneField(
   field: TemplateField,
@@ -1241,7 +1382,13 @@ function snapOneField(
   // `scoreThreshold`, and ambiguity guards still apply unchanged —
   // false positives on signature rows would be filtered the same
   // way they are for text rows.
-  if (field.fieldKind === "multiline") {
+  //
+  // v0.5.25: option-group fields ARE NOT eligible. Their option
+  // sub-bboxes are already locked to label positions (no underline
+  // stroke to snap to); the parent rect's `fieldType` is
+  // `"option-group"` so this `fieldType !== "text"` check above
+  // already handles them — this block is for kind-only safety.
+  if (field.fieldKind === "multiline" || field.fieldKind === "option-group") {
     counts.skippedNonText += 1;
     return field;
   }
@@ -1323,15 +1470,47 @@ function snapOneField(
   }
 
   if (candidates.length === 0) {
-    counts.noStroke += 1;
-    if (wantLog) {
-      logDecision(
-        field,
-        "skipped:no-stroke",
-        0,
-        -1,
-        `(highestScore=${highestScore.toFixed(2)} < ${opts.scoreThreshold} or failed thinness gate)`
-      );
+    // v0.5.25 — text-row fallback (vertical-only). Some forms render
+    // a label like `Expiration Date (MM/YY)` with NO printed
+    // underline next to it; the user just writes after the label.
+    // Gemini's bbox is its best guess at where the typed text will
+    // sit, but Gemini routinely places it visibly low because there
+    // is no stroke to anchor on. The fallback aligns
+    // `bbox_bottom` to the baseline of the nearest text row in the
+    // PDF text layer.
+    //
+    // Conservative: only runs on text/multiline/date kinds. Signatures
+    // are excluded — signature fields often sit above an extensible
+    // line that may or may not exist; aligning them to a text-row
+    // baseline can constrict the writable area.
+    const textRowResult = tryTextRowSnap(field, render, opts, wantLog);
+    if (textRowResult) {
+      counts.textRowSnapped += 1;
+      return { ...field, y: textRowResult.newY };
+    }
+
+    if (
+      Array.isArray(render.textRows) &&
+      render.textRows.length > 0 &&
+      isTextRowEligible(field)
+    ) {
+      counts.textRowNoMatch += 1;
+      if (wantLog) {
+        console.log(
+          `[underlineSnap] field=${field.id} page=${field.pageNumber} result=skipped:no-stroke-no-text-row deltaY=0.00pt strokeRow=-1 (highestScore=${highestScore.toFixed(2)} < ${opts.scoreThreshold}; no text row within ±${opts.textRowMaxDeltaPoints}pt with ≥${(opts.textRowMinHorizontalOverlap * 100).toFixed(0)}% overlap)`
+        );
+      }
+    } else {
+      counts.noStroke += 1;
+      if (wantLog) {
+        logDecision(
+          field,
+          "skipped:no-stroke",
+          0,
+          -1,
+          `(highestScore=${highestScore.toFixed(2)} < ${opts.scoreThreshold} or failed thinness gate)`
+        );
+      }
     }
     return field;
   }
@@ -1514,6 +1693,8 @@ export function snapFieldsToUnderlines(
     tooFar: 0,
     skippedNonText: 0,
     skippedNoPage: 0,
+    textRowSnapped: 0,
+    textRowNoMatch: 0,
     hSnappedResizeFit: 0,
     hSnappedRelocate: 0,
     hSkippedNoStroke: 0,
@@ -1555,8 +1736,21 @@ export function snapFieldsToUnderlines(
   // The order of the skip counters mirrors the order of the
   // checks in `tryHorizontalSnap` so a reader can match the
   // summary back to the per-field decisions.
+  // v0.5.25 — surface `textRowSnapped` and `textRowNoMatch` next to
+  // the existing `noStroke` counter. Together they account for every
+  // field where the stroke search reported `skipped:no-stroke`:
+  //   - `textRowSnapped`: text-row fallback fired (bbox aligned to
+  //     baseline of nearest text row in the PDF text layer).
+  //   - `noStroke`: still skipped (signature, no eligible text row,
+  //     or text rows missing on this page).
+  //   - `textRowNoMatch`: eligible field with text rows present but
+  //     none within the gate (vertical Δ ≤ textRowMaxDeltaPoints AND
+  //     horizontal-overlap ≥ textRowMinHorizontalOverlap).
   console.log(
     `[underlineSnap] snapped ${counts.snapped}/${textConsidered} text fields, skipped ${counts.noStroke} (no stroke), ${counts.ambiguous} (ambiguous), ${counts.tooFar} (too far)` +
+      (counts.textRowSnapped > 0 || counts.textRowNoMatch > 0
+        ? ` — text-row fallback ${counts.textRowSnapped} snapped, ${counts.textRowNoMatch} no-match`
+        : "") +
       (counts.skippedNonText > 0 || counts.skippedNoPage > 0
         ? ` — ignored ${counts.skippedNonText} non-text + ${counts.skippedNoPage} unrendered`
         : "") +

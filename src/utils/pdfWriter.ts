@@ -1,6 +1,13 @@
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import type { Project, Template, TemplateField } from "@/types";
-import { getTemplateFieldValue, normalizeCardType, repairTemplateMappings, type PromptFieldValues } from "@/utils/fill";
+import {
+  getOptionGroupSelection,
+  getTemplateFieldValue,
+  normalizeCardType,
+  repairTemplateMappings,
+  type PromptFieldValues,
+} from "@/utils/fill";
+import { normalizeCardTypeLabel } from "@/utils/fieldCatalog";
 
 function isCheckboxField(field: TemplateField): boolean {
   return (
@@ -15,6 +22,16 @@ function isSignatureField(field: TemplateField): boolean {
     field.mappedProjectKey === "cardholderSignature" ||
     field.fieldKind === "signature"
   );
+}
+
+/**
+ * v0.5.25 — option-group field check. Identifies the
+ * card-type-style horizontal label list the user circles to indicate
+ * their selection. The `pdfWriter` draws a hand-drawn-style oval
+ * around the selected option's bbox at fill time.
+ */
+function isOptionGroupField(field: TemplateField): boolean {
+  return field.fieldType === "option-group" || field.fieldKind === "option-group";
 }
 
 function fitTextToWidth(text: string, width: number, font: any, fontSize: number): string {
@@ -80,6 +97,58 @@ export async function writeFilledPdfBytes(
     const page = pages[pageIndex];
 
     const pageHeight = page.getHeight();
+
+    // v0.5.25 — option-group fields render BEFORE the value gate
+    // because their "value" is the selected option label rather than
+    // a project-string lookup. We skip cleanly when nothing is
+    // selected (no oval drawn — fill-time skip yields a blank field).
+    if (isOptionGroupField(field)) {
+      if (!Array.isArray(field.options) || field.options.length === 0) continue;
+      const selectedLabel = getOptionGroupSelection(
+        project,
+        field,
+        promptValues
+      );
+      if (!selectedLabel) continue;
+      const targetLabel = selectedLabel.toLowerCase();
+      const targetNormalised = normalizeCardTypeLabel(selectedLabel);
+      const chosen = field.options.find((opt) => {
+        if (opt.label.toLowerCase() === targetLabel) return true;
+        if (
+          targetNormalised &&
+          normalizeCardTypeLabel(opt.label) === targetNormalised
+        ) {
+          return true;
+        }
+        return false;
+      });
+      if (!chosen) continue;
+
+      // Hand-drawn-style oval around the selected option's bbox. ~3pt
+      // padding on each side, ~1pt stroke. pdf-lib's `drawEllipse`
+      // takes a center point + xScale/yScale (radii), drawing a true
+      // ellipse with no fill. The slight imperfection users perceive
+      // as hand-drawn comes naturally from the rounded geometry; we
+      // don't try to wobble the path because pdf-lib's stroke
+      // renderer is exact, and a wobble would feel artificial.
+      const padding = 3;
+      const ovalCenterX = chosen.bbox.x + chosen.bbox.width / 2;
+      const ovalCenterYTop = chosen.bbox.y + chosen.bbox.height / 2;
+      const ovalCenterYPdf = pageHeight - ovalCenterYTop;
+      const ovalRx = chosen.bbox.width / 2 + padding;
+      const ovalRy = chosen.bbox.height / 2 + padding;
+
+      page.drawEllipse({
+        x: ovalCenterX,
+        y: ovalCenterYPdf,
+        xScale: ovalRx,
+        yScale: ovalRy,
+        borderColor: rgb(0.08, 0.08, 0.08),
+        borderWidth: 1.0,
+      });
+      continue;
+    }
+
     const rawValue = getTemplateFieldValue(project, field, promptValues, siblingKeys);
     if (!rawValue) continue;
 

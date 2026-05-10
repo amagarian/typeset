@@ -38,7 +38,62 @@ export function getTemplateFieldPromptLabel(field: TemplateField): string {
 }
 
 export function getPromptFields(template: Template): TemplateField[] {
-  return template.fields.filter((field) => field.mappedProjectKey === "__prompt__");
+  // v0.5.25 — option-group fields ALWAYS appear in the fill prompt
+  // (regardless of their `mappedProjectKey`). Users want to pick the
+  // card type per-fill rather than relying solely on the project's
+  // stored `creditCardType`, especially on multi-card workflows where
+  // the same project signs multiple authorisations on different
+  // brands. The prompt UI seeds the picker from the project value
+  // (via `getOptionGroupSelection`) so the typical case stays
+  // single-click.
+  return template.fields.filter(
+    (field) =>
+      field.mappedProjectKey === "__prompt__" || isOptionGroupField(field)
+  );
+}
+
+/**
+ * v0.5.25 — option-group field check shared between pdfWriter and the
+ * UI. Branches on either `fieldType` or `fieldKind` so legacy
+ * templates that only set one of the two still classify correctly.
+ */
+export function isOptionGroupField(field: TemplateField): boolean {
+  return (
+    field.fieldType === "option-group" || field.fieldKind === "option-group"
+  );
+}
+
+/**
+ * v0.5.25 — resolve the label of the currently-selected option for
+ * an `option-group` field. Resolution order:
+ *   1. Explicit prompt value submitted from `FillPromptModal` (the
+ *      user just picked one).
+ *   2. The field's own `selectedOption` (a default chosen at
+ *      template-edit time, or persisted from a prior fill).
+ *   3. For `cardType` canonicals: project's `creditCardType` value
+ *      (collapsed via `normalizeCardType` to the canonical four
+ *      brand keys), then mapped back to the matching option's label
+ *      (case-insensitive synonym match).
+ *   4. Empty string (no oval drawn).
+ */
+export function getOptionGroupSelection(
+  project: Project,
+  field: TemplateField,
+  promptValues: PromptFieldValues = {}
+): string {
+  const fromPrompt = promptValues[field.id]?.trim();
+  if (fromPrompt) return fromPrompt;
+  const fromField = field.selectedOption?.trim();
+  if (fromField) return fromField;
+  if (field.canonicalFieldId === "cardType") {
+    const normalised = normalizeCardType(project.creditCardType);
+    if (!normalised) return "";
+    if (normalised === "visa") return "Visa";
+    if (normalised === "mastercard") return "MasterCard";
+    if (normalised === "amex") return "AMEX";
+    if (normalised === "discover") return "Discover";
+  }
+  return "";
 }
 
 /**

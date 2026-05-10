@@ -11,6 +11,69 @@ export interface CanonicalFieldDefinition {
   groupId?: string;
   multiline?: boolean;
   allowDuplicates?: boolean;
+  /**
+   * For `option-group` canonicals (v0.5.25): the canonical option set
+   * the renderer/UI defaults to. The actual per-option bboxes ship on
+   * the detected `TemplateField` (see {@link TemplateField.options}),
+   * but the canonical option set lets the alias-matcher recognise a
+   * row of mutually-exclusive labels even when the model emits them
+   * as separate fields and we need to stitch them back together.
+   */
+  optionSet?: string[];
+}
+
+/**
+ * Canonical option labels for `cardType` (v0.5.25). The first match
+ * wins when normalising detected labels — e.g. `Mastercard`,
+ * `MASTERCARD`, `master card`, and `MC` all collapse to `MasterCard`.
+ * `Other` is a special "user-typed continuation" option; the form's
+ * `Other:___` line is detected as a separate text field via the
+ * existing pipeline.
+ */
+export const CARD_TYPE_OPTION_SET: ReadonlyArray<string> = [
+  "Visa",
+  "MasterCard",
+  "AMEX",
+  "Discover",
+  "Other",
+];
+
+/**
+ * Synonym set for card-type label matching (case-insensitive). Used by
+ * both the option-group merge pass (Gemini sometimes splits the row
+ * into separate text fields) and by `inferCanonicalId`'s preflight
+ * check that promotes any option-group whose options match the
+ * card-type pattern to canonical `cardType`.
+ */
+export const CARD_TYPE_LABEL_SYNONYMS: Record<string, string> = {
+  visa: "Visa",
+  mastercard: "MasterCard",
+  "master card": "MasterCard",
+  mc: "MasterCard",
+  amex: "AMEX",
+  "american express": "AMEX",
+  americanexpress: "AMEX",
+  discover: "Discover",
+  "discover card": "Discover",
+  other: "Other",
+};
+
+/**
+ * Normalise a detected option label into its canonical form, or
+ * `undefined` if it is not a recognised card-type label. Used by the
+ * card-type detector to decide whether a row of horizontal labels
+ * really IS a card-type selector vs an unrelated horizontal list.
+ */
+export function normalizeCardTypeLabel(raw: string | undefined): string | undefined {
+  if (!raw) return undefined;
+  const key = raw.trim().toLowerCase().replace(/[^a-z\s]/g, "");
+  if (!key) return undefined;
+  if (CARD_TYPE_LABEL_SYNONYMS[key]) return CARD_TYPE_LABEL_SYNONYMS[key];
+  const collapsed = key.replace(/\s+/g, " ");
+  if (CARD_TYPE_LABEL_SYNONYMS[collapsed]) return CARD_TYPE_LABEL_SYNONYMS[collapsed];
+  const compact = key.replace(/\s+/g, "");
+  if (CARD_TYPE_LABEL_SYNONYMS[compact]) return CARD_TYPE_LABEL_SYNONYMS[compact];
+  return undefined;
 }
 
 export const CANONICAL_FIELD_DEFINITIONS: CanonicalFieldDefinition[] = [
@@ -260,6 +323,38 @@ export const CANONICAL_FIELD_DEFINITIONS: CanonicalFieldDefinition[] = [
     checkboxValue: "amex",
     groupId: "creditCardType",
     sectionHints: ["payment", "card-type"],
+  },
+  // v0.5.25 — option-group form of the card-type selector. Used on
+  // forms that render the selector as a horizontal list of labels
+  // with NO drawn checkboxes/circles (industry-standard credit-card
+  // UX where the user circles the chosen option). The Arrow CC
+  // Authorization form is the canonical example: a single row reads
+  // `Card Type: Visa  MasterCard  AMEX  Discover  Other:___`. The
+  // Other:___ portion is a separate text field; the rest is one
+  // option-group field.
+  //
+  // Coexists with the four `creditCardType*` checkbox canonicals
+  // above for backward compat with forms that DO draw checkboxes
+  // beside each label. The detector picks the right shape based on
+  // visual evidence: if drawn checkboxes are present, Gemini emits
+  // four `creditCardType*` checkbox-group fields; if no checkboxes
+  // are drawn, Gemini emits a single `option-group` field with an
+  // `options` array, which `inferCanonicalId`'s preflight promotes
+  // to this canonical.
+  {
+    id: "cardType",
+    label: "Card Type",
+    mappedProjectKey: "creditCardType",
+    fieldKind: "option-group",
+    aliases: [
+      "card type",
+      "type of card",
+      "credit card type",
+      "card brand",
+      "payment method",
+    ],
+    sectionHints: ["payment", "card-type"],
+    optionSet: [...CARD_TYPE_OPTION_SET],
   },
 ];
 

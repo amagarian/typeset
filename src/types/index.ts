@@ -23,6 +23,7 @@ export type CanonicalFieldId =
   | "creditCardTypeMastercard"
   | "creditCardTypeDiscover"
   | "creditCardTypeAmex"
+  | "cardType"
   | "creditCardHolder"
   | "cardholderSignature"
   | "creditCardNumber"
@@ -35,7 +36,38 @@ export type TemplateFieldKind =
   | "date"
   | "signature"
   | "checkbox-group"
-  | "boolean-checkbox";
+  | "boolean-checkbox"
+  | "option-group";
+
+/**
+ * One option inside an `option-group` field (v0.5.25). Each option has
+ * a label string and a tight bbox in PDF user-space points around just
+ * that label's printed text. When the user picks a label, the form
+ * filler draws a hand-drawn-style oval around the corresponding bbox
+ * (industry-standard credit-card-form UX). The field's `value` is the
+ * `label` of the chosen option, or `null`/empty when nothing is
+ * selected.
+ *
+ * Why a per-option sub-bbox instead of a single parent bbox: the
+ * options aren't anchored to drawn checkboxes/circles on the page —
+ * the user typically circles or marks ONE label of a horizontal list
+ * (e.g. `Visa  MasterCard  AMEX  Discover  Other`). To draw an oval
+ * AROUND the chosen label at fill time, the renderer needs to know
+ * exactly where that label's text sits, not just where the row sits.
+ * Per-option bboxes give pdfWriter a tight target without forcing it
+ * to re-OCR the page at fill time.
+ */
+export interface FieldOption {
+  /** The option's display text, e.g. `"Visa"`, `"MasterCard"`. */
+  label: string;
+  /** Tight bbox around the label's printed text, PDF user-space pt. */
+  bbox: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
+}
 
 export type TemplateFieldSource =
   | "text-inline"
@@ -100,8 +132,8 @@ export interface TemplateField {
   height: number;
   /** 0–1, from auto-detection or manual */
   confidence: number;
-  /** Field type: text input or checkbox */
-  fieldType?: "text" | "checkbox";
+  /** Field type: text input, checkbox, or option-group selector. */
+  fieldType?: "text" | "checkbox" | "option-group";
   /** Richer field semantics used by the writer. */
   fieldKind?: TemplateFieldKind;
   detectionSource?: TemplateFieldSource;
@@ -111,6 +143,22 @@ export interface TemplateField {
   confidenceDetails?: ConfidenceDetails;
   /** For checkbox fields: which value triggers this checkbox to be checked */
   checkboxValue?: string;
+  /**
+   * For `option-group` fields (v0.5.25): the per-option sub-rectangles
+   * within (or near) the parent bbox. Each option's bbox is in PDF
+   * user-space points and tight around just that option label's text.
+   * The form filler draws a hand-drawn-style oval around the chosen
+   * option's bbox at fill time.
+   */
+  options?: FieldOption[];
+  /**
+   * For `option-group` fields (v0.5.25): the `label` of the currently
+   * selected option, or `null`/`undefined` when nothing is selected.
+   * Set at fill time (FillPromptModal) when the user picks an option;
+   * also editable in the TemplateReviewModal sidebar to pin a default
+   * choice on the template.
+   */
+  selectedOption?: string | null;
   /** Literal value for manual one-off fields not bound to Project. */
   customValue?: string;
   /** Prompt label shown when this field is collected at fill time. */

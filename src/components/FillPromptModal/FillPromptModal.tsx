@@ -1,8 +1,10 @@
 import { useMemo, useState, useCallback } from "react";
-import type { Template, TemplateField } from "@/types";
+import type { Project, Template, TemplateField } from "@/types";
 import {
+  getOptionGroupSelection,
   getPromptFields,
   getTemplateFieldPromptLabel,
+  isOptionGroupField,
   type PromptFieldValues,
 } from "@/utils/fill";
 import { PdfPageCanvas } from "@/components/PdfPageCanvas/PdfPageCanvas";
@@ -12,6 +14,12 @@ interface FillPromptModalProps {
   template: Template;
   pdfBytes?: Uint8Array | null;
   initialValues?: PromptFieldValues;
+  /**
+   * v0.5.25 — used to seed an option-group field's default selection
+   * from the project's stored value (e.g. card type) so the typical
+   * "no-change" case is a single confirmation click.
+   */
+  project?: Project | null;
   mode: "preview" | "export";
   onClose: () => void;
   onSubmit: (values: PromptFieldValues) => void;
@@ -21,6 +29,7 @@ export function FillPromptModal({
   template,
   pdfBytes,
   initialValues = {},
+  project,
   mode,
   onClose,
   onSubmit,
@@ -30,7 +39,16 @@ export function FillPromptModal({
   const optionalFields = useMemo(() => allPromptFields.filter((f) => f.optional), [allPromptFields]);
   const promptFields = allPromptFields;
   const [values, setValues] = useState<PromptFieldValues>(() =>
-    Object.fromEntries(promptFields.map((field) => [field.id, initialValues[field.id] ?? ""]))
+    Object.fromEntries(
+      promptFields.map((field) => {
+        const seeded = initialValues[field.id];
+        if (seeded !== undefined && seeded !== "") return [field.id, seeded];
+        if (isOptionGroupField(field) && project) {
+          return [field.id, getOptionGroupSelection(project, field, {})];
+        }
+        return [field.id, seeded ?? ""];
+      })
+    )
   );
   const [activeFieldId, setActiveFieldId] = useState<string | null>(
     promptFields.length > 0 ? promptFields[0].id : null
@@ -181,6 +199,7 @@ function FieldRow({
 }: FieldRowProps) {
   const isCheckbox =
     field.fieldType === "checkbox" || field.fieldKind === "boolean-checkbox";
+  const isOptionGroup = isOptionGroupField(field);
   const labelText = getTemplateFieldPromptLabel(field);
   const placeholder = isOptional ? `${field.label} (optional)` : field.label;
 
@@ -217,6 +236,35 @@ function FieldRow({
             }}
           >
             Restore
+          </button>
+        </div>
+      ) : isOptionGroup ? (
+        <div className={styles.inputWrap}>
+          <select
+            className={styles.input}
+            value={value}
+            onFocus={onActivate}
+            onChange={(e) => onChange(e.target.value)}
+          >
+            <option value="">— Select an option —</option>
+            {(field.options ?? []).map((opt) => (
+              <option key={opt.label} value={opt.label}>
+                {opt.label}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className={styles.skipBtn}
+            onClick={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onToggleSkip();
+            }}
+            title="Skip this field"
+            aria-label={`Skip ${labelText}`}
+          >
+            ×
           </button>
         </div>
       ) : isCheckbox ? (

@@ -74,6 +74,41 @@ export function DraggableField({
         scrollParent.style.overflow = "hidden";
       }
 
+      // v0.5.25 — capture option bboxes at drag start so we can
+      // translate/scale them in lockstep with the parent rect. For
+      // option-group fields the per-option bboxes live in absolute
+      // PDF user-space, so a parent move must shift each option by
+      // the same dx/dy and a parent resize scales each option's
+      // offset within the parent proportionally.
+      const startOptions = field.options
+        ? field.options.map((o) => ({ ...o, bbox: { ...o.bbox } }))
+        : null;
+
+      const computeOptions = (
+        nextX: number,
+        nextY: number,
+        nextW: number,
+        nextH: number
+      ): TemplateField["options"] | undefined => {
+        if (!startOptions) return undefined;
+        const { fieldX, fieldY, fieldW, fieldH } = startPos.current;
+        const sx = fieldW > 0 ? nextW / fieldW : 1;
+        const sy = fieldH > 0 ? nextH / fieldH : 1;
+        return startOptions.map((opt) => {
+          const localDx = opt.bbox.x - fieldX;
+          const localDy = opt.bbox.y - fieldY;
+          return {
+            label: opt.label,
+            bbox: {
+              x: nextX + localDx * sx,
+              y: nextY + localDy * sy,
+              width: opt.bbox.width * sx,
+              height: opt.bbox.height * sy,
+            },
+          };
+        });
+      };
+
       const handleMouseMove = (moveEvent: MouseEvent) => {
         moveEvent.preventDefault();
         const dx = (moveEvent.clientX - startPos.current.x) / scale;
@@ -81,54 +116,92 @@ export function DraggableField({
         const { fieldX, fieldY, fieldW, fieldH } = startPos.current;
 
         if (mode === "move") {
-          onChange({
-            x: Math.max(0, fieldX + dx),
-            y: Math.max(0, fieldY + dy),
-          });
+          const nextX = Math.max(0, fieldX + dx);
+          const nextY = Math.max(0, fieldY + dy);
+          const updates: Partial<TemplateField> = { x: nextX, y: nextY };
+          const nextOpts = computeOptions(nextX, nextY, fieldW, fieldH);
+          if (nextOpts) updates.options = nextOpts;
+          onChange(updates);
         } else if (mode === "resize-e") {
-          onChange({ width: Math.max(20, fieldW + dx) });
+          const nextW = Math.max(20, fieldW + dx);
+          const updates: Partial<TemplateField> = { width: nextW };
+          const nextOpts = computeOptions(fieldX, fieldY, nextW, fieldH);
+          if (nextOpts) updates.options = nextOpts;
+          onChange(updates);
         } else if (mode === "resize-w") {
           const newWidth = Math.max(20, fieldW - dx);
-          onChange({
-            x: Math.max(0, fieldX + (fieldW - newWidth)),
+          const nextX = Math.max(0, fieldX + (fieldW - newWidth));
+          const updates: Partial<TemplateField> = {
+            x: nextX,
             width: newWidth,
-          });
+          };
+          const nextOpts = computeOptions(nextX, fieldY, newWidth, fieldH);
+          if (nextOpts) updates.options = nextOpts;
+          onChange(updates);
         } else if (mode === "resize-n") {
           const newHeight = Math.max(10, fieldH - dy);
-          onChange({
-            y: Math.max(0, fieldY + (fieldH - newHeight)),
+          const nextY = Math.max(0, fieldY + (fieldH - newHeight));
+          const updates: Partial<TemplateField> = {
+            y: nextY,
             height: newHeight,
-          });
+          };
+          const nextOpts = computeOptions(fieldX, nextY, fieldW, newHeight);
+          if (nextOpts) updates.options = nextOpts;
+          onChange(updates);
         } else if (mode === "resize-s") {
-          onChange({ height: Math.max(10, fieldH + dy) });
+          const newHeight = Math.max(10, fieldH + dy);
+          const updates: Partial<TemplateField> = { height: newHeight };
+          const nextOpts = computeOptions(fieldX, fieldY, fieldW, newHeight);
+          if (nextOpts) updates.options = nextOpts;
+          onChange(updates);
         } else if (mode === "resize-nw") {
           const newWidth = Math.max(20, fieldW - dx);
           const newHeight = Math.max(10, fieldH - dy);
-          onChange({
-            x: Math.max(0, fieldX + (fieldW - newWidth)),
-            y: Math.max(0, fieldY + (fieldH - newHeight)),
+          const nextX = Math.max(0, fieldX + (fieldW - newWidth));
+          const nextY = Math.max(0, fieldY + (fieldH - newHeight));
+          const updates: Partial<TemplateField> = {
+            x: nextX,
+            y: nextY,
             width: newWidth,
             height: newHeight,
-          });
+          };
+          const nextOpts = computeOptions(nextX, nextY, newWidth, newHeight);
+          if (nextOpts) updates.options = nextOpts;
+          onChange(updates);
         } else if (mode === "resize-ne") {
           const newHeight = Math.max(10, fieldH - dy);
-          onChange({
-            y: Math.max(0, fieldY + (fieldH - newHeight)),
-            width: Math.max(20, fieldW + dx),
+          const nextY = Math.max(0, fieldY + (fieldH - newHeight));
+          const newWidth = Math.max(20, fieldW + dx);
+          const updates: Partial<TemplateField> = {
+            y: nextY,
+            width: newWidth,
             height: newHeight,
-          });
+          };
+          const nextOpts = computeOptions(fieldX, nextY, newWidth, newHeight);
+          if (nextOpts) updates.options = nextOpts;
+          onChange(updates);
         } else if (mode === "resize-sw") {
           const newWidth = Math.max(20, fieldW - dx);
-          onChange({
-            x: Math.max(0, fieldX + (fieldW - newWidth)),
+          const nextX = Math.max(0, fieldX + (fieldW - newWidth));
+          const newHeight = Math.max(10, fieldH + dy);
+          const updates: Partial<TemplateField> = {
+            x: nextX,
             width: newWidth,
-            height: Math.max(10, fieldH + dy),
-          });
+            height: newHeight,
+          };
+          const nextOpts = computeOptions(nextX, fieldY, newWidth, newHeight);
+          if (nextOpts) updates.options = nextOpts;
+          onChange(updates);
         } else if (mode === "resize-se") {
-          onChange({
-            width: Math.max(20, fieldW + dx),
-            height: Math.max(10, fieldH + dy),
-          });
+          const newWidth = Math.max(20, fieldW + dx);
+          const newHeight = Math.max(10, fieldH + dy);
+          const updates: Partial<TemplateField> = {
+            width: newWidth,
+            height: newHeight,
+          };
+          const nextOpts = computeOptions(fieldX, fieldY, newWidth, newHeight);
+          if (nextOpts) updates.options = nextOpts;
+          onChange(updates);
         }
       };
 
@@ -176,6 +249,80 @@ export function DraggableField({
       ? normalizeCardType(projectValue ?? "") === normalizeCardType(field.checkboxValue ?? "")
       : projectValue === field.checkboxValue
   );
+
+  // v0.5.25 — option-group field (e.g. card-type horizontal label
+  // list with no drawn checkboxes). Renders the parent rect for
+  // drag/resize plus a small circle outline around each option's
+  // bbox to telegraph the selector pattern in the review canvas.
+  const isOptionGroup =
+    field.fieldType === "option-group" || field.fieldKind === "option-group";
+
+  if (isOptionGroup) {
+    const selectedLabel = (field.selectedOption ?? "").toLowerCase();
+    return (
+      <div
+        ref={containerRef}
+        data-draggable-field
+        className={`${styles.field} ${styles.optionGroup ?? ""} ${selected ? styles.selected : ""} ${dragMode ? styles.dragging : ""}`}
+        style={scaledStyle}
+        onMouseDown={handleFieldMouseDown}
+        title={`${field.label} — drag to move (option group)`}
+      >
+        <span className={styles.label}>{field.label}</span>
+
+        {(field.options ?? []).map((opt, idx) => {
+          const isSel = opt.label.toLowerCase() === selectedLabel;
+          const ovalLeft = (opt.bbox.x - field.x) * scale;
+          const ovalTop = (opt.bbox.y - field.y) * scale;
+          const ovalWidth = opt.bbox.width * scale;
+          const ovalHeight = opt.bbox.height * scale;
+          const padPx = 3 * scale;
+          return (
+            <div
+              key={`${opt.label}-${idx}`}
+              className={`${styles.optionMarker ?? ""} ${isSel ? styles.optionMarkerSelected ?? "" : ""}`}
+              style={{
+                position: "absolute",
+                left: ovalLeft - padPx,
+                top: ovalTop - padPx,
+                width: Math.max(8, ovalWidth + padPx * 2),
+                height: Math.max(8, ovalHeight + padPx * 2),
+                borderRadius: "50%",
+                border: `${selected ? 2 : 1}px solid ${isSel ? "#0a7c2c" : "rgba(40, 70, 200, 0.55)"}`,
+                pointerEvents: "none",
+                boxSizing: "border-box",
+              }}
+            />
+          );
+        })}
+
+        <div
+          data-handle="nw"
+          className={`${styles.handle} ${styles.handleNW}`}
+          onMouseDown={(e) => startDrag(e, "resize-nw")}
+          title="Drag to resize"
+        />
+        <div
+          data-handle="ne"
+          className={`${styles.handle} ${styles.handleNE}`}
+          onMouseDown={(e) => startDrag(e, "resize-ne")}
+          title="Drag to resize"
+        />
+        <div
+          data-handle="sw"
+          className={`${styles.handle} ${styles.handleSW}`}
+          onMouseDown={(e) => startDrag(e, "resize-sw")}
+          title="Drag to resize"
+        />
+        <div
+          data-handle="se"
+          className={`${styles.handle} ${styles.handleSE}`}
+          onMouseDown={(e) => startDrag(e, "resize-se")}
+          title="Drag to resize"
+        />
+      </div>
+    );
+  }
 
   // Checkbox fields render as click targets, but can also be dragged when selected
   if (isCheckbox) {
