@@ -11,6 +11,7 @@ export type CanonicalFieldId =
   | "jobNumber"
   | "poNumber"
   | "authorizationDate"
+  | "shootDate"
   | "productionCompany"
   | "billingAddress"
   | "billingCity"
@@ -100,6 +101,22 @@ export interface Project {
   jobNumber: string;
   poNumber: string;
   authorizationDate: string;
+  /**
+   * v0.5.31 — ISO date (YYYY-MM-DD) of the future event the project is
+   * for: the shoot, booking, rental period, or service date. Distinct
+   * from `authorizationDate`, which represents the date the
+   * cardholder signs the form (typically today). Forms that carry
+   * both contexts (e.g. an inline "for my booking on _____ (date)"
+   * blank AND a standalone "Date:" line by the signature) auto-fill
+   * each blank from the right canonical instead of conflating both
+   * onto today's date.
+   *
+   * Optional so projects created prior to v0.5.31 deserialise without
+   * a migration step — `coerceProject` and the form filler treat
+   * missing/empty values the same as no shoot date and fall through
+   * to a Fill-prompt entry.
+   */
+  shootDate?: string;
   productionCompany: string;
   billingAddress: string;
   billingCity: string;

@@ -609,6 +609,32 @@ function buildPass1SharedSystemPrompt(): string {
     "    → WRONG: ONE `option-group` field with `options: [{label: 'Other:'}, {label: 'Cardholder Name'}]`. The two labels fail every gate above (cardinality < 3, different rows, different semantic roles, one ends in `:`).",
     "    → RIGHT: emit `Other:____` as a `text` field for the write-in continuation, and `Cardholder Name ____` as a separate `text` field. No option-group.",
     "",
+    "## Date disambiguation rule (v0.5.31 — IMPORTANT for credit card / rental forms)",
+    "Forms often contain two distinct date contexts. Field-type stays `date` for both — only the LABEL distinguishes them. The post-processor uses the label to map to the right canonical (`authorizationDate` vs `shootDate`):",
+    "",
+    "  1. **Authorization date** — a standalone `Date:` or `Date of Authorization:` line, usually next to or near the cardholder signature. This is the date the user signs the form (typically today). Classify this as `field_type: \"text\"`, `field_kind: \"date\"`, `canonical_field_id: \"authorizationDate\"`, and emit `label: \"Date\"` (or whatever the form prints — usually a bare `Date`). Semantic context: AUTHORIZATION.",
+    "",
+    "  2. **Shoot / Booking / Event / Rental date** — a date field embedded in sentence context that refers to a future event, booking, shoot, rental period, or service. Examples:",
+    "     - `for my booking at Beam Studios on _____ (date)`",
+    "     - `Shoot date: _____`",
+    "     - `Rental period beginning _____`",
+    "     - `for the production on _____`",
+    "     - `Event date: _____`",
+    "",
+    "    Classify the embedded sentence-context date as `field_type: \"text\"`, `field_kind: \"date\"`, `canonical_field_id: \"shootDate\"`. The label you emit MUST reflect the booking nature — preserve the form's actual phrasing where possible. Acceptable labels: `\"Shoot Date\"`, `\"Booking Date\"`, `\"Rental Date\"`, `\"Event Date\"`, `\"Session Date\"`, `\"Production Date\"`, `\"Service Date\"`. NEVER emit a bare `\"Date\"` label for a booking-context blank — that label is reserved for the standalone authorization-date line.",
+    "",
+    "  When in doubt or context is ambiguous, lean toward `authorization`. Concrete tie-breakers: a date next to a SIGNATURE line, a date in a closing block, or a date appearing alone on a row labelled only `Date:` is `authorizationDate`. A date inside a body-text paragraph that names a venue / shoot / booking / rental is `shootDate`. The same form may emit both — emit each one separately with its own canonical id.",
+    "",
+    "  Concrete few-shot example — same form carries BOTH date contexts:",
+    "    Form text fragment:",
+    "      `... I authorize Beam Studios to charge my credit card for a $500.00 deposit for my booking at Beam Studios on _______ (date). The remaining balance ...`",
+    "      `... Cardholder Signature: ________________   Date: _______`",
+    "    Correct emission:",
+    "      - Inline blank: `context_before: \"...for my booking at Beam Studios on\"`, `context_after: \"(date) The remaining balance...\"`, `label: \"Booking Date\"`, `canonical_field_id: \"shootDate\"`, `field_type: \"text\"`, `field_kind: \"date\"`.",
+    "      - Standalone `Date:` line by signature: `context_before: \"...Cardholder Signature: ________________ Date:\"`, `context_after: \"\"`, `label: \"Date\"`, `canonical_field_id: \"authorizationDate\"`, `field_type: \"text\"`, `field_kind: \"date\"`.",
+    "",
+    "  Negative example — what NOT to do: do NOT emit BOTH dates with `canonical_field_id: \"authorizationDate\"`. Conflating both onto the authorization canonical means the form filler will write today's date into the booking blank too, which is wrong. The booking date and the signing date are distinct semantic concepts and the post-processor REQUIRES the labels to differ to route them correctly.",
+    "",
     "If you cannot precisely locate the writable area, OMIT the field. We strongly prefer 10 correctly-placed fields to 20 fields where half are sitting on labels.",
   ].join("\n");
 }
@@ -909,7 +935,33 @@ function inferByPattern(
     return "cardholderSignature";
   }
 
+  // v0.5.31 — shootDate preflight. Runs BEFORE the generic
+  // `(date)` / `date:` → authorizationDate rule below so a row whose
+  // surrounding sentence references a booking / shoot / rental / event
+  // / session / production / service period resolves to the new
+  // `shootDate` canonical instead of being conflated with the
+  // signature-block authorization date. Critical for forms (e.g. the
+  // Beam Studios CC AUTH_Deposit and Rental form) that carry BOTH
+  // contexts: the post-processor must route the inline booking blank
+  // to `shootDate` and the standalone signature-row `Date:` line to
+  // `authorizationDate`. The patterns are sourced from the canonical
+  // catalog so additions stay centralised in `fieldCatalog.ts`.
+  const shootDef = CANONICAL_FIELD_DEFINITIONS.find((d) => d.id === "shootDate");
+  if (shootDef?.patterns?.length) {
+    const haystack = `${ctx} ${aft}`;
+    for (const pattern of shootDef.patterns) {
+      if (pattern.test(haystack)) {
+        return "shootDate";
+      }
+    }
+  }
+
   // "(date)" or "date:" appearing in the suffix → date blank.
+  // Reaches here only when the shootDate preflight above did NOT
+  // match — i.e. the surrounding sentence carries no booking/shoot/
+  // rental context, so a bare "(date)" or "Date:" suffix is the
+  // signature-block authorization date by default. Per the v0.5.31
+  // disambiguation rule: when in doubt, lean authorization.
   if (/^\(\s*date\s*\)/.test(aft) || /^date\s*[:.)]?/.test(aft)) {
     return "authorizationDate";
   }

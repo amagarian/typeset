@@ -86,6 +86,7 @@ function isProjectEmpty(project: Project): boolean {
       project.jobNumber,
       project.poNumber,
       project.authorizationDate,
+      project.shootDate ?? "",
       project.productionCompany,
       project.billingAddress,
       project.billingCity,

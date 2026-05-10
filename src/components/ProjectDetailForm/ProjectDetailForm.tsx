@@ -55,6 +55,33 @@ export function ProjectDetailForm({ project, onChange, readOnly }: ProjectDetail
         </div>
       ))}
 
+      {/*
+        v0.5.31 — Shoot Date input.
+
+        Positioned between Phone (last entry in TEXT_FIELDS) and Card
+        Type so it sits in the booking-context group rather than the
+        payment group. Stored on Project as ISO YYYY-MM-DD (the native
+        `<input type="date">` value contract); the form filler converts
+        to MM/DD/YY at fill time. Distinct from `expDate` (card expiry,
+        rendered below as part of CARD_FIELDS) and `authorizationDate`
+        (defaulted to today inside `getTemplateFieldValue`, never
+        surfaced as a Project field).
+      */}
+      <div className={styles.field}>
+        <input
+          id="shootDate"
+          type="date"
+          className={styles.input}
+          value={project.shootDate ?? ""}
+          onChange={(e) => onChange({ shootDate: e.target.value })}
+          readOnly={readOnly}
+          placeholder=" "
+        />
+        <label className={styles.label} htmlFor="shootDate">
+          SHOOT DATE
+        </label>
+      </div>
+
       <div className={styles.field}>
         <select
           id="creditCardType"

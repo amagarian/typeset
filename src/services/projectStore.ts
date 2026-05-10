@@ -112,6 +112,11 @@ function coerceProject(raw: unknown): Project | null {
     jobNumber: str("jobNumber"),
     poNumber: str("poNumber"),
     authorizationDate: str("authorizationDate"),
+    // v0.5.31 — `shootDate` is optional on the type, but persisting
+    // an empty string for unset values matches every other Project
+    // field's shape and keeps `coerceProject`'s output total/well-typed
+    // for downstream consumers.
+    shootDate: str("shootDate"),
     productionCompany: str("productionCompany"),
     billingAddress: str("billingAddress"),
     billingCity: str("billingCity"),

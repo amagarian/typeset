@@ -28,6 +28,7 @@ const PROJECT_KEY_LABELS: Record<string, string> = {
   ccv: "CCV",
   cardholderSignature: "Signature",
   authorizationDate: "Authorization date",
+  shootDate: "Shoot date",
 };
 
 const CHECKBOX_VALUE_LABELS: Record<string, string> = {

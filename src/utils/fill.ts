@@ -206,6 +206,18 @@ export function getTemplateFieldValue(
     return `${mm}/${dd}/${yy}`;
   }
 
+  // v0.5.31 — `shootDate` is stored on the Project as an ISO date
+  // string (YYYY-MM-DD) — the native `<input type="date">` value
+  // contract. Form filling expects the MM/DD/YY shape used elsewhere
+  // (matches `authorizationDate`'s default formatting and what the
+  // renderer expects for date-typed fields). Empty values fall through
+  // to the empty string so unfilled shoot-date blanks behave like any
+  // other unmapped-but-empty field.
+  if (key === "shootDate") {
+    const iso = (project.shootDate ?? "").trim();
+    return iso ? formatIsoDateForFill(iso) : "";
+  }
+
   const value = project[key];
   if (typeof value !== "string") return "";
 
@@ -214,6 +226,20 @@ export function getTemplateFieldValue(
   }
 
   return value;
+}
+
+/**
+ * Convert an ISO date string (YYYY-MM-DD, the native `<input
+ * type="date">` value contract) into the MM/DD/YY format used by the
+ * form filler. Returns the original string verbatim when the input is
+ * not a recognisable ISO date so legacy projects that stored dates in
+ * a different shape still render something sensible.
+ */
+function formatIsoDateForFill(iso: string): string {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!match) return iso;
+  const [, yyyy, mm, dd] = match;
+  return `${mm}/${dd}/${yyyy.slice(-2)}`;
 }
 
 export function buildFilledFields(

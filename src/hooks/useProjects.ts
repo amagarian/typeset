@@ -96,6 +96,7 @@ function freshProject(initial: Partial<Project> = {}): Project {
     jobNumber: "",
     poNumber: "",
     authorizationDate: "",
+    shootDate: "",
     productionCompany: "",
     billingAddress: "",
     billingCity: "",

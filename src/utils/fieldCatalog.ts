@@ -20,6 +20,19 @@ export interface CanonicalFieldDefinition {
    * as separate fields and we need to stitch them back together.
    */
   optionSet?: string[];
+  /**
+   * v0.5.31 — context-level regex patterns used by the canonical
+   * inference preflight when the field's printed label is too generic
+   * to disambiguate (e.g. a bare `Date` blank embedded mid-sentence).
+   * Aliases are matched against the field's label string, while
+   * `patterns` are matched against the broader sentence haystack
+   * (`context_before` + `context_after` + `label`). This is what lets
+   * `shootDate` win over the generic-date fallback when a row reads
+   * "for my booking at Beam Studios on _____ (date)" — the "for my
+   * booking" pattern fires even though the inferred label is just
+   * "Date". Patterns are case-insensitive by convention.
+   */
+  patterns?: RegExp[];
 }
 
 /**
@@ -116,6 +129,58 @@ export const CANONICAL_FIELD_DEFINITIONS: CanonicalFieldDefinition[] = [
     fieldKind: "date",
     aliases: ["authorization date", "auth date"],
     sectionHints: ["authorization", "signature", "footer"],
+  },
+  // v0.5.31 — shoot/booking date canonical. Distinct from
+  // `authorizationDate` (which is "the date the user signs the form",
+  // typically today) — `shootDate` represents the future event the
+  // form is being executed FOR (booking, shoot, rental period, etc.).
+  // Forms in this corpus frequently carry both contexts (e.g. the
+  // Beam Studios CC AUTH_Deposit and Rental form has an inline
+  // "for my booking at Beam Studios on _____ (date)" sentence AND a
+  // standalone "Date:" line by the cardholder signature). Without
+  // this canonical, the post-processor would conflate both dates onto
+  // `authorizationDate` and the form would auto-fill "today" into the
+  // booking blank too — wrong.
+  //
+  // `aliases` are matched against the field's label string; `patterns`
+  // run against the broader sentence haystack and are how we recover
+  // shootDate from inline-sentence blanks where Gemini sees only a
+  // bare "Date" caption next to the underline. The Pass-1 prompt
+  // (v0.5.31 date-disambiguation rule) instructs Gemini to emit
+  // booking-context labels like "Shoot Date" / "Booking Date" /
+  // "Rental Date" directly, but the patterns are the safety net.
+  {
+    id: "shootDate",
+    label: "Shoot Date",
+    mappedProjectKey: "shootDate",
+    fieldKind: "date",
+    aliases: [
+      "shoot date",
+      "booking date",
+      "event date",
+      "session date",
+      "rental date",
+      "production date",
+      "wrap date",
+      "shoot day",
+      "service date",
+    ],
+    sectionHints: ["booking", "rental", "shoot", "header"],
+    patterns: [
+      // Possessive / definite-article phrasings — covers the most
+      // common inline-sentence shapes the corpus throws at us:
+      //   "for my booking at Beam Studios", "from my booking at",
+      //   "during the rental", "before the shoot", "after our event".
+      // The leading-prep variant is bundled into the same class so
+      // phrasings like "for my booking ..." and "from my booking ..."
+      // both fire even though only the latter happens to appear in
+      // the v0.5.31 reference form.
+      /\b(?:my|our|the)\s+(?:booking|shoot|rental|event|session|production|service|wrap)\b/i,
+      /\bfor\s+(?:my|our|the)\s+(?:booking|shoot|rental|event|session|production|service|wrap)\b/i,
+      /\brental\s+period\b/i,
+      /\b(?:shoot|booking|event|rental|session|production|service|wrap)\s+(?:date|day)\b/i,
+      /\bdate\s+of\s+(?:shoot|booking|event|rental|session|production|service|the\s+(?:shoot|booking|event|rental|session|production|service))\b/i,
+    ],
   },
   {
     id: "productionCompany",

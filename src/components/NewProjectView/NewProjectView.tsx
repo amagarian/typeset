@@ -57,6 +57,7 @@ export function NewProjectView({
     jobNumber: "",
     poNumber: "",
     authorizationDate: "",
+    shootDate: "",
     productionCompany: "",
     billingAddress: "",
     billingCity: "",
