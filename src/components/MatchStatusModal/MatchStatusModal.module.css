@@ -39,7 +39,9 @@
   border-bottom: 1px solid var(--border);
 }
 
+/* File names are code-shaped per the v0.5.24 type spec. */
 .fileName {
+  font-family: var(--font-mono);
   font-size: 13px;
   color: var(--text);
   font-weight: 500;
@@ -110,11 +112,14 @@
   color: #991b1b;
 }
 
+/* Template name is code-shaped (registry-listed) — mono. */
 .title {
+  font-family: var(--font-mono);
   font-size: 15px;
   font-weight: 600;
   margin: 0;
   color: var(--text);
+  letter-spacing: var(--letter-display);
 }
 
 .meta {
@@ -181,8 +186,10 @@
   margin-bottom: 6px;
 }
 
+/* Registry-listed template names render as code-shaped per v0.5.24. */
 .matchName {
   flex: 1;
+  font-family: var(--font-mono);
   font-size: 13px;
   color: var(--text);
 }

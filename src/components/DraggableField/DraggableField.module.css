@@ -62,10 +62,17 @@
   line-height: 1;
 }
 
+/*
+ * v0.5.24 — the floating tag above each draggable field shows the
+ * field's canonical label (eg. "billingAddress"). That is code-shaped
+ * data (it maps 1:1 to a field id key in the saved Project), so it
+ * stays mono even though the rest of the app went sans.
+ */
 .label {
   position: absolute;
   top: -18px;
   left: 0;
+  font-family: var(--font-mono);
   font-size: 9px;
   padding: 2px 5px;
   background: #3b82f6;

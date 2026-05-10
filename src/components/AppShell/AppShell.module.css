@@ -28,4 +28,52 @@
   display: flex;
   flex-direction: column;
   background: var(--bg-app);
+  position: relative;
+}
+
+/*
+ * v0.5.24 — main-window header strip.
+ *
+ * Sits absolutely positioned across the top of `.main` so it shares
+ * the 38px-tall drag region row with the existing window dragger
+ * without disturbing the existing column layout (NewProjectView /
+ * ProjectWorkspace already pad 40px of clearance from the top).
+ * The strip's children remain clickable; `.headerRight` opts out
+ * of the drag region so the contribution badge can be clicked.
+ */
+.mainHeader {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 11;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  height: 38px;
+  padding: 0 16px;
+  pointer-events: none;
+}
+
+/* Brand wordmark — display face, slight negative tracking, modest
+ * weight contrast vs. the body sans elsewhere in the chrome. */
+.brand {
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: var(--letter-display);
+  color: var(--text);
+  user-select: none;
+  -webkit-user-select: none;
+  pointer-events: none;
+}
+
+.headerRight {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  pointer-events: auto;
 }

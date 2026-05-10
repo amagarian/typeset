@@ -19,7 +19,14 @@ import { SettingsModal } from "@/components/SettingsModal/SettingsModal";
 import { Toast, type ToastState } from "@/components/Toast/Toast";
 import { TrayDropZone } from "@/components/TrayDropZone/TrayDropZone";
 import { UpdateBanner } from "@/components/UpdateBanner/UpdateBanner";
+import { ContributionBadge } from "@/components/ContributionBadge/ContributionBadge";
+import { ConfettiBurst } from "@/components/ConfettiBurst/ConfettiBurst";
 import { useAutoUpdate } from "@/hooks/useAutoUpdate";
+import {
+  bumpOptimistic,
+  checkAndFireMilestone,
+  fetchContributionStats,
+} from "@/services/contributionStats";
 import { getPromptFields, type PromptFieldValues } from "@/utils/fill";
 import { writeFilledPdfBytes } from "@/utils/pdfWriter";
 import { exportPdfBytes, type PdfExportMode } from "@/utils/exportPdf";
@@ -284,12 +291,25 @@ function MainApp() {
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [matchModal, setMatchModal] = useState<PdfMatchResult | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  // v0.5.24 — bumping `confettiTrigger` re-fires the inline confetti
+  // burst portal. Sentinel value 0 means "do nothing yet"; we set
+  // `Date.now()` on each milestone so back-to-back milestones still
+  // re-trigger the animation rather than no-oping on a stale ref.
+  const [confettiTrigger, setConfettiTrigger] = useState(0);
 
   // v0.5.23 — drives the auto-update banner. Hook also schedules the
   // launch-time check and the focus-triggered (debounced) re-check. Mounted
   // exactly once here; the dropzone webview renders <TrayDropZone /> from
   // <App /> above and never reaches this component.
   const { banner: updateBanner, dismissBanner: dismissUpdateBanner } = useAutoUpdate();
+
+  // v0.5.24 — kick off the contribution stats fetch on launch so the
+  // header badge picks up the user's count from the server before
+  // their first interaction. Cache short-circuits the network on
+  // warm starts; the helper handles all error swallowing.
+  useEffect(() => {
+    void fetchContributionStats();
+  }, []);
 
   const handleRelaunch = useCallback(async () => {
     try {
@@ -1120,10 +1140,27 @@ function MainApp() {
         );
 
         if (result.created) {
-          showToast(
-            "Saved & published to the community registry.",
-            "success"
-          );
+          // v0.5.24 — only INSERTs (not UPDATEs) bump the contribution
+          // tally. UPDATE = re-publishing an already-shared template
+          // for this device, which doesn't change the distinct
+          // fingerprint count. The bump is provisional and gets
+          // reconciled on the next fetch (which always happens
+          // because `bumpOptimistic` invalidates the cache TTL).
+          const newCount = bumpOptimistic();
+          const milestone = checkAndFireMilestone(newCount);
+          if (milestone) {
+            showToast(milestone.message, "success");
+            setConfettiTrigger(Date.now());
+          } else {
+            showToast(
+              "Saved & published to the community registry.",
+              "success"
+            );
+          }
+          // Reconcile against the server in the background so any
+          // optimistic over-count (eg. server-side dedup) corrects
+          // itself before the next user-facing read.
+          void fetchContributionStats({ force: true });
         } else if (result.updated) {
           showToast(
             "Saved & updated your community registry entry.",
@@ -1404,6 +1441,7 @@ function MainApp() {
         onSelectProject={handleSelectProject}
         onNewProject={handleNewProject}
         onOpenSettings={() => setSettingsOpen(true)}
+        headerRight={<ContributionBadge />}
       >
         {view === "new-project" || view === "edit-project" ? (
           <NewProjectView
@@ -1710,6 +1748,13 @@ function MainApp() {
           onDismiss={dismissUpdateBanner}
         />
       )}
+
+      {/*
+        v0.5.24 — milestone celebration. Always mounted (cheap), only
+        animates when `confettiTrigger` is non-zero. Portals to body
+        so it's above modals / banners / popovers.
+      */}
+      <ConfettiBurst triggerKey={confettiTrigger} />
     </>
   );
 }

@@ -1,3 +1,8 @@
+/*
+ * v0.5.24 — toast explicitly opts into the body sans stack. Toast copy
+ * is short body messages; mono on a one-line dark popover reads as a
+ * log line, not a notification.
+ */
 .toast {
   position: fixed;
   right: 18px;
@@ -13,9 +18,11 @@
   border: 1px solid rgba(255, 255, 255, 0.12);
   box-shadow: 0 18px 40px rgba(0, 0, 0, 0.22);
   max-width: 420px;
+  font-family: var(--font-sans);
 }
 
 .message {
+  font-family: var(--font-sans);
   font-size: 13px;
   line-height: 1.35;
 }
@@ -27,6 +34,7 @@
   border: 1px solid rgba(255, 255, 255, 0.12);
   background: transparent;
   color: #fafaf9;
+  font-family: var(--font-sans);
   font-size: 18px;
   line-height: 1;
   display: flex;

@@ -1,0 +1,157 @@
+/*
+ * v0.5.24 — header-mounted contribution tally pill.
+ *
+ * The pill itself is intentionally low-key (matches the surrounding
+ * header chrome). The popover borrows the dark surface language from
+ * `UpdateBanner` so a user who has seen one immediately recognises
+ * the other as "the app talking to me about my registry presence".
+ */
+
+.wrapper {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 4px 10px;
+  background: var(--bg-panel);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--text);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+  line-height: 1;
+}
+
+.badge:hover {
+  background: var(--bg-input);
+  border-color: var(--border-focus);
+}
+
+.badgeOpen {
+  border-color: var(--border-focus);
+  background: var(--bg-input);
+}
+
+/* Number reads as code-shaped data per the v0.5.24 type spec. */
+.count {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+/* "shared" is body sans alongside the mono numeric. */
+.label {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+}
+
+/*
+ * Popover surface. Anchored bottom-right to the badge so it grows
+ * down-and-left and never collides with the right edge of the
+ * window or the auto-update banner that pins to bottom-right.
+ */
+.popover {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: 320px;
+  max-width: 86vw;
+  z-index: 1080;
+  background: rgba(28, 25, 23, 0.97);
+  color: #fafaf9;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: var(--radius);
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.32);
+  padding: 12px 4px 8px;
+  font-family: var(--font-sans);
+}
+
+.popoverHeader {
+  padding: 0 12px 8px;
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+  margin-bottom: 6px;
+}
+
+.popoverTitle {
+  font-family: var(--font-sans);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: var(--letter-wide);
+  text-transform: uppercase;
+  color: rgba(250, 250, 249, 0.78);
+  margin: 0;
+}
+
+.popoverCount {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: #fafaf9;
+  font-variant-numeric: tabular-nums;
+}
+
+.list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 304px; /* ~8 rows × 38px */
+  overflow-y: auto;
+}
+
+.row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+}
+
+.row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+/* Template names in the registry-list popover are mono per spec. */
+.rowName {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: #fafaf9;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Relative timestamp — sans, dim. */
+.rowTime {
+  font-family: var(--font-sans);
+  font-size: 11px;
+  color: rgba(250, 250, 249, 0.55);
+  flex-shrink: 0;
+}
+
+.empty {
+  padding: 16px 12px 12px;
+  font-family: var(--font-sans);
+  font-size: 12px;
+  line-height: 1.45;
+  color: rgba(250, 250, 249, 0.7);
+}

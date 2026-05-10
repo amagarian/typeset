@@ -260,12 +260,17 @@
   color: var(--text);
 }
 
+/*
+ * Coordinates are code-shaped data (x/y/w/h literals). Mono via the
+ * shared variable so a future swap of the mono family stays a single-
+ * file change in `index.css`.
+ */
 .fieldCoords {
   display: flex;
   gap: 6px;
   font-size: 9px;
   color: var(--text-muted);
-  font-family: monospace;
+  font-family: var(--font-mono);
   margin-bottom: 4px;
   padding: 3px 5px;
   background: var(--bg-input);

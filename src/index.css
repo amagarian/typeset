@@ -13,14 +13,28 @@
   --radius: 8px;
   --radius-sm: 4px;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
-  /* Kept the `--font-sans` name so every existing component picks the
-     new family up automatically; semantically it's now the project's
-     primary monospace stack. */
-  --font-sans: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco, "Courier New", monospace;
+  /*
+   * v0.5.24 — typography system.
+   *
+   * Body / UI / labels / buttons / modal copy / tooltips / errors /
+   * inputs use a system sans stack. Display (h1, h2, brand wordmark,
+   * large stat numbers) uses JetBrains Mono with mild negative
+   * letter-spacing for typographic weight contrast. Mono is reserved
+   * for code-shaped data (field IDs, fingerprints, version strings,
+   * file names, template names in the registry list).
+   *
+   * Components must always go through these variables — never hard-
+   * code "JetBrains Mono" in component CSS — so a future swap of the
+   * mono / display family stays a single-file change.
+   */
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Segoe UI", system-ui, sans-serif;
+  --font-display: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Menlo", monospace;
   --sidebar-width: 200px;
   --header-uppercase: 600;
   --letter-wide: 0.05em;
   --letter-normal: 0;
+  --letter-display: -0.01em;
   --font-signature: "Caveat", cursive;
 }
 
@@ -41,13 +55,39 @@ html, body, #root {
  * window bg explicitly so the standard webview still has its surface.
  */
 body {
+  /*
+   * v0.5.24 — body defaults to the system sans stack. Components that
+   * legitimately need monospace (code-shaped data, the brand
+   * wordmark, h1/h2) opt in explicitly via `var(--font-mono)` /
+   * `var(--font-display)`. Everything else inherits sans for free.
+   */
   font-family: var(--font-sans);
   font-size: 12px;
-  font-feature-settings: "calt" 1, "ss01" 1;
+  line-height: 1.5;
+  letter-spacing: 0;
   color: var(--text);
   background: transparent;
   -webkit-font-smoothing: antialiased;
   text-rendering: optimizeLegibility;
+  font-weight: 400;
+}
+
+/*
+ * Display headings. Mono via the display variable (same family as
+ * --font-mono today, but kept distinct so the display face can drift
+ * later without touching code spans). Negative tracking + bold weight
+ * gives the headline the visual weight monospace needs to read as a
+ * heading rather than a code block.
+ */
+h1, h2 {
+  font-family: var(--font-display);
+  letter-spacing: var(--letter-display);
+  font-weight: 600;
+  margin: 0;
+}
+
+h1 {
+  font-weight: 700;
 }
 
 button {

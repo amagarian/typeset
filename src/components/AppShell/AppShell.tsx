@@ -9,6 +9,12 @@ interface AppShellProps {
   onSelectProject: (id: string) => void;
   onNewProject: () => void;
   onOpenSettings?: () => void;
+  /**
+   * v0.5.24 — top-right slot in the main-window header. Used by App.tsx
+   * to mount the contribution tally badge alongside the Typeset
+   * wordmark. Optional so legacy call sites (none today) keep working.
+   */
+  headerRight?: ReactNode;
 }
 
 export function AppShell({
@@ -18,6 +24,7 @@ export function AppShell({
   onSelectProject,
   onNewProject,
   onOpenSettings,
+  headerRight,
 }: AppShellProps) {
   return (
     <div className={styles.shell}>
@@ -29,7 +36,13 @@ export function AppShell({
         onNewProject={onNewProject}
         onOpenSettings={onOpenSettings}
       />
-      <main className={styles.main}>{children}</main>
+      <main className={styles.main}>
+        <header className={styles.mainHeader} data-tauri-drag-region>
+          <span className={styles.brand}>Typeset</span>
+          <div className={styles.headerRight}>{headerRight}</div>
+        </header>
+        {children}
+      </main>
     </div>
   );
 }

@@ -116,8 +116,9 @@
   gap: 6px;
 }
 
+/* API key display is code-shaped data — mono per the v0.5.24 type spec. */
 .maskedInput {
-  font-family: ui-monospace, "SF Mono", monospace;
+  font-family: var(--font-mono);
   letter-spacing: 0.04em;
 }
 
