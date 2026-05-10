@@ -46,6 +46,7 @@ pub fn run() {
             keychain::set_gemini_key,
             keychain::get_gemini_key,
             keychain::has_gemini_key,
+            keychain::get_gemini_key_status,
             keychain::clear_gemini_key,
             gemini::gemini_detect_fields,
             gemini::gemini_detect_fields_images,

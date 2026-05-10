@@ -2671,25 +2671,77 @@ function mergeCardTypeOptionGroup(fields: TemplateField[]): TemplateField[] {
 }
 
 /**
+ * Intersection-over-Union for two axis-aligned bboxes (page coordinates).
+ * Returns 0 when the boxes don't share area at all. Used by `dedupeFields`
+ * to catch the two-strings-on-top-of-each-other case where the model
+ * emits one bbox tight on the value area and a second bbox covering the
+ * full row — the corner-distance heuristic missed those because their
+ * top-left corners can drift > 12pt apart even when they fully overlap.
+ */
+function bboxIoU(
+  a: { x: number; y: number; width: number; height: number },
+  b: { x: number; y: number; width: number; height: number }
+): number {
+  const ix1 = Math.max(a.x, b.x);
+  const iy1 = Math.max(a.y, b.y);
+  const ix2 = Math.min(a.x + a.width, b.x + b.width);
+  const iy2 = Math.min(a.y + a.height, b.y + b.height);
+  const iw = Math.max(0, ix2 - ix1);
+  const ih = Math.max(0, iy2 - iy1);
+  const inter = iw * ih;
+  if (inter <= 0) return 0;
+  const aArea = Math.max(0, a.width) * Math.max(0, a.height);
+  const bArea = Math.max(0, b.width) * Math.max(0, b.height);
+  const union = aArea + bArea - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+function bboxArea(b: { width: number; height: number }): number {
+  return Math.max(0, b.width) * Math.max(0, b.height);
+}
+
+/**
  * De-duplicate detections by spatial overlap. Production paperwork
  * legitimately repeats canonical fields (cardholder name in two
  * paragraphs, dates at top and bottom) and every instance needs to be
- * filled with the same value — so we DON'T dedupe by canonical id.
- * We only drop two detections that sit on top of each other (within
- * 12pt on the same page, same field type), which only happens when
- * the model double-tags one location.
+ * filled with the same value — so we DON'T dedupe by canonical id alone
+ * across far-apart page regions.
+ *
+ * v0.6.3 — replaced the brittle `|Δx| < 12 && |Δy| < 12` check with
+ * IoU-based overlap detection, and added a same-canonical preference
+ * that catches the "two strings of digits drawn on top of each other"
+ * failure mode (one bbox tight on the digit area, one covering the full
+ * row — corners > 12pt apart but boxes nearly coincident). When two
+ * detections collide we keep the larger-area survivor instead of the
+ * insertion-order survivor; the bigger bbox is almost always the better
+ * fill target (full row vs. a sub-slice).
  */
 function dedupeFields(fields: TemplateField[]): TemplateField[] {
   const result: TemplateField[] = [];
   for (const field of fields) {
-    const overlapping = result.find(
-      (existing) =>
-        existing.pageNumber === field.pageNumber &&
-        Math.abs(existing.x - field.x) < 12 &&
-        Math.abs(existing.y - field.y) < 12 &&
-        existing.fieldType === field.fieldType
-    );
-    if (overlapping) continue;
+    const overlapIdx = result.findIndex((existing) => {
+      if (existing.pageNumber !== field.pageNumber) return false;
+      if (existing.fieldType !== field.fieldType) return false;
+      const iou = bboxIoU(existing, field);
+      if (iou >= 0.3) return true;
+      if (
+        existing.canonicalFieldId &&
+        existing.canonicalFieldId === field.canonicalFieldId &&
+        iou > 0
+      ) {
+        return true;
+      }
+      return (
+        Math.abs(existing.x - field.x) < 12 && Math.abs(existing.y - field.y) < 12
+      );
+    });
+    if (overlapIdx >= 0) {
+      const existing = result[overlapIdx];
+      if (bboxArea(field) > bboxArea(existing)) {
+        result[overlapIdx] = field;
+      }
+      continue;
+    }
     result.push(field);
   }
   return result;
@@ -3109,6 +3161,84 @@ interface Pass1Result {
 }
 
 /**
+ * v0.6.3 — collapse vertically-stacked `billingAddress` widgets into a
+ * single multiline field. Some forms (Arrow CC Authorization is the
+ * canonical example) draw the billing-address area as 2-3 stacked
+ * single-line widgets all sharing the `Billing Address` caption. The
+ * detector legitimately tags every line as `billingAddress`, but
+ * `getTemplateFieldValue` returns `project.billingAddress` (one string)
+ * for each, so the SAME line gets written into every widget — the
+ * "first line of the address on every line" symptom.
+ *
+ * Merge rule: same page, same `mappedProjectKey === "billingAddress"`,
+ * consecutive in vertical order with a gap ≤ 1.5× the smaller field
+ * height. The merged widget keeps the top-most field's id (so any raw
+ * map keyed on it still resolves) and grows downward to swallow the
+ * stack. Runs BEFORE `dedupeFields` so any leftover overlap is still
+ * collapsed by the IoU pass.
+ */
+function mergeStackedBillingAddress(fields: TemplateField[]): TemplateField[] {
+  const candidates: number[] = [];
+  for (let i = 0; i < fields.length; i += 1) {
+    if (fields[i].mappedProjectKey === "billingAddress") candidates.push(i);
+  }
+  if (candidates.length < 2) return fields;
+
+  const dropped = new Set<number>();
+  const groups: number[][] = [];
+  const byPage = new Map<number, number[]>();
+  for (const idx of candidates) {
+    const page = fields[idx].pageNumber;
+    const bucket = byPage.get(page) ?? [];
+    bucket.push(idx);
+    byPage.set(page, bucket);
+  }
+  for (const bucket of byPage.values()) {
+    bucket.sort((a, b) => fields[a].y - fields[b].y);
+    let cluster: number[] = [];
+    for (const idx of bucket) {
+      if (cluster.length === 0) {
+        cluster.push(idx);
+        continue;
+      }
+      const prev = fields[cluster[cluster.length - 1]];
+      const cur = fields[idx];
+      const gap = cur.y - (prev.y + prev.height);
+      const slack = 1.5 * Math.min(prev.height, cur.height);
+      if (gap <= slack) {
+        cluster.push(idx);
+      } else {
+        if (cluster.length > 1) groups.push(cluster);
+        cluster = [idx];
+      }
+    }
+    if (cluster.length > 1) groups.push(cluster);
+  }
+
+  if (groups.length === 0) return fields;
+
+  const replacements = new Map<number, TemplateField>();
+  for (const group of groups) {
+    const head = fields[group[0]];
+    const tail = fields[group[group.length - 1]];
+    const merged: TemplateField = {
+      ...head,
+      y: head.y,
+      height: tail.y + tail.height - head.y,
+      width: Math.max(...group.map((i) => fields[i].width)),
+      x: Math.min(...group.map((i) => fields[i].x)),
+      fieldKind: "multiline",
+    };
+    replacements.set(group[0], merged);
+    for (let k = 1; k < group.length; k += 1) dropped.add(group[k]);
+  }
+
+  return fields
+    .map((f, i) => replacements.get(i) ?? f)
+    .filter((_, i) => !dropped.has(i));
+}
+
+/**
  * Shared field-mapping pipeline used by both Pass-1 paths
  * (Fast-mode single-shot and Maximum-mode Stage 1b). Takes the raw
  * Gemini-returned fields, runs them through `mapToTemplateField`,
@@ -3140,7 +3270,11 @@ function mapPass1RawFields(
   // cardType field is the one that participates in dedup overlap
   // checks (the original 4-5 sibling text/checkbox fields disappear).
   const groupMerged = mergeCardTypeOptionGroup(filtered);
-  const deduped = dedupeFields(groupMerged);
+  // v0.6.3 — merge stacked Billing Address widgets BEFORE dedup so
+  // the Arrow CC Authorization form (and similar) collapses 2-3 lines
+  // of `billingAddress` into a single multiline target.
+  const addressMerged = mergeStackedBillingAddress(groupMerged);
+  const deduped = dedupeFields(addressMerged);
 
   // Drop any raw entries whose mapped field got dedup'd away — the QC
   // pass should only audit fields we actually kept.

@@ -7,6 +7,7 @@ import {
   setApiKey,
   clearApiKey,
   testGeminiConnection,
+  getGeminiKeyStatus,
 } from "@/services/geminiClient";
 import { LOCKED_MODEL } from "@/services/geminiSettings";
 import packageJson from "../../../package.json";
@@ -27,8 +28,9 @@ interface SettingsModalProps {
 /**
  * Settings panel.
  *
- * Gemini: API key in macOS keychain (v0.6.2+). Model and accuracy stay
- * locked in `geminiSettings.ts`. Account, local data, About unchanged.
+ * Gemini: API key resolution (v0.6.2+): macOS keychain override, else optional
+ * compile-time `TYPESET_GEMINI_API_KEY` from release builds. Model and accuracy
+ * stay locked in `geminiSettings.ts`. Account, local data, About unchanged.
  *
  * Since v0.5.9 the public template registry is a passive,
  * fingerprint-driven backend with no UI surface here. Drop a PDF
@@ -76,6 +78,9 @@ export function SettingsModal({
   const [applePending, setApplePending] = useState(false);
 
   const [geminiHasKey, setGeminiHasKey] = useState(false);
+  /** Saved keychain key only (not the optional compile-time release key). */
+  const [geminiKeychainPresent, setGeminiKeychainPresent] = useState(false);
+  const [geminiBuildTimeKey, setGeminiBuildTimeKey] = useState(false);
   const [geminiKeyInput, setGeminiKeyInput] = useState("");
   const [geminiBusy, setGeminiBusy] = useState(false);
   const [geminiError, setGeminiError] = useState<string | null>(null);
@@ -109,7 +114,18 @@ export function SettingsModal({
     setGeminiKeyInput("");
     setGeminiError(null);
     setGeminiOk(null);
-    void hasApiKey().then(setGeminiHasKey);
+    void (async () => {
+      const status = await getGeminiKeyStatus();
+      if (status) {
+        setGeminiBuildTimeKey(status.buildTimeKeyPresent);
+        setGeminiKeychainPresent(status.keychainKeyPresent);
+        setGeminiHasKey(status.buildTimeKeyPresent || status.keychainKeyPresent);
+      } else {
+        void hasApiKey().then(setGeminiHasKey);
+        setGeminiKeychainPresent(false);
+        setGeminiBuildTimeKey(false);
+      }
+    })();
   }, [open]);
 
   useEffect(() => {
@@ -217,6 +233,7 @@ export function SettingsModal({
     try {
       await setApiKey(key);
       setGeminiHasKey(true);
+      setGeminiKeychainPresent(true);
       setGeminiKeyInput("");
       setGeminiOk("API key saved to your keychain.");
       window.setTimeout(() => setGeminiOk(null), 4000);
@@ -233,10 +250,19 @@ export function SettingsModal({
     setGeminiOk(null);
     try {
       await clearApiKey();
-      setGeminiHasKey(false);
+      const status = await getGeminiKeyStatus();
+      const stillHasKey =
+        Boolean(status?.buildTimeKeyPresent) || Boolean(status?.keychainKeyPresent);
+      setGeminiKeychainPresent(Boolean(status?.keychainKeyPresent));
+      setGeminiBuildTimeKey(Boolean(status?.buildTimeKeyPresent));
+      setGeminiHasKey(stillHasKey);
       setGeminiKeyInput("");
-      setGeminiOk("API key removed.");
-      window.setTimeout(() => setGeminiOk(null), 3000);
+      if (status?.buildTimeKeyPresent) {
+        setGeminiOk("Keychain override removed. Field detection still uses the built-in key.");
+      } else {
+        setGeminiOk("API key removed.");
+      }
+      window.setTimeout(() => setGeminiOk(null), 4000);
     } catch (err) {
       setGeminiError(err instanceof Error ? err.message : "Couldn't remove the key.");
     } finally {
@@ -299,24 +325,48 @@ export function SettingsModal({
           <div className={styles.section}>
             <span className={styles.label}>Gemini</span>
             <p className={styles.helpText}>
-              Field detection uses the Gemini API. Create a key in{" "}
-              <a
-                href="https://aistudio.google.com/apikey"
-                target="_blank"
-                rel="noreferrer"
-                className={styles.inlineLink}
-              >
-                Google AI Studio
-              </a>
-              . It is stored in your macOS keychain only.
+              {geminiBuildTimeKey ? (
+                <>
+                  This build includes a key for field detection. You can optionally save your
+                  own in the keychain to override it. Or create a key in{" "}
+                  <a
+                    href="https://aistudio.google.com/apikey"
+                    target="_blank"
+                    rel="noreferrer"
+                    className={styles.inlineLink}
+                  >
+                    Google AI Studio
+                  </a>
+                  .
+                </>
+              ) : (
+                <>
+                  Field detection uses the Gemini API. Create a key in{" "}
+                  <a
+                    href="https://aistudio.google.com/apikey"
+                    target="_blank"
+                    rel="noreferrer"
+                    className={styles.inlineLink}
+                  >
+                    Google AI Studio
+                  </a>
+                  . It is stored in your macOS keychain only.
+                </>
+              )}
             </p>
-            {geminiHasKey && (
-              <p className={styles.helpText}>A key is on file. Paste below to replace it.</p>
+            {geminiKeychainPresent && (
+              <p className={styles.helpText}>A keychain key is on file. Paste below to replace it.</p>
             )}
             <input
               type="password"
               className={styles.input}
-              placeholder={geminiHasKey ? "New API key (optional)" : "Paste API key"}
+              placeholder={
+                geminiKeychainPresent
+                  ? "New API key (optional)"
+                  : geminiBuildTimeKey
+                    ? "Override with your own key (optional)"
+                    : "Paste API key"
+              }
               value={geminiKeyInput}
               onChange={(e) => setGeminiKeyInput(e.target.value)}
               autoComplete="off"
@@ -349,10 +399,10 @@ export function SettingsModal({
               <button
                 type="button"
                 className={styles.clearBtn}
-                disabled={geminiBusy || !geminiHasKey}
+                disabled={geminiBusy || !geminiKeychainPresent}
                 onClick={() => void handleClearGeminiKey()}
               >
-                Remove key
+                Remove keychain key
               </button>
             </div>
             {geminiError && (

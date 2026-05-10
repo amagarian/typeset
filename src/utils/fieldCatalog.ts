@@ -199,6 +199,16 @@ export const CANONICAL_FIELD_DEFINITIONS: CanonicalFieldDefinition[] = [
     sectionHints: ["billing", "contact", "header"],
   },
   {
+    // v0.6.3 — dropped the bare `"address"` alias. It was matching as a
+    // word-boundary substring inside labels like `Address Line 2`,
+    // `Address (City, State, Zip)`, etc., which collapsed multiple
+    // distinct widgets onto `billingAddress`. Every one of them then
+    // rendered `project.billingAddress` (just the street), producing
+    // the "first line of address repeated on every line" symptom on
+    // the Arrow CC Authorization form. Real billing-address labels
+    // almost always carry a qualifier (`Billing`, `Mailing`, `Company`,
+    // `Remit To`); the rare bare-`Address` case can be re-mapped from
+    // the template editor.
     id: "billingAddress",
     label: "Billing Address",
     mappedProjectKey: "billingAddress",
@@ -210,7 +220,6 @@ export const CANONICAL_FIELD_DEFINITIONS: CanonicalFieldDefinition[] = [
       "credit card billing address",
       "mailing address",
       "remit to",
-      "address",
     ],
     sectionHints: ["billing", "payment", "contact"],
     multiline: true,

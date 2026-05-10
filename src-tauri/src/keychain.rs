@@ -17,10 +17,16 @@
 //! Earlier versions stored an Anthropic key under `anthropic-api-key`;
 //! we don't migrate it because the keys are not interchangeable.
 //!
-//! Gemini API keys live in the keychain (`gemini-api-key`). Use
-//! Settings → Gemini to set or rotate; never commit keys to git.
+//! Gemini API keys:
+//!   - **Keychain** (`gemini-api-key`) — set in Settings; takes precedence
+//!     over any build-time key (local override / rotation).
+//!   - **Compile-time** — optional `TYPESET_GEMINI_API_KEY` env var at
+//!     `cargo build` time (e.g. CI secret). Middle ground: not in git, but
+//!     still recoverable from the shipped binary (not a substitute for a
+//!     server-side proxy).
 
 use keyring::Entry;
+use serde::Serialize;
 
 const SERVICE: &str = "typeset";
 const GEMINI_ACCOUNT: &str = "gemini-api-key";
@@ -66,9 +72,54 @@ fn delete_secret(account: &str) -> Result<(), String> {
 // Gemini API key
 // ---------------------------------------------------------------------------
 
+/// Non-empty value baked in at **compile time** when `TYPESET_GEMINI_API_KEY`
+/// is set in the environment for `cargo build`. Never read from runtime env.
+fn embedded_gemini_key() -> Option<&'static str> {
+    match option_env!("TYPESET_GEMINI_API_KEY") {
+        Some(raw) => {
+            let t = raw.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t)
+            }
+        }
+        None => None,
+    }
+}
+
 /// Read the Gemini API key for `gemini.rs` detection commands.
 pub fn read_api_key() -> Option<String> {
     read_secret(GEMINI_ACCOUNT)
+}
+
+/// Keychain first (user override), then compile-time embedded key.
+pub fn resolve_gemini_api_key() -> Result<String, String> {
+    if let Some(k) = read_api_key() {
+        return Ok(k);
+    }
+    if let Some(k) = embedded_gemini_key() {
+        return Ok(k.to_string());
+    }
+    Err(
+        "Gemini API key is not configured. Open Settings (⌘,) and paste a key from Google AI Studio."
+            .to_string(),
+    )
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GeminiKeyStatus {
+    /// Whether this binary was built with `TYPESET_GEMINI_API_KEY` set.
+    pub build_time_key_present: bool,
+    pub keychain_key_present: bool,
+}
+
+#[tauri::command]
+pub fn get_gemini_key_status() -> Result<GeminiKeyStatus, String> {
+    Ok(GeminiKeyStatus {
+        build_time_key_present: embedded_gemini_key().is_some(),
+        keychain_key_present: read_api_key().is_some(),
+    })
 }
 
 #[tauri::command]
@@ -87,7 +138,7 @@ pub fn get_gemini_key() -> Result<Option<String>, String> {
 
 #[tauri::command]
 pub fn has_gemini_key() -> Result<bool, String> {
-    Ok(read_api_key().is_some())
+    Ok(read_api_key().is_some() || embedded_gemini_key().is_some())
 }
 
 #[tauri::command]

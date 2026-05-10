@@ -25,6 +25,11 @@
 # Per-release steps:
 #   - Bump `version` in src-tauri/tauri.conf.json + package.json + run
 #     `npm install --package-lock-only` to update the lockfile, commit, push.
+#   - Gemini compile-time key (not in git): the script auto-pulls it from
+#     the macOS keychain entry `typeset / gemini-api-key` (the same one
+#     Settings → Gemini writes to). To override on a CI runner or other
+#     machine, export TYPESET_GEMINI_API_KEY='…' before invoking. Omit
+#     to ship a key-less build (users paste their own key in Settings).
 #   - Run this script: `bash scripts/release.sh`
 
 set -euo pipefail
@@ -63,6 +68,31 @@ fi
 export TAURI_SIGNING_PRIVATE_KEY
 TAURI_SIGNING_PRIVATE_KEY="$(cat "$KEY_PATH")"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""
+
+# --- Gemini API key (compile-time embed) --------------------------------
+# Resolution order:
+#   1. `TYPESET_GEMINI_API_KEY` already exported in the shell.
+#   2. macOS Keychain entry created by Typeset itself
+#      (service=`typeset`, account=`gemini-api-key`) — the same place
+#      the running app stores the user-pasted key. This means after
+#      pasting a key into Settings → Gemini once, future releases pick
+#      it up automatically with zero extra typing.
+#   3. Nothing — release proceeds without an embedded key. Users will
+#      need to paste their own key in Settings → Gemini after install.
+if [ -z "${TYPESET_GEMINI_API_KEY:-}" ]; then
+  KEY_FROM_KEYCHAIN=$(security find-generic-password \
+      -s typeset -a gemini-api-key -w 2>/dev/null || true)
+  if [ -n "$KEY_FROM_KEYCHAIN" ]; then
+    export TYPESET_GEMINI_API_KEY="$KEY_FROM_KEYCHAIN"
+    echo "==> Using Gemini API key from macOS keychain (typeset/gemini-api-key)"
+  fi
+fi
+if [ -n "${TYPESET_GEMINI_API_KEY:-}" ]; then
+  echo "==> Embedding Gemini API key at build time (length: ${#TYPESET_GEMINI_API_KEY})"
+else
+  echo "==> No Gemini API key in env or keychain — shipping a key-less build."
+  echo "    Users will be prompted to paste a key in Settings → Gemini after install."
+fi
 
 # --- Apple code-signing identity (auto-detected) ------------------------
 # Override with `TYPESET_APPLE_SIGNING_IDENTITY="..."` when you want to force

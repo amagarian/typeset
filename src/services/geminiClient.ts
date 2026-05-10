@@ -267,6 +267,27 @@ export async function testGeminiConnection(model: string): Promise<void> {
   }
 }
 
+export interface GeminiKeyStatus {
+  buildTimeKeyPresent: boolean;
+  keychainKeyPresent: boolean;
+}
+
+export async function getGeminiKeyStatus(): Promise<GeminiKeyStatus | null> {
+  if (!isTauriAvailable()) return null;
+  try {
+    const raw = await invoke<{
+      build_time_key_present: boolean;
+      keychain_key_present: boolean;
+    }>("get_gemini_key_status");
+    return {
+      buildTimeKeyPresent: raw.build_time_key_present,
+      keychainKeyPresent: raw.keychain_key_present,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function setApiKey(key: string): Promise<void> {
   if (!isTauriAvailable()) {
     throw new GeminiNotConfiguredError(

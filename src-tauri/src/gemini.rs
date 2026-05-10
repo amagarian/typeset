@@ -28,10 +28,12 @@
 //!      returns it.
 //!
 //! Authentication uses a Gemini API key in the `x-goog-api-key` header.
-//! The key is stored in the OS keychain (`keychain.rs`, account
-//! `gemini-api-key`). Users add or rotate it in **Settings (⌘,)** —
-//! it is never baked into the binary. v0.5.37 briefly shipped a
-//! hardcoded beta key; that path was removed after the key was revoked.
+//! Resolution order (see `keychain::resolve_gemini_api_key`): OS keychain
+//! entry `gemini-api-key` first, then an optional compile-time key from the
+//! `TYPESET_GEMINI_API_KEY` build env (CI secret). The compile-time path is
+//! a convenience middle ground — the value still ends up in the binary; it is
+//! not extract-proof. v0.5.37 briefly shipped a leaked hardcoded key; that
+//! approach was removed.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -135,12 +137,7 @@ fn build_client() -> Result<reqwest::Client, String> {
 }
 
 fn require_key() -> Result<String, String> {
-    crate::keychain::read_api_key()
-        .filter(|s| !s.trim().is_empty())
-        .ok_or_else(|| {
-            "Gemini API key is not configured. Open Settings (⌘,) and paste a key from Google AI Studio."
-                .to_string()
-        })
+    crate::keychain::resolve_gemini_api_key()
 }
 
 fn emit_progress(app: &AppHandle, payload: GeminiProgress) {
