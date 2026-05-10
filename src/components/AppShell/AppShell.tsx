@@ -8,6 +8,13 @@ interface AppShellProps {
   selectedProjectId: string | null;
   onSelectProject: (id: string) => void;
   onNewProject: () => void;
+  /**
+   * v0.5.27 — kept on the prop surface even though Sidebar no
+   * longer renders a Settings button. The App-level handler is
+   * still invoked by the macOS menu bar (⌘,) listener registered
+   * in App.tsx, so the wiring stays intact at the shell boundary
+   * for callers that supply it. Unused locally.
+   */
   onOpenSettings?: () => void;
   /**
    * v0.5.24 — top-right slot in the main-window header. Used by App.tsx
@@ -26,7 +33,6 @@ export function AppShell({
   selectedProjectId,
   onSelectProject,
   onNewProject,
-  onOpenSettings,
   headerRight,
 }: AppShellProps) {
   return (
@@ -37,7 +43,6 @@ export function AppShell({
         selectedId={selectedProjectId}
         onSelect={onSelectProject}
         onNewProject={onNewProject}
-        onOpenSettings={onOpenSettings}
       />
       <main className={styles.main}>
         <header className={styles.mainHeader} data-tauri-drag-region>

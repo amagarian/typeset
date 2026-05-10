@@ -311,6 +311,37 @@ function MainApp() {
     void fetchContributionStats();
   }, []);
 
+  // v0.5.27 — bridge for the native macOS menu bar's "Settings…"
+  // item (⌘,). The Rust setup hook in `src-tauri/src/lib.rs`
+  // emits `menu:open-settings` on activation; we mirror it into a
+  // local state flip here. `setSettingsOpen(true)` is idempotent,
+  // so a stale fire while the modal is already open is a no-op
+  // (no double-open / focus thrash). The async import keeps the
+  // Tauri event API out of any non-Tauri (browser preview) build.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: (() => void) | undefined;
+    void (async () => {
+      try {
+        const { listen } = await import("@tauri-apps/api/event");
+        const off = await listen<unknown>("menu:open-settings", () => {
+          setSettingsOpen(true);
+        });
+        if (cancelled) {
+          off();
+        } else {
+          unlisten = off;
+        }
+      } catch (err) {
+        console.warn("[Typeset] Menu listener attach failed:", err);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, []);
+
   const handleRelaunch = useCallback(async () => {
     try {
       const { relaunch } = await import("@tauri-apps/plugin-process");
