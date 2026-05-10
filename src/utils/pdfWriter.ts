@@ -99,17 +99,33 @@ function fitTextToWidth(text: string, width: number, font: any, fontSize: number
  * field.width` so even when the heuristic fires on a wrong label we
  * never push past the bbox midpoint.
  */
-const LABEL_PREFIX_CANONICAL_IDS = new Set([
-  "creditCardHolder",
-  "billingAddress",
-  "ccv",
-  "cardholderSignature",
-  "creditCardNumber",
-  "phone",
-  "email",
-  "authorizationDate",
-  "cardType",
-]);
+/**
+ * v0.6.13 — per-canonical minimum-shift table. Gemini's `raw.label`
+ * is a short Title-Case description (`"Cardholder Name"`, `"CVV"`),
+ * but the form's PRINTED prefix label is usually longer (e.g.
+ * `"Cardholder's Name:"`, `"CVV2/Security Code:"`). Measuring the
+ * canonical name alone underestimates the shift on the Keslow CC
+ * Auth grid, leaving the value's first few characters on top of the
+ * tail of the printed label.
+ *
+ * The minimum-shift values below are the typical PRINTED prefix
+ * widths at 12pt across the real-world corpus we test against (a
+ * mix of Keslow, Arrow, 204, and Hollywood Depot CC-auth grids).
+ * The actual shift used is `max(measuredLabelWidth + 4, perCanonicalMin)`,
+ * then clamped to `0.5 * field.width` so even a wildly wrong canonical
+ * mapping can never shift past the bbox midpoint.
+ */
+const LABEL_PREFIX_MIN_SHIFT_BY_CANONICAL: Record<string, number> = {
+  creditCardHolder: 100, // "Cardholder's Name:"
+  billingAddress: 95, // "Billing Address:" / "Cardholder Billing Address:"
+  ccv: 120, // "CVV2/Security Code:" / "CVV (3 digit):"
+  cardholderSignature: 65, // "Signature:"
+  creditCardNumber: 55, // "Card #:" (short) — wider when "Credit Card Number:"
+  phone: 60, // "Phone Number:" / "Phone:"
+  email: 55, // "Email:" / "Email Address:"
+  authorizationDate: 250, // "Authorization is valid through (MM/DD/YYY):"
+  cardType: 65, // "Card Type:" / "Type:"
+};
 
 function computePrefixLabelShiftX(
   field: TemplateField,
@@ -128,19 +144,33 @@ function computePrefixLabelShiftX(
   if (!printed) return 0;
 
   const endsWithColon = /[:：]\s*$/.test(printed);
-  const canonicalMatch =
-    typeof field.canonicalFieldId === "string" &&
-    LABEL_PREFIX_CANONICAL_IDS.has(field.canonicalFieldId);
+  const canonicalId =
+    typeof field.canonicalFieldId === "string"
+      ? field.canonicalFieldId
+      : undefined;
+  const canonicalMin =
+    canonicalId && canonicalId in LABEL_PREFIX_MIN_SHIFT_BY_CANONICAL
+      ? LABEL_PREFIX_MIN_SHIFT_BY_CANONICAL[canonicalId]
+      : 0;
+  const canonicalMatch = canonicalMin > 0;
 
-  // PATH A requires width ≥ 100pt; PATH B requires width ≥ 150pt
-  // (canonical-only paths are riskier, so we demand a wider bbox to
-  // reduce the chance of shifting a genuinely post-colon writable
-  // area). If neither gate is satisfied, no shift.
+  // PATH A (explicit colon in printedLabel) — width gate 100pt.
+  // PATH B (canonical-min only) — width gate 180pt. Canonical-only
+  // paths are riskier than the explicit-colon path, so we demand a
+  // wider bbox before shifting to prevent over-shifting a narrow
+  // genuinely-post-colon writable area (e.g. an EXP cell).
   const widthOk =
     (endsWithColon && field.width >= 100) ||
-    (canonicalMatch && field.width >= 150);
+    (canonicalMatch && field.width >= 180);
   if (!widthOk) return 0;
 
+  // v0.6.13 — only treat `contextBefore` as a "label sits OUTSIDE
+  // bbox to the LEFT" signal when the printed-label stem appears in
+  // the LAST ~40 chars of contextBefore. A contains-anywhere check
+  // was too loose: Gemini sometimes packs the entire row's leading
+  // sentence into context_before regardless of where the bbox
+  // actually starts, so the stem could appear mid-string even when
+  // the bbox engulfs the printed label.
   const ctx = (field.contextBefore ?? "").trim().toLowerCase();
   if (ctx.length > 0) {
     const stem = printed
@@ -149,14 +179,15 @@ function computePrefixLabelShiftX(
       .trim();
     if (stem.length >= 4) {
       const probe = stem.slice(0, Math.min(stem.length, 16));
-      if (ctx.includes(probe)) return 0;
+      const tail = ctx.slice(Math.max(0, ctx.length - 40));
+      if (tail.includes(probe)) return 0;
     }
   }
 
   const measureLabel = endsWithColon ? printed : `${printed}:`;
   const labelWidth = font.widthOfTextAtSize(measureLabel, fontSize);
-  const shift = labelWidth + 4;
-  const ceiling = field.width * 0.6;
+  const shift = Math.max(labelWidth + 4, canonicalMin);
+  const ceiling = field.width * 0.5;
   return Math.min(shift, ceiling);
 }
 
@@ -178,7 +209,15 @@ function fitWithShrink(
   minFontSize: number = 6.5
 ): { text: string; fontSize: number } {
   if (!text) return { text: "", fontSize: baseFontSize };
-  const maxWidth = Math.max(0, width - 6);
+  // v0.6.13 — proportional right margin. A flat 6pt margin worked on
+  // 200pt+ bboxes but ate too much of the writable area on narrow
+  // boxes (e.g. an EXP cell ~30pt wide that's bbox'd correctly past
+  // the colon — 6pt is 20% of the cell, dropping us below the shrink
+  // floor for `01/31`). The new floor of 15% of width caps the
+  // margin at 6pt for wide bboxes but scales down to ~3pt on narrow
+  // cells, letting shrink find a fit.
+  const rightMargin = Math.min(6, width * 0.15);
+  const maxWidth = Math.max(0, width - rightMargin);
   if (maxWidth <= 0) return { text, fontSize: baseFontSize };
   if (font.widthOfTextAtSize(text, baseFontSize) <= maxWidth) {
     return { text, fontSize: baseFontSize };
@@ -540,7 +579,16 @@ export async function writeFilledPdfBytes(
         }
 
         let yBaseline = yPdfBottom + field.height - 1;
-        const usableWidth = Math.max(8, field.width - insetX - 3);
+        // v0.6.13 — restore the v0.6.10 "field.width - (insetX - 3)"
+        // formula. v0.6.11 changed this to `field.width - insetX - 3`,
+        // which is the mathematically correct net subtraction but
+        // shaved 6pt of slack off narrow bboxes — enough to push the
+        // post-Layout-A1 EXP cell (now correctly bbox'd at ~30pt
+        // starting past the colon) below the shrink-floor and into
+        // ellipsis territory ("EXP: 0..."). Restoring the v0.6.10
+        // expression buys back the slack while keeping wide bboxes
+        // (Cardholder Name, Billing Address) unaffected.
+        const usableWidth = Math.max(8, field.width - (insetX - 3));
 
         for (const line of lines) {
           const { text: fitted, fontSize: actualFontSize } = fitWithShrink(
@@ -573,7 +621,7 @@ export async function writeFilledPdfBytes(
         baseFontSize = Math.max(7, Math.min(12, Math.floor(field.height * 0.75)));
       }
 
-      const usableWidth = Math.max(8, field.width - insetX - 3);
+      const usableWidth = Math.max(8, field.width - (insetX - 3));
       const { text: value, fontSize: actualFontSize } = fitWithShrink(
         rawValue,
         usableWidth,
