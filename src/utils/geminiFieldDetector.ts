@@ -99,6 +99,8 @@ import {
   type PageRender,
 } from "@/utils/underlineSnap";
 import { annotateOptionGroupBlanks } from "@/utils/optionBlankDetector";
+import { annotateBoxedFields } from "@/utils/boxedFieldDetector";
+import { annotateInitialBoxes } from "@/utils/initialBoxDetector";
 
 export {
   GeminiNotConfiguredError as ClaudeNotConfiguredError, // back-compat alias
@@ -266,6 +268,24 @@ const RENDER_LONG_EDGE_PX = 2048;
  * field rectangles we store on `TemplateField`. No Y flip is needed
  * anywhere in the pipeline.
  */
+/**
+ * v0.6.0 (D1) — hard cap on multi-page rendering. The Gemini call
+ * is bounded by output-token budget (32k) which roughly translates
+ * to 25-40 fields per page on dense paperwork; very long packets
+ * (rental agreements with 30+ initialed clauses) blow past that
+ * budget and produce truncated JSON that the salvager has to fix
+ * up. 20 pages is well above the corpus's longest form (12 pages,
+ * the Studio Contract Hollywood) and gives headroom for complex
+ * vendor-set agreements without exploding the response size.
+ *
+ * Pages beyond the cap are SKIPPED, NOT errored — the caller still
+ * gets a usable detection; the user just won't see auto-detected
+ * fields on the trailing pages and can hand-add them in the
+ * review canvas. A console.warn fires once when truncation
+ * happens so the next user report carries evidence.
+ */
+const MAX_RENDERED_PAGES = 20;
+
 async function renderPagesToPng(
   pdfBytes: Uint8Array,
   onProgress?: (pageNumber: number, totalPages: number) => void
@@ -275,8 +295,14 @@ async function renderPagesToPng(
   const rendered: RenderedPage[] = [];
 
   try {
-    for (let pageNumber = 1; pageNumber <= pdf.numPages; pageNumber += 1) {
-      onProgress?.(pageNumber, pdf.numPages);
+    const effectivePages = Math.min(pdf.numPages, MAX_RENDERED_PAGES);
+    if (pdf.numPages > MAX_RENDERED_PAGES) {
+      console.warn(
+        `[Typeset Diag] PDF has ${pdf.numPages} pages; capping detection at the first ${MAX_RENDERED_PAGES}. Trailing pages must be hand-added in the review canvas.`
+      );
+    }
+    for (let pageNumber = 1; pageNumber <= effectivePages; pageNumber += 1) {
+      onProgress?.(pageNumber, effectivePages);
 
       const page = await pdf.getPage(pageNumber);
       const baseViewport = page.getViewport({ scale: 1 });
@@ -437,6 +463,323 @@ async function extractTextRows(
     xMin: row.xMin,
     xMax: row.xMax,
   }));
+}
+
+/**
+ * v0.6.0 (D3) — lightweight section detection.
+ *
+ * Walks the text content of each rendered page and identifies
+ * ALL-CAPS section headers (`SECTION 1`, `SECTION 2:`,
+ * `BASIC INFORMATION`, `CREDIT CARD INFORMATION`, etc.). Each
+ * detected header opens a section that runs from the header's
+ * baseline down to the next header on the same page (or to the
+ * page bottom). The result is a flat list of section bands, one
+ * per page, that the field-annotation step uses to tag each
+ * `TemplateField` with the section it physically falls into.
+ *
+ * Why deterministic regex + text content rather than a Gemini
+ * call: section detection is a small, well-defined lexical task
+ * that adds zero rate-limit pressure when done locally. Bold
+ * detection isn't reliably exposed by pdf.js (fontName usually
+ * carries a "Bold" suffix on type 1 fonts but not on subsetted
+ * embedded fonts), so we approximate boldness via length +
+ * caps-ratio + standalone-row gates. False positives are
+ * tolerated (a stray ALL CAPS sentence becomes a single-row
+ * section that affects nothing because no field falls inside
+ * it); false negatives downgrade to "field has no section
+ * annotation" which is also benign.
+ *
+ * Used by:
+ *   - B2: bare `Name` disambiguation (a Name field in a section
+ *     labelled `CREDIT CARD INFORMATION` resolves to
+ *     `creditCardHolder`; one in `SECTION 1: BASIC INFORMATION`
+ *     falls through to the officer/signer canonical).
+ *   - D2: cross-page dedup (same-canonical fields in different
+ *     sections are NOT merged; sibling sections legitimately
+ *     repeat the same canonical id).
+ */
+export interface SectionBand {
+  page: number;
+  /** Baseline y of the header text, top-down origin (matches `TemplateField.y`). */
+  startY: number;
+  /** Top-down y where this section ends — the next header's startY or pageBottom. */
+  endY: number;
+  /** The header text itself (e.g. `"SECTION 1: BASIC INFORMATION"`). */
+  label: string;
+}
+
+/**
+ * Decide whether a given text-row string looks like an ALL-CAPS
+ * section header. Conservative — false negatives are preferred to
+ * false positives because a header that's missed downgrades the
+ * caller to "no section annotation" (benign), whereas a false
+ * header inserts a band that can split a real section into two
+ * and hijack the bare-Name disambiguation.
+ *
+ * Triggers (any of):
+ *   - Matches one of a curated list of well-known headers
+ *     (`SECTION X`, `BASIC INFORMATION`, `CREDIT CARD …`, `BILLING`,
+ *     `SHIPPING`, `AUTHORIZED SIGNER`, etc.).
+ *   - Or: starts with `SECTION` followed by a digit/Roman numeral.
+ *   - Or: is a short (≤ 50 chars) all-caps run with at least 2
+ *     letter characters and no lowercase letters; whitespace,
+ *     digits, and standard punctuation pass through.
+ */
+function isSectionHeaderText(raw: string): boolean {
+  const text = raw.trim();
+  if (!text) return false;
+  if (text.length > 60) return false;
+
+  if (/^section\s+(?:[ivxlcdm]+|\d+)\b/i.test(text)) return true;
+  const KNOWN_HEADERS = [
+    /^basic information/i,
+    /^credit\s+card(?:\s+information)?/i,
+    /^cardholder/i,
+    /^billing\s+information/i,
+    /^shipping\s+information/i,
+    /^authorized\s+signer/i,
+    /^company\s+information/i,
+    /^contact\s+information/i,
+    /^banking\s+information/i,
+    /^payment\s+information/i,
+    /^cc\s+auth(?:orization)?/i,
+    /^vehicle\s+information/i,
+    /^insurance\s+information/i,
+    /^production\s+information/i,
+    /^rental\s+(?:period|terms)/i,
+  ];
+  if (KNOWN_HEADERS.some((re) => re.test(text))) return true;
+
+  // Generic ALL CAPS heuristic. We require at least 4 letter
+  // characters so single-word labels like `OK` don't trigger.
+  // Tolerate digits (`SECTION 1`), spaces, and standard
+  // punctuation — the gate is "does this row contain any
+  // lowercase letters". If yes, it's a sentence; if no, it's a
+  // header.
+  const letters = text.replace(/[^A-Za-z]/g, "");
+  if (letters.length < 4) return false;
+  if (letters !== letters.toUpperCase()) return false;
+  return true;
+}
+
+/**
+ * Per-page text-row extraction WITH the underlying string
+ * preserved (the existing `extractTextRows` discards strings to
+ * keep the snap helper's payload minimal). Returns rows sorted by
+ * top-down y so the caller can scan in document order.
+ */
+async function extractTextRowsWithStrings(
+  page: pdfjsLib.PDFPageProxy,
+  pageHeightPt: number
+): Promise<Array<{ y: number; xMin: number; xMax: number; text: string }>> {
+  const textContent = await page.getTextContent();
+  const ROW_KEY_PT = 2;
+  const rows = new Map<
+    number,
+    { yBottomUp: number; xMin: number; xMax: number; parts: Array<{ x: number; str: string }> }
+  >();
+
+  type TextItem = { str?: string; transform?: number[]; width?: number };
+  for (const item of textContent.items as TextItem[]) {
+    const str = (item.str ?? "").replace(/\s+/g, " ");
+    if (!str.trim()) continue;
+    const transform = item.transform;
+    if (!Array.isArray(transform) || transform.length < 6) continue;
+    const x = transform[4];
+    const yBottomUp = transform[5];
+    const width = typeof item.width === "number" ? item.width : 0;
+    if (!Number.isFinite(x) || !Number.isFinite(yBottomUp)) continue;
+
+    const key = Math.round(yBottomUp / ROW_KEY_PT) * ROW_KEY_PT;
+    const existing = rows.get(key);
+    if (existing) {
+      existing.xMin = Math.min(existing.xMin, x);
+      existing.xMax = Math.max(existing.xMax, x + (width || 0));
+      existing.parts.push({ x, str });
+    } else {
+      rows.set(key, {
+        yBottomUp,
+        xMin: x,
+        xMax: x + (width || 0),
+        parts: [{ x, str }],
+      });
+    }
+  }
+
+  return Array.from(rows.values())
+    .map((row) => {
+      // Concatenate parts in left-to-right reading order so the
+      // resulting `text` reads as the user sees it.
+      const sorted = [...row.parts].sort((a, b) => a.x - b.x);
+      const text = sorted
+        .map((p) => p.str)
+        .join(" ")
+        .replace(/\s+/g, " ")
+        .trim();
+      return {
+        y: pageHeightPt - row.yBottomUp,
+        xMin: row.xMin,
+        xMax: row.xMax,
+        text,
+      };
+    })
+    .sort((a, b) => a.y - b.y);
+}
+
+export interface PageTextRowWithString {
+  y: number;
+  xMin: number;
+  xMax: number;
+  text: string;
+}
+
+export interface PageTextSnapshot {
+  rowsByPage: Record<number, PageTextRowWithString[]>;
+  pageHeightsPt: Record<number, number>;
+}
+
+/**
+ * Extract per-page text rows WITH their strings for every page in
+ * the document (capped at `MAX_RENDERED_PAGES`). Used by both the
+ * section detector and the boxed-field detector so each pass
+ * benefits from a single pdf.js read.
+ *
+ * Returns an empty snapshot on failure — both consumers treat
+ * missing rows as "no annotation" / "no boxed-field detection",
+ * which keeps the downstream pipeline working.
+ */
+export async function extractPageTextSnapshot(
+  pdfBytes: Uint8Array
+): Promise<PageTextSnapshot> {
+  const bytesCopy = new Uint8Array(pdfBytes);
+  const out: PageTextSnapshot = { rowsByPage: {}, pageHeightsPt: {} };
+  let pdf: pdfjsLib.PDFDocumentProxy;
+  try {
+    pdf = await pdfjsLib.getDocument({ data: bytesCopy }).promise;
+  } catch (err) {
+    console.warn("[Typeset Text] pdf.js getDocument failed; text snapshot will be empty.", err);
+    return out;
+  }
+  try {
+    const totalPages = Math.min(pdf.numPages, MAX_RENDERED_PAGES);
+    for (let pageNumber = 1; pageNumber <= totalPages; pageNumber += 1) {
+      let page: pdfjsLib.PDFPageProxy;
+      try {
+        page = await pdf.getPage(pageNumber);
+      } catch (err) {
+        console.warn(`[Typeset Text] getPage(${pageNumber}) failed; skipping.`, err);
+        continue;
+      }
+      const baseViewport = page.getViewport({ scale: 1 });
+      out.pageHeightsPt[pageNumber] = baseViewport.height;
+      try {
+        out.rowsByPage[pageNumber] = await extractTextRowsWithStrings(
+          page,
+          baseViewport.height
+        );
+      } catch (err) {
+        console.warn(
+          `[Typeset Text] extractTextRowsWithStrings(page=${pageNumber}) failed; skipping.`,
+          err
+        );
+      }
+    }
+  } finally {
+    pdf.destroy();
+  }
+  return out;
+}
+
+/**
+ * Run section detection on a pre-computed text snapshot. Pure
+ * function; no pdf.js calls. Used by the detection pipeline AFTER
+ * `extractPageTextSnapshot` so the snapshot can be reused for the
+ * boxed-field detector.
+ */
+export function detectSectionsFromSnapshot(
+  snapshot: PageTextSnapshot
+): SectionBand[] {
+  const out: SectionBand[] = [];
+  for (const [pageStr, rows] of Object.entries(snapshot.rowsByPage)) {
+    const pageNumber = Number(pageStr);
+    const pageHeight = snapshot.pageHeightsPt[pageNumber] ?? 0;
+    const headers = rows.filter((row) => isSectionHeaderText(row.text));
+    if (headers.length === 0) continue;
+    for (let i = 0; i < headers.length; i += 1) {
+      const header = headers[i];
+      const next = headers[i + 1];
+      out.push({
+        page: pageNumber,
+        startY: header.y,
+        endY: next ? next.y : pageHeight,
+        label: header.text,
+      });
+    }
+  }
+  if (out.length > 0) {
+    console.log(
+      `[Typeset Sections] Detected ${out.length} section(s) across ${new Set(out.map((s) => s.page)).size} page(s).`
+    );
+  }
+  return out;
+}
+
+/**
+ * Backwards-compatible wrapper for callers that just want the
+ * sections without managing a snapshot. Internally delegates to
+ * `extractPageTextSnapshot` + `detectSectionsFromSnapshot`.
+ */
+export async function detectSections(
+  pdfBytes: Uint8Array
+): Promise<SectionBand[]> {
+  const snapshot = await extractPageTextSnapshot(pdfBytes);
+  return detectSectionsFromSnapshot(snapshot);
+}
+
+/**
+ * Map a {@link PageTextSnapshot} to the `{ yBottom, xMin, xMax, text }`
+ * shape consumed by the boxed-field detector. The snapshot's `y`
+ * already represents the top-down baseline of the row, so it
+ * doubles as `yBottom` in `TextRow` semantics.
+ */
+function pageTextSnapshotToBoxedTextRows(
+  snapshot: PageTextSnapshot
+): Record<number, Array<{ yBottom: number; xMin: number; xMax: number; text: string }>> {
+  return Object.fromEntries(
+    Object.entries(snapshot.rowsByPage).map(([p, rows]) => [
+      Number(p),
+      rows.map((r) => ({
+        yBottom: r.y,
+        xMin: r.xMin,
+        xMax: r.xMax,
+        text: r.text,
+      })),
+    ])
+  );
+}
+
+/**
+ * Annotate each field with the section it physically falls into.
+ * A field falls in a section when the section's `page` matches
+ * the field's `pageNumber` AND the field's vertical centre sits
+ * within `[startY, endY]`. Fields in no section are left
+ * untouched — `section` stays undefined.
+ *
+ * Returns a NEW array; never mutates the input.
+ */
+export function annotateFieldsWithSections(
+  fields: TemplateField[],
+  sections: ReadonlyArray<SectionBand>
+): TemplateField[] {
+  if (sections.length === 0) return fields;
+  return fields.map((field) => {
+    const cy = field.y + field.height / 2;
+    const match = sections.find(
+      (s) => s.page === field.pageNumber && cy >= s.startY && cy <= s.endY
+    );
+    if (!match) return field;
+    return { ...field, section: match.label };
+  });
 }
 
 
@@ -1221,6 +1564,35 @@ function inferByLabel(
     return "ccv";
   }
 
+  // v0.6.0 (B1) — Tel preflight. "Tel", "Tel:", "Tel.", and
+  // "Telephone" are the dominant phone-label captions on
+  // legal/rental paperwork (the v0.5.x corpus has 8 forms using
+  // bare `Tel:` and 5 using `Telephone`). We MUST short-circuit
+  // here rather than registering these as global aliases on the
+  // `phone` canonical: the alias index is consulted by
+  // `inferCanonicalId` against `context_before + context_after`
+  // haystacks, and short tokens like `tel` would substring-match
+  // unrelated content (`hotel`, `tel:` inside an instruction
+  // sentence, etc.). Label-only matching is precise — Gemini hands
+  // us the label string verbatim, and the user's eye-level
+  // experience treats `Tel` as unambiguous in a form context.
+  //
+  // Triggers:
+  //   - `tel`, `tel:`, `tel.` (most common typographic variants)
+  //   - `telephone`, `telephone:`, `telephone.`
+  //   - `tel #`, `tel#`, `tel no`, `tel no.`, `tel number`
+  //     (variants observed in the corpus)
+  if (
+    lbl === "tel" ||
+    lbl === "telephone" ||
+    /^tel\s*[:.#]$/.test(lbl) ||
+    /^telephone\s*[:.#]$/.test(lbl) ||
+    /^tel\s*(?:no\.?|number|#)$/.test(lbl) ||
+    /^telephone\s*(?:no\.?|number|#)$/.test(lbl)
+  ) {
+    return "phone";
+  }
+
   // v0.5.15 — Name-label preflight. "Print Name" and similar
   // person-name labels denote a cardholder/customer-name field
   // unambiguously when they sit ON the label. They MUST short-circuit
@@ -1239,16 +1611,22 @@ function inferByLabel(
   //
   // Triggers:
   //   - `print name` (the v0.5.14 user report)
-  //   - `name` alone, or `name:` / `name.` (typographic variants)
   //   - `first name`, `last name`, `full name`, `customer name`,
   //     `cardholder name`, `card holder name` — covered for parity;
   //     the existing alias index already catches some of these but
   //     this preflight makes the precedence explicit.
+  //
+  // v0.6.0 (B2) — bare `Name` / `Name:` / `Name.` is REMOVED from
+  // this preflight. Without surrounding context it's ambiguous
+  // (cardholder vs. authorized signer vs. emergency contact) and
+  // the preflight here used to force-fit it to `creditCardHolder`,
+  // hijacking officer-name fields on rental-account / new-account
+  // forms (204 New Account, ISS Deposit, Camtec). Disambiguation
+  // happens in `mapToTemplateField` where `context_before` /
+  // `context_after` and the field's section are visible.
   if (
     /^print\s+name$/.test(lbl) ||
-    /^(?:first|last|full|customer|cardholder|card\s+holder)\s+name$/.test(lbl) ||
-    lbl === "name" ||
-    /^name\s*[:.]$/.test(lbl)
+    /^(?:first|last|full|customer|cardholder|card\s+holder)\s+name$/.test(lbl)
   ) {
     return "creditCardHolder";
   }
@@ -1609,11 +1987,62 @@ function mapToTemplateField(
     const lbl = (raw.label ?? "").trim().toLowerCase();
     if (
       /^print\s+name$/.test(lbl) ||
-      /^(?:first|last|full|customer|cardholder|card\s+holder)\s+name$/.test(lbl) ||
-      lbl === "name" ||
-      /^name\s*[:.]$/.test(lbl)
+      /^(?:first|last|full|customer|cardholder|card\s+holder)\s+name$/.test(lbl)
     ) {
       canonicalId = "creditCardHolder";
+    }
+  }
+
+  // v0.6.0 (B2) — bare `Name` disambiguation. The label-only
+  // preflight in `inferByLabel` USED to map bare `Name` /
+  // `Name:` / `Name.` to `creditCardHolder` unconditionally, which
+  // hijacked authorized-signer / officer fields on rental-account
+  // forms (204 New Account, ISS Deposit, Camtec). With that
+  // preflight removed (see the comment in `inferByLabel`'s name
+  // block), bare `Name` arrives here with `canonicalId` likely
+  // `undefined`. We resolve via context:
+  //   1. If the label OR `context_before` contains a cardholder
+  //      hint (`cardholder`, `card holder`, `name on card`,
+  //      `print name on card`) OR the immediate preceding context
+  //      contains a credit-card section header
+  //      (`credit card`, `cc auth`, `payment`, `cardholder`),
+  //      → `creditCardHolder`.
+  //   2. Else, if the surrounding context carries an officer hint
+  //      (`officer`, `title`, `president`, `secretary`,
+  //      `authorized signer`, `corporate`, `company officer`),
+  //      → `authorizedSignerName`.
+  //   3. Else, leave `canonicalId` undefined so the field falls
+  //      through to `__prompt__` in the mapped-key resolution
+  //      below — Gemini's downstream semantic mapping (or the
+  //      user) decides.
+  //
+  // The 80pt section-header window described in the spec is
+  // approximated by `context_before` content here — Gemini's
+  // prompt instructs it to surface the immediate row-context
+  // (typically 60–120pt above the bbox), so a CC section header
+  // sitting "within ~80pt above" usually shows up in
+  // `context_before`. For full-form section ranges we rely on
+  // detectSections (Workstream D3) annotating `field.section`,
+  // and that takes precedence — see the section-tagging pass
+  // after this block.
+  if (canonicalId === undefined) {
+    const bareLbl = (raw.label ?? "").trim().toLowerCase();
+    const isBareName =
+      bareLbl === "name" || /^name\s*[:.]$/.test(bareLbl);
+    if (isBareName) {
+      const hay = `${(raw.context_before ?? "").toLowerCase()} ${(raw.context_after ?? "").toLowerCase()}`;
+      const labelHint = bareLbl;
+      const ccHints =
+        /\bcardholder\b|\bcard\s+holder\b|\bname\s+on\s+card\b|\bprint\s+name\s+on\s+card\b/;
+      const ccSection = /\bcredit\s+card\b|\bcc\s+auth\b|\bpayment\b/;
+      const officerHints =
+        /\bofficer\b|\btitle\b|\bpresident\b|\bsecretary\b|\bauthorized\s+signer\b|\bcorporate\b|\bcompany\s+officer\b/;
+      if (ccHints.test(labelHint) || ccHints.test(hay) || ccSection.test(hay)) {
+        canonicalId = "creditCardHolder";
+      } else if (officerHints.test(hay)) {
+        canonicalId = "authorizedSignerName";
+      }
+      // else — leave undefined; falls to `__prompt__` below.
     }
   }
 
@@ -2954,6 +3383,17 @@ async function detectFieldsImpl(
     };
   }
 
+  // v0.6.0 (D3 + B3) — single per-page text-row snapshot used by
+  // BOTH the section detector (D3) and the boxed-field detector
+  // (B3). Runs in parallel with the post-detection pipeline; the
+  // pipeline doesn't block on a snapshot-extraction failure
+  // (sections + boxed-field annotations both degrade silently to
+  // "no annotation").
+  const textSnapshotPromise = extractPageTextSnapshot(pdfBytes).catch((err) => {
+    console.warn("[Typeset Text] snapshot extraction failed; sections + boxed-field detection will be empty.", err);
+    return { rowsByPage: {}, pageHeightsPt: {} } as PageTextSnapshot;
+  });
+
   if (!twoPass) {
     // v0.5.5 snap runs once per detection regardless of accuracy
     // mode, AFTER mapToTemplateField + dedup but BEFORE we hand the
@@ -2972,8 +3412,36 @@ async function detectFieldsImpl(
     const annotated = annotateOptionGroupBlanks(snapped, pageRenders, {
       verbose: true,
     });
-    onStatus?.(`Gemini detected ${annotated.length} field(s).`, 1);
-    return annotated;
+    const snapshot = await textSnapshotPromise;
+    // v0.6.0 (B3) — boxed-field detector. Runs AFTER snap +
+    // option-blank annotation so the field set is at its final
+    // bbox geometry; the boxed-field pass corrects over-extended
+    // bboxes for label-inside-box patterns and emits new fields
+    // for boxes Gemini missed entirely. Conservative thresholds —
+    // see the module comment in `boxedFieldDetector.ts`.
+    // Translate `y` → `yBottom` to match the `TextRow` shape used by
+    // the rest of the snap pipeline.
+    const boxed = annotateBoxedFields(
+      annotated,
+      pageRenders,
+      { textRows: pageTextSnapshotToBoxedTextRows(snapshot) },
+      { verbose: true }
+    );
+    // v0.6.0 (F) — clause-initials column detection. Runs after
+    // the boxed-field pass so any initials cluster that overlaps
+    // a boxed-field bbox is skipped (the boxed-field bbox wins).
+    const withInitials = annotateInitialBoxes(boxed, pageRenders, {
+      verbose: true,
+    });
+    // v0.6.0 (D3) — annotate fields with the section they fall
+    // into. Used by B2 (cross-section bare-Name disambiguation)
+    // and downstream consumers that want to display a section
+    // header in the review canvas. Skips silently when section
+    // detection failed or found no headers.
+    const sections = detectSectionsFromSnapshot(snapshot);
+    const sectioned = annotateFieldsWithSections(withInitials, sections);
+    onStatus?.(`Gemini detected ${sectioned.length} field(s).`, 1);
+    return sectioned;
   }
 
   // ----- Pass 2: quality-control audit ------------------------------------
@@ -3008,11 +3476,23 @@ async function detectFieldsImpl(
     const annotated = annotateOptionGroupBlanks(snapped, pageRenders, {
       verbose: true,
     });
+    const snapshot = await textSnapshotPromise;
+    const boxed = annotateBoxedFields(
+      annotated,
+      pageRenders,
+      { textRows: pageTextSnapshotToBoxedTextRows(snapshot) },
+      { verbose: true }
+    );
+    const withInitials = annotateInitialBoxes(boxed, pageRenders, {
+      verbose: true,
+    });
+    const sections = detectSectionsFromSnapshot(snapshot);
+    const sectioned = annotateFieldsWithSections(withInitials, sections);
     onStatus?.(
-      `Verification failed; using Pass 1 results (${annotated.length} field(s)).`,
+      `Verification failed; using Pass 1 results (${sectioned.length} field(s)).`,
       1
     );
-    return annotated;
+    return sectioned;
   }
 
   const snapped = snapFieldsToUnderlines(qcFields, pageRenders, {
@@ -3021,11 +3501,23 @@ async function detectFieldsImpl(
   const annotated = annotateOptionGroupBlanks(snapped, pageRenders, {
     verbose: true,
   });
+  const snapshot = await textSnapshotPromise;
+  const boxed = annotateBoxedFields(
+    annotated,
+    pageRenders,
+    { textRows: pageTextSnapshotToBoxedTextRows(snapshot) },
+    { verbose: true }
+  );
+  const withInitials = annotateInitialBoxes(boxed, pageRenders, {
+    verbose: true,
+  });
+  const sections = detectSectionsFromSnapshot(snapshot);
+  const sectioned = annotateFieldsWithSections(withInitials, sections);
   onStatus?.(
-    `Detection complete — ${annotated.length} field(s) after verification.`,
+    `Detection complete — ${sectioned.length} field(s) after verification.`,
     1
   );
-  return annotated;
+  return sectioned;
 }
 
 // ---------------------------------------------------------------------------

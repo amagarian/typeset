@@ -147,6 +147,12 @@ function freshProject(initial: Partial<Project> = {}): Project {
     createdAt: nowIso,
     updatedAt: nowIso,
     modifiedAt: nowMs,
+    // v0.6.0 — new optional fields default to undefined; the form
+    // filler and UI treat undefined as "not provided" identically
+    // to "". We don't pre-seed them here so a brand-new project
+    // doesn't accumulate ~30 empty strings (lighter JSON, cleaner
+    // storage / sync payloads). Spread `initial` on top so callers
+    // can pre-populate any subset.
     ...initial,
   };
 }

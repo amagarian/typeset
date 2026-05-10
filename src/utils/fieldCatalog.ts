@@ -260,6 +260,14 @@ export const CANONICAL_FIELD_DEFINITIONS: CanonicalFieldDefinition[] = [
     label: "Phone",
     mappedProjectKey: "phone",
     fieldKind: "text",
+    // NOTE: v0.6.0 added a label-only `Tel` / `Tel.` / `Tel:`
+    // preflight in `geminiFieldDetector.ts:inferByLabel` — those
+    // tokens are NOT in the alias array because the global alias
+    // index is also consulted by `inferCanonicalId` against the
+    // surrounding-context haystack, where a 3-char `tel`
+    // substring would hijack words like "hotel" / "intel". The
+    // preflight matches the EXACT bare-`Tel` captions found on
+    // 204 New Account, FNJ-GEO, and similar credit-app forms.
     aliases: ["phone", "phone #", "phone number", "phone numbers", "telephone", "telephone #", "mobile", "cell"],
     sectionHints: ["contact", "billing"],
   },
@@ -420,6 +428,376 @@ export const CANONICAL_FIELD_DEFINITIONS: CanonicalFieldDefinition[] = [
     ],
     sectionHints: ["payment", "card-type"],
     optionSet: [...CARD_TYPE_OPTION_SET],
+  },
+
+  // -----------------------------------------------------------------
+  // v0.6.0 — corpus-driven canonicals. Grouped roughly by section
+  // (business, signers, banking/shipping, rental, vehicle/insurance,
+  // production, accounting, address, initials).
+  //
+  // Aliases are kept short and unambiguous to keep the substring
+  // matcher in `inferCanonicalId` from hijacking unrelated context.
+  // Where a label is genuinely short (`DBA`, `EIN`, `VIN`), the
+  // 3-char minimum gate in `inferByLabel` / `inferCanonicalId` still
+  // applies — `dba` and `ein` clear it, `dl` (driver licence) does
+  // not and lives only as a longer alias (`dl #`, `driver license`).
+  // -----------------------------------------------------------------
+
+  {
+    id: "federalTaxId",
+    label: "Federal Tax ID",
+    mappedProjectKey: "federalTaxId",
+    fieldKind: "text",
+    aliases: ["federal tax id", "federal id", "tax id", "ein", "fein", "tin", "federal id #", "federal employer id"],
+    sectionHints: ["business", "header"],
+  },
+  {
+    id: "dunsNumber",
+    label: "DUNS Number",
+    mappedProjectKey: "dunsNumber",
+    fieldKind: "text",
+    aliases: ["duns", "duns number", "duns #", "d-u-n-s", "d.u.n.s."],
+    sectionHints: ["business"],
+  },
+  {
+    id: "dbaName",
+    label: "DBA Name",
+    mappedProjectKey: "dbaName",
+    fieldKind: "text",
+    aliases: ["dba", "d/b/a", "doing business as", "dba name"],
+    sectionHints: ["business"],
+  },
+  {
+    id: "parentCompany",
+    label: "Parent Company",
+    mappedProjectKey: "parentCompany",
+    fieldKind: "text",
+    aliases: ["parent company", "parent corporation"],
+    sectionHints: ["business"],
+  },
+  {
+    id: "yearsInBusiness",
+    label: "Years in Business",
+    mappedProjectKey: "yearsInBusiness",
+    fieldKind: "text",
+    aliases: ["years in business", "years business"],
+    sectionHints: ["business"],
+  },
+  {
+    id: "dateBusinessStarted",
+    label: "Date Business Started",
+    mappedProjectKey: "dateBusinessStarted",
+    fieldKind: "date",
+    aliases: ["date business started", "business start date", "date started"],
+    sectionHints: ["business"],
+  },
+  {
+    id: "dateIncorporated",
+    label: "Date Incorporated",
+    mappedProjectKey: "dateIncorporated",
+    fieldKind: "date",
+    aliases: ["date incorporated", "date of incorporation", "incorporation date"],
+    sectionHints: ["business"],
+  },
+  {
+    id: "resaleTaxCertificate",
+    label: "Resale Tax Certificate",
+    mappedProjectKey: "resaleTaxCertificate",
+    fieldKind: "text",
+    aliases: ["resale tax certificate", "resale cert", "resale certificate", "resale #", "resale number"],
+    sectionHints: ["business"],
+  },
+
+  // Authorized signers (officer-level, distinct from cardholders)
+  {
+    id: "authorizedSignerName",
+    label: "Authorized Signer",
+    mappedProjectKey: "authorizedSignerName",
+    fieldKind: "text",
+    aliases: [
+      "authorized signer",
+      "authorized signer name",
+      "authorized signature name",
+      "officer name",
+      "company officer",
+      "officer's name",
+      "print name (officer)",
+    ],
+    sectionHints: ["signature", "authorization", "signer"],
+  },
+  {
+    id: "authorizedSignerTitle",
+    label: "Signer Title",
+    mappedProjectKey: "authorizedSignerTitle",
+    fieldKind: "text",
+    aliases: [
+      "authorized signer title",
+      "officer title",
+      "signer title",
+      "title (officer)",
+      "title of signer",
+      "company officer title",
+    ],
+    sectionHints: ["signature", "authorization", "signer"],
+  },
+  {
+    id: "secondAuthorizedSignerName",
+    label: "Second Authorized Signer",
+    mappedProjectKey: "secondAuthorizedSignerName",
+    fieldKind: "text",
+    aliases: [
+      "second authorized signer",
+      "second signer",
+      "co-signer name",
+      "co-signer",
+      "secondary signer",
+    ],
+    sectionHints: ["signature", "authorization", "signer"],
+    allowDuplicates: true,
+  },
+  {
+    id: "secondAuthorizedSignerTitle",
+    label: "Second Signer Title",
+    mappedProjectKey: "secondAuthorizedSignerTitle",
+    fieldKind: "text",
+    aliases: ["second signer title", "co-signer title", "secondary signer title"],
+    sectionHints: ["signature", "authorization", "signer"],
+    allowDuplicates: true,
+  },
+
+  // Banking + shipping account numbers
+  {
+    id: "bankName",
+    label: "Bank Name",
+    mappedProjectKey: "bankName",
+    fieldKind: "text",
+    aliases: ["bank name", "name of bank", "bank"],
+    sectionHints: ["banking", "credit"],
+  },
+  {
+    id: "bankRoutingNumber",
+    label: "Bank Routing #",
+    mappedProjectKey: "bankRoutingNumber",
+    fieldKind: "text",
+    aliases: ["routing", "routing number", "routing #", "aba", "aba routing", "aba number"],
+    sectionHints: ["banking", "credit"],
+  },
+  {
+    id: "bankAccountNumber",
+    label: "Bank Account #",
+    mappedProjectKey: "bankAccountNumber",
+    fieldKind: "text",
+    // NOTE: deliberately NOT aliasing bare `account number` / `account #` —
+    // those collide with `creditCardNumber` aliases. The matcher
+    // resolves "bank account number" via substring, but standalone
+    // "account number" stays with `creditCardNumber` to preserve
+    // v0.5.x CC-form behaviour. Banking rows that read "Bank Acct #" /
+    // "Bank Account No." are caught by the explicit aliases below.
+    aliases: ["bank account", "bank account number", "bank account no", "bank account #", "bank acct", "bank acct #", "bank acct number"],
+    sectionHints: ["banking", "credit"],
+  },
+  {
+    id: "fedExAccountNumber",
+    label: "FedEx Account #",
+    mappedProjectKey: "fedExAccountNumber",
+    fieldKind: "text",
+    aliases: ["fedex account", "fedex account number", "fedex #", "fedex account #", "federal express account"],
+    sectionHints: ["shipping"],
+  },
+  {
+    id: "upsAccountNumber",
+    label: "UPS Account #",
+    mappedProjectKey: "upsAccountNumber",
+    fieldKind: "text",
+    aliases: ["ups account", "ups account number", "ups #", "ups account #"],
+    sectionHints: ["shipping"],
+  },
+
+  // Rental period
+  {
+    id: "rentalStartDate",
+    label: "Rental Start Date",
+    mappedProjectKey: "rentalStartDate",
+    fieldKind: "date",
+    aliases: ["start date", "rental start", "pickup date", "pick-up date", "begin date", "rental begin"],
+    sectionHints: ["rental", "schedule"],
+    patterns: [/\brental\s+(?:start|period\s+begin)\b/i, /\bpick(?:[-\s]?up)\s+date\b/i],
+  },
+  {
+    id: "rentalEndDate",
+    label: "Rental End Date",
+    mappedProjectKey: "rentalEndDate",
+    fieldKind: "date",
+    aliases: ["end date", "rental end", "return date", "drop off date", "drop-off date", "rental return"],
+    sectionHints: ["rental", "schedule"],
+    patterns: [/\brental\s+(?:end|period\s+end|return)\b/i, /\bdrop[-\s]?off\s+date\b/i],
+  },
+
+  // Studio Contract — rate + hours
+  {
+    id: "hourlyRateBuild",
+    label: "Build Rate",
+    mappedProjectKey: "hourlyRateBuild",
+    fieldKind: "text",
+    aliases: ["build rate", "build hourly rate", "shop rate", "build rate/hr", "build $/hr"],
+    sectionHints: ["rate", "schedule"],
+  },
+  {
+    id: "hourlyRateShoot",
+    label: "Shoot Rate",
+    mappedProjectKey: "hourlyRateShoot",
+    fieldKind: "text",
+    aliases: ["shoot rate", "shoot hourly rate", "shoot rate/hr", "shoot $/hr"],
+    sectionHints: ["rate", "schedule"],
+  },
+  {
+    id: "hoursBuild",
+    label: "Build Hours",
+    mappedProjectKey: "hoursBuild",
+    fieldKind: "text",
+    aliases: ["build hours", "build hr", "build hrs"],
+    sectionHints: ["schedule"],
+  },
+  {
+    id: "hoursShoot",
+    label: "Shoot Hours",
+    mappedProjectKey: "hoursShoot",
+    fieldKind: "text",
+    aliases: ["shoot hours", "shoot hr", "shoot hrs"],
+    sectionHints: ["schedule"],
+  },
+
+  // Vehicle / DL fields
+  {
+    id: "driverLicenseNumber",
+    label: "Driver Licence #",
+    mappedProjectKey: "driverLicenseNumber",
+    fieldKind: "text",
+    aliases: ["driver license", "driver license number", "driver license #", "driver's license", "driver's license number", "dl #", "dl number", "drivers license"],
+    sectionHints: ["vehicle", "credit"],
+  },
+  {
+    id: "vehicleVin",
+    label: "Vehicle VIN",
+    mappedProjectKey: "vehicleVin",
+    fieldKind: "text",
+    aliases: ["vin", "vin #", "vehicle identification number", "vehicle vin"],
+    sectionHints: ["vehicle"],
+  },
+  {
+    id: "vehiclePlate",
+    label: "Vehicle Plate",
+    mappedProjectKey: "vehiclePlate",
+    fieldKind: "text",
+    aliases: ["plate", "plate #", "license plate", "license plate #", "tag #", "tag number"],
+    sectionHints: ["vehicle"],
+  },
+  {
+    id: "insuranceCarrier",
+    label: "Insurance Carrier",
+    mappedProjectKey: "insuranceCarrier",
+    fieldKind: "text",
+    aliases: ["insurance carrier", "insurance company", "insurer"],
+    sectionHints: ["vehicle", "insurance"],
+  },
+  {
+    id: "insurancePolicyNumber",
+    label: "Insurance Policy #",
+    mappedProjectKey: "insurancePolicyNumber",
+    fieldKind: "text",
+    aliases: ["policy number", "policy #", "insurance policy", "insurance policy number", "insurance policy #"],
+    sectionHints: ["vehicle", "insurance"],
+  },
+
+  // Other accounting / invoicing
+  {
+    id: "invoiceNumber",
+    label: "Invoice #",
+    mappedProjectKey: "invoiceNumber",
+    fieldKind: "text",
+    aliases: ["invoice", "invoice number", "invoice #", "inv #", "inv number"],
+    sectionHints: ["billing", "header"],
+  },
+  {
+    id: "accountingContactName",
+    label: "Accounting Contact",
+    mappedProjectKey: "accountingContactName",
+    fieldKind: "text",
+    aliases: ["accounting contact", "accounting contact name", "accounts payable contact", "ap contact"],
+    sectionHints: ["billing", "contact"],
+  },
+  {
+    id: "accountingEmail",
+    label: "Accounting Email",
+    mappedProjectKey: "accountingEmail",
+    fieldKind: "text",
+    aliases: ["accounting email", "ap email", "accounts payable email"],
+    sectionHints: ["billing", "contact"],
+  },
+
+  // Address variants — distinct from `billingAddress`
+  {
+    id: "streetAddress",
+    label: "Street Address",
+    mappedProjectKey: "streetAddress",
+    fieldKind: "text",
+    aliases: ["street address", "street", "physical address"],
+    sectionHints: ["contact", "billing"],
+  },
+  {
+    id: "deliveryAddress",
+    label: "Delivery Address",
+    mappedProjectKey: "deliveryAddress",
+    fieldKind: "multiline",
+    aliases: ["delivery address", "ship to", "ship-to address", "shipping address", "deliver to"],
+    sectionHints: ["shipping"],
+    multiline: true,
+  },
+
+  // Production metadata (ISS Acro)
+  {
+    id: "showName",
+    label: "Show Name",
+    mappedProjectKey: "showName",
+    fieldKind: "text",
+    aliases: ["show name", "show title", "series name", "series title", "production title"],
+    sectionHints: ["job", "header"],
+  },
+  {
+    id: "seasonNumber",
+    label: "Season #",
+    mappedProjectKey: "seasonNumber",
+    fieldKind: "text",
+    aliases: ["season", "season number", "season #"],
+    sectionHints: ["job"],
+  },
+  {
+    id: "productionClassification",
+    label: "Production Type",
+    mappedProjectKey: "productionClassification",
+    fieldKind: "text",
+    aliases: [
+      "production classification",
+      "classification of show",
+      "classification of production",
+      "type of production",
+      "production type",
+    ],
+    sectionHints: ["job"],
+  },
+
+  // Per-clause initial boxes (Studio Contract, long rentals).
+  // `mappedProjectKey: "initials"` — the form filler reads
+  // `Project.initials` (or auto-derives from name when empty).
+  // Multiple boxes per page are legitimate, so allow duplicates.
+  {
+    id: "clauseInitials",
+    label: "Initials",
+    mappedProjectKey: "initials",
+    fieldKind: "text",
+    aliases: ["initials", "initial", "renter initials", "client initials", "204 initials"],
+    sectionHints: ["initials", "clause"],
+    allowDuplicates: true,
   },
 ];
 

@@ -63,3 +63,159 @@ select.input {
   line-height: 1;
 }
 
+/* v0.6.0 — signature block (upload / preview / replace / remove).
+ * Sits in the form column flow so the bottom border matches the
+ * surrounding input rows; only the inner controls deviate from the
+ * `.input` baseline. */
+.signatureBlock {
+  display: flex;
+  flex-direction: column;
+}
+
+.signatureFileInput {
+  display: none;
+}
+
+.signaturePreviewRow {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--bg-input);
+  border-bottom: 1px solid var(--border);
+  position: relative;
+}
+
+.signaturePreviewWrap {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.signaturePreviewImg {
+  display: block;
+  max-width: 200px;
+  max-height: 80px;
+  width: auto;
+  height: auto;
+  object-fit: contain;
+  background: #fff;
+  border: 1px solid var(--border);
+  border-radius: 2px;
+  padding: 4px;
+}
+
+.signatureCaption {
+  font-size: 9px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: var(--letter-section);
+  color: var(--text-label);
+}
+
+.signatureActions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+
+.signatureUploadRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px 12px;
+  background: var(--bg-input);
+  border-bottom: 1px solid var(--border);
+  margin-top: -1px; /* fold into the border of the input above */
+}
+
+.signatureActionBtn {
+  font-size: 11px;
+  font-weight: 500;
+  padding: 5px 10px;
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text);
+  cursor: pointer;
+  border-radius: 2px;
+  transition: background 0.12s, border-color 0.12s;
+}
+
+.signatureActionBtn:hover {
+  background: var(--bg-hover, var(--border));
+}
+
+.signatureActionDanger {
+  color: var(--text-secondary, var(--text));
+}
+
+.signatureActionDanger:hover {
+  border-color: #b94a4a;
+  color: #b94a4a;
+}
+
+.signatureHint {
+  font-size: 10px;
+  color: var(--text-label);
+  letter-spacing: 0.02em;
+}
+
+/* v0.6.0 — collapsible section groups (Business, Banking, etc.).
+ * Native `<details>` element — keeps a11y semantics (keyboard +
+ * screen reader) without a JS state machine. Default-collapsed; an
+ * expanded section reveals its child fields with the same `.input`
+ * styling as the always-visible top fields. */
+.sectionDisclosure {
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  margin-top: -1px; /* collapse adjacent borders so the form remains a single rail */
+}
+
+.sectionDisclosure[open] {
+  background: var(--bg-input);
+}
+
+.sectionSummary {
+  display: flex;
+  align-items: center;
+  padding: 12px 16px;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--letter-section);
+  color: var(--text-label);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  background: transparent;
+  transition: background 0.12s;
+}
+
+.sectionSummary::-webkit-details-marker {
+  display: none;
+}
+
+.sectionSummary::before {
+  content: "›";
+  display: inline-block;
+  margin-right: 8px;
+  transform: rotate(0deg);
+  transition: transform 0.15s ease-out;
+  font-size: 14px;
+  line-height: 1;
+  color: var(--text-label);
+}
+
+.sectionDisclosure[open] > .sectionSummary::before {
+  transform: rotate(90deg);
+}
+
+.sectionSummary:hover {
+  color: var(--text);
+}
+
+.sectionBody {
+  display: flex;
+  flex-direction: column;
+}
+

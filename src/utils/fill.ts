@@ -218,6 +218,27 @@ export function getTemplateFieldValue(
     return iso ? formatIsoDateForFill(iso) : "";
   }
 
+  // v0.6.0 — clause-initials boxes. `Project.initials` is optional;
+  // when empty, derive from the most relevant person-name field
+  // available (cardholder → authorised signer → producer). Returns
+  // empty string when no name is available.
+  if (key === "initials") {
+    const explicit = (project.initials ?? "").trim();
+    if (explicit) return explicit.toUpperCase().slice(0, 4);
+    const sourceName = (
+      project.creditCardHolder ||
+      project.authorizedSignerName ||
+      project.producer ||
+      ""
+    ).trim();
+    if (!sourceName) return "";
+    const parts = sourceName.split(/\s+/).filter(Boolean);
+    if (parts.length === 0) return "";
+    const first = parts[0]?.[0] ?? "";
+    const last = parts.length > 1 ? parts[parts.length - 1]?.[0] ?? "" : "";
+    return `${first}${last}`.toUpperCase();
+  }
+
   const value = project[key];
   if (typeof value !== "string") return "";
 

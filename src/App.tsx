@@ -279,6 +279,7 @@ function MainApp() {
     saveStatus,
     syncStatus,
     error: projectsError,
+    flushSave,
   } = useProjects();
   const [view, setView] = useState<View>("workspace");
   const [selectedProjectId, setSelectedProjectId] = useState<string | null>(null);
@@ -729,12 +730,50 @@ function MainApp() {
         });
       };
 
+      // v0.6.0 (Workstream C) — AcroForm-first ingestion. Many
+      // production rental/account/CC-auth PDFs ship with native
+      // form widgets at the right coordinates. We try the cheap,
+      // deterministic AcroForm extractor BEFORE the Gemini call:
+      //   - Zero AcroForm fields → returns null, fall through to
+      //     Gemini-only (existing behaviour, no regression).
+      //   - All pages covered by AcroForm widgets → skip Gemini
+      //     entirely; field placement is exact and the API call
+      //     is saved.
+      //   - Some pages covered → hybrid mode (NOT YET wired —
+      //     v0.6.0 ships AcroForm-only-or-Gemini-only). The
+      //     hybrid merge is queued for a v0.6.x follow-up because
+      //     the pages-without-AcroForm case is dominated by
+      //     standalone CC-auth scans (no AcroForm, full Gemini)
+      //     and full-AcroForm packets (no Gemini needed); the
+      //     "hybrid same-document" case (some pages have form
+      //     widgets, others don't) is rare in the corpus.
       let detectedFields: TemplateField[] = [];
+      let acroformDetectionUsed = false;
       try {
-        detectedFields = await detectFieldsWithClaude(bytes, 1, setDocProcessing, {
-          projectHint: effectiveProject,
-          filename: file.name,
-        });
+        const { tryAcroFormIngest } = await import("@/utils/acroFormIngest");
+        const acroformResult = await tryAcroFormIngest(bytes);
+        if (acroformResult && acroformResult.fields.length > 0) {
+          setDocProcessing(
+            `Detected ${acroformResult.fields.length} native form field${acroformResult.fields.length === 1 ? "" : "s"}…`,
+            0.95
+          );
+          detectedFields = acroformResult.fields;
+          acroformDetectionUsed = true;
+          console.log(
+            `[Typeset] AcroForm path: ${acroformResult.fields.length} field(s) extracted across ${acroformResult.pageNumbers.size} page(s); skipping Gemini.`
+          );
+        }
+      } catch (acroErr) {
+        console.warn("[Typeset] AcroForm ingest threw — falling through to Gemini:", acroErr);
+      }
+
+      try {
+        if (!acroformDetectionUsed) {
+          detectedFields = await detectFieldsWithClaude(bytes, 1, setDocProcessing, {
+            projectHint: effectiveProject,
+            filename: file.name,
+          });
+        }
       } catch (err) {
         console.warn("[Typeset] Gemini detection failed:", err);
         if (err instanceof ClaudeNotConfiguredError) {
@@ -1465,6 +1504,29 @@ function MainApp() {
     setView("workspace");
   }, [deleteProjectInStore, projects, selectedProjectId]);
 
+  // v0.6.0 — explicit Save handler for the job edit page. Flushes
+  // any pending debounced autosave to disk synchronously, then
+  // navigates back to the workspace empty state with the sidebar
+  // selection cleared. Differs from `handleCloseNewProject` in
+  // two ways:
+  //   1. We force-flush before navigating so a user mid-typing a
+  //      sentence still gets their last keystroke persisted before
+  //      the view tears down (the 500ms autosave debounce would
+  //      otherwise drop the in-flight edit when the timer's
+  //      `useEffect` cleanup runs on unmount).
+  //   2. We do NOT delete an empty project — Save is an explicit
+  //      "I want this saved" intent, even if the user only typed
+  //      a label and decided that was enough.
+  const handleSaveProject = useCallback(async () => {
+    try {
+      await flushSave();
+    } catch (err) {
+      console.warn("[App] flushSave failed during explicit Save:", err);
+    }
+    setSelectedProjectId(null);
+    setView("workspace");
+  }, [flushSave]);
+
   const handleEditProject = useCallback(() => {
     setView("edit-project");
   }, []);
@@ -1544,6 +1606,8 @@ function MainApp() {
                 : () => setView("workspace")
             }
             onImportPdf={importProjectFromPdf}
+            onSave={handleSaveProject}
+            onError={(message) => showToast(message, "error")}
           />
         ) : (
           <ProjectWorkspace

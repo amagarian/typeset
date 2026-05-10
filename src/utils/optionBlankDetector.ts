@@ -37,14 +37,28 @@
  * X appears next to a label that has no blank" (visually wrong),
  * so the asymmetry argues for high precision over high recall.
  *
- * Out of scope (v0.5.36): single-stroke selectors like
- * `Type: ___ Visa  Mastercard  Amex` where ONE underline serves
- * the whole group. The per-option search would find the same
- * stroke for every option (hit different fragments of it), which
- * would render multiple Xs along a single shared blank — wrong.
- * Detection skips the option-group entirely when fewer than half
- * its options have detectable per-option blanks (heuristic gate
- * for "this is probably a single-shared-stroke group").
+ * v0.6.0 (Workstream B4) — single-shared-stroke selectors are now
+ * a first-class case. Some forms render a credit-card row as
+ * `Type: ____________________________ Visa Mastercard Amex
+ * Discover` with ONE continuous underline that the user marks
+ * with an X under the chosen option label. When per-option blank
+ * detection fails the `minHitRatio` gate (a strong signal that
+ * there are no per-option blanks), we run a SECOND pass that
+ * searches the option-group's vertical band for a single long
+ * horizontal stroke spanning the field. If one is found and it
+ * intersects the x-extent of multiple option labels, we annotate
+ * the field with `sharedUnderline = true` and `sharedUnderlineRect`
+ * (the stroke's bounding rect). The renderer (`DraggableField.tsx`
+ * + `pdfWriter.ts`) draws an X centred ABOVE the stroke at the
+ * x-coordinate of the selected option's label centre, so the
+ * single shared underline carries one X marking the user's pick.
+ *
+ * Why this lives in the same module rather than its own file:
+ * the gate that punts the per-option pass IS the signal that
+ * triggers the shared-stroke pass. Splitting them would force
+ * the call site to plumb the per-option failure mode through a
+ * separate API; co-locating keeps the field-level decision local
+ * and lets us share the row-search machinery (`longestDarkRun`).
  */
 
 import type { FieldOption, TemplateField } from "@/types";
@@ -145,6 +159,26 @@ export interface OptionBlankDetectorOptions {
   minHitRatio?: number;
 
   /**
+   * v0.6.0 — shared-stroke fallback. When the per-option pass fails
+   * the `minHitRatio` gate (the only strong signal we have that the
+   * blanks aren't per-option), we re-scan the option-group's
+   * baseline band for a single long horizontal stroke. The stroke
+   * must:
+   *   - sit within ±`sharedStrokeBandPoints` of the options' shared
+   *     baseline (mean of `opt.bbox.y + opt.bbox.height`);
+   *   - span at least `sharedStrokeMinSpanRatio` of the field's
+   *     full x-extent (default 0.6 — generous enough to catch
+   *     `Type: ____ Visa Mastercard Amex` where the underline
+   *     starts before the first option, but tight enough to reject
+   *     a stroke that only spans one option width).
+   *
+   * Defaults: 6pt band, 0.6 span ratio, same dark-luminance/
+   * thinness gates as per-option detection.
+   */
+  sharedStrokeBandPoints?: number;
+  sharedStrokeMinSpanRatio?: number;
+
+  /**
    * If true, log per-option detection decisions to the console.
    * Off by default to keep production logs quiet; the call site in
    * `geminiFieldDetector.ts` can opt in for diagnostic dumps.
@@ -161,6 +195,8 @@ const DEFAULT_OPTIONS: Required<OptionBlankDetectorOptions> = {
   thinnessOffsetPoints: 2,
   thinnessNeighborMaxRatio: 0.4,
   minHitRatio: 0.5,
+  sharedStrokeBandPoints: 6,
+  sharedStrokeMinSpanRatio: 0.6,
   verbose: false,
 };
 
@@ -340,6 +376,146 @@ function detectOptionBlank(
 }
 
 /**
+ * v0.6.0 (B4) — shared-stroke detector.
+ *
+ * Re-scans the option-group field's baseline band (computed as the
+ * mean of `opt.bbox.y + opt.bbox.height` across the options) for
+ * the LONGEST horizontal stroke that:
+ *   - sits within ±`sharedStrokeBandPoints` of the baseline;
+ *   - spans at least `sharedStrokeMinSpanRatio` of the field's
+ *     full x-extent;
+ *   - passes the same thinness gate as per-option detection
+ *     (neighbour rows above/below are < 40% as dark, so we don't
+ *     match the row's label glyph rows).
+ *
+ * The horizontal search range is the FULL field x-extent
+ * (`field.x` → `field.x + field.width`) — not the per-option
+ * lookback. The shared stroke commonly extends BEFORE the first
+ * option (the `Type: _______` lead-in) and must be considered as
+ * a single contiguous run, so a lookback-only search would miss
+ * the left tail and produce a stroke length too short to clear
+ * the span ratio.
+ */
+function detectSharedStroke(
+  field: TemplateField,
+  options: ReadonlyArray<FieldOption>,
+  render: PageRender,
+  opts: Required<OptionBlankDetectorOptions>
+): { rect: { x: number; y: number; width: number; height: number } } | null {
+  if (options.length < 2) return null;
+  const ppp = 1 / Math.max(1e-6, render.pdfPointsPerPixel);
+
+  // Mean baseline across the options. Each option's bbox height is
+  // a tight crop of its label, so `bbox.y + bbox.height` is the
+  // label's baseline. The shared stroke sits on (or just below)
+  // this shared baseline, so the mean is a stable anchor even
+  // when individual options drift a pt or two from each other on
+  // a busy form.
+  const baseline =
+    options.reduce((sum, opt) => sum + opt.bbox.y + opt.bbox.height, 0) /
+    options.length;
+
+  const searchTopPx = Math.max(
+    0,
+    Math.floor((baseline - opts.sharedStrokeBandPoints) * ppp)
+  );
+  const searchBotPx = Math.min(
+    render.height - 1,
+    Math.ceil((baseline + opts.sharedStrokeBandPoints) * ppp)
+  );
+
+  // Search the full FIELD x-extent — the shared stroke may extend
+  // past the leftmost option (the `Type: ___` lead-in is the
+  // canonical case). We use the field's parent rect rather than
+  // the union of option rects so we don't miss the lead-in.
+  const fieldLeftPt = field.x;
+  const fieldRightPt = field.x + field.width;
+  const searchLeftPx = Math.max(0, Math.floor(fieldLeftPt * ppp));
+  const searchRightPx = Math.min(
+    render.width - 1,
+    Math.ceil(fieldRightPt * ppp)
+  );
+
+  if (searchRightPx <= searchLeftPx) return null;
+  if (searchBotPx < searchTopPx) return null;
+
+  const minSpanPx = (fieldRightPt - fieldLeftPt) * opts.sharedStrokeMinSpanRatio * ppp;
+  const thinnessOffsetPx = Math.max(1, Math.round(opts.thinnessOffsetPoints * ppp));
+
+  let best: DetectionResult | null = null;
+
+  for (let row = searchTopPx; row <= searchBotPx; row += 1) {
+    const run = longestDarkRun(
+      render.imageData,
+      row,
+      searchLeftPx,
+      searchRightPx,
+      opts.darkLuminance
+    );
+    if (run.length < minSpanPx) continue;
+
+    const above = longestDarkRun(
+      render.imageData,
+      row - thinnessOffsetPx,
+      run.leftPx,
+      run.rightPx,
+      opts.darkLuminance
+    );
+    const below = longestDarkRun(
+      render.imageData,
+      row + thinnessOffsetPx,
+      run.leftPx,
+      run.rightPx,
+      opts.darkLuminance
+    );
+    if (above.length >= run.length * opts.thinnessNeighborMaxRatio) continue;
+    if (below.length >= run.length * opts.thinnessNeighborMaxRatio) continue;
+
+    if (!best || run.length > (best.strokeRightPx - best.strokeLeftPx + 1)) {
+      best = {
+        strokeRow: row,
+        strokeLeftPx: run.leftPx,
+        strokeRightPx: run.rightPx,
+        strokeWidthPt: run.length * render.pdfPointsPerPixel,
+      };
+    }
+  }
+
+  if (!best) return null;
+
+  // Verify the stroke intersects ≥ 2 option label x-extents.
+  // Catches the pathological case where a long stroke matches the
+  // span ratio but sits entirely BEFORE the first option (e.g. a
+  // signature blank that bleeds into the option-group's bbox);
+  // in that case there's no meaningful "x-position-of-selected-
+  // option" geometry for the renderer to use, so we'd rather
+  // bail and let the field render with no shared underline.
+  const strokeLeftPt = best.strokeLeftPx * render.pdfPointsPerPixel;
+  const strokeRightPt = best.strokeRightPx * render.pdfPointsPerPixel;
+  let intersected = 0;
+  for (const opt of options) {
+    const optLeft = opt.bbox.x;
+    const optRight = opt.bbox.x + opt.bbox.width;
+    if (strokeRightPt >= optLeft && strokeLeftPt <= optRight) intersected += 1;
+  }
+  if (intersected < 2) return null;
+
+  // Stroke height kept thin (~2pt visually) — the rect is just a
+  // marker of where the renderer should anchor; the X glyph the
+  // renderer draws will be sized off the option label height, not
+  // off this rect's height.
+  const strokeYPt = best.strokeRow * render.pdfPointsPerPixel;
+  return {
+    rect: {
+      x: strokeLeftPt,
+      y: strokeYPt - 1,
+      width: strokeRightPt - strokeLeftPt,
+      height: 2,
+    },
+  };
+}
+
+/**
  * Walk every option-group field in `fields` and annotate each
  * option with `hasUnderlineBlank` + `blankRect` when a per-option
  * underline is detected. Returns a NEW array; never mutates the
@@ -396,9 +572,31 @@ export function annotateOptionGroupBlanks(
     const ratio = hits / field.options.length;
 
     if (ratio < opts.minHitRatio) {
+      // v0.6.0 (B4) — fall through to the shared-stroke detector
+      // when per-option detection failed the ratio gate. The gate
+      // failure is the strongest signal we have that the field's
+      // blanks aren't per-option (typically because there's ONE
+      // shared underline serving the whole row); the shared-stroke
+      // detector picks that case up explicitly. If THAT also
+      // fails, the field is truly "no detectable blank of any
+      // kind" and we fall through to the v0.5.25 oval render.
+      const shared = detectSharedStroke(field, field.options, render, opts);
+      if (shared) {
+        if (opts.verbose) {
+          console.log(
+            `[optionBlankDetector] field=${field.id} shared-stroke detected (per-option ratio=${ratio.toFixed(2)} < ${opts.minHitRatio.toFixed(2)}): rect=${JSON.stringify(shared.rect)}`
+          );
+        }
+        annotatedGroups += 1;
+        return {
+          ...field,
+          sharedUnderline: true,
+          sharedUnderlineRect: shared.rect,
+        };
+      }
       if (opts.verbose) {
         console.log(
-          `[optionBlankDetector] field=${field.id} dropped: only ${hits}/${field.options.length} options detected a blank (ratio=${ratio.toFixed(2)} < ${opts.minHitRatio.toFixed(2)}; probably single-shared-stroke or no per-option blanks)`
+          `[optionBlankDetector] field=${field.id} dropped: only ${hits}/${field.options.length} options detected a blank (ratio=${ratio.toFixed(2)} < ${opts.minHitRatio.toFixed(2)}); no shared-stroke either — falling back to oval render.`
         );
       }
       return field;

@@ -29,7 +29,50 @@ export type CanonicalFieldId =
   | "cardholderSignature"
   | "creditCardNumber"
   | "expDate"
-  | "ccv";
+  | "ccv"
+  // v0.6.0 — corpus-driven canonicals (32-form analysis). Each maps
+  // to a new optional field on `Project` (see below). Aliases +
+  // patterns live in `fieldCatalog.ts`. Adding ~22 canonicals lets
+  // the detector resolve a much wider set of credit-application,
+  // banking, vehicle, production-rate, and rental-period blanks
+  // beyond the v0.5 CC-auth focus.
+  | "federalTaxId"
+  | "dunsNumber"
+  | "dbaName"
+  | "authorizedSignerName"
+  | "authorizedSignerTitle"
+  | "secondAuthorizedSignerName"
+  | "secondAuthorizedSignerTitle"
+  | "bankName"
+  | "bankRoutingNumber"
+  | "bankAccountNumber"
+  | "fedExAccountNumber"
+  | "upsAccountNumber"
+  | "rentalStartDate"
+  | "rentalEndDate"
+  | "hourlyRateBuild"
+  | "hourlyRateShoot"
+  | "hoursBuild"
+  | "hoursShoot"
+  | "driverLicenseNumber"
+  | "vehicleVin"
+  | "vehiclePlate"
+  | "insuranceCarrier"
+  | "insurancePolicyNumber"
+  | "invoiceNumber"
+  | "dateBusinessStarted"
+  | "dateIncorporated"
+  | "parentCompany"
+  | "streetAddress"
+  | "deliveryAddress"
+  | "accountingContactName"
+  | "accountingEmail"
+  | "clauseInitials"
+  | "showName"
+  | "seasonNumber"
+  | "productionClassification"
+  | "resaleTaxCertificate"
+  | "yearsInBusiness";
 
 export type TemplateFieldKind =
   | "text"
@@ -183,6 +226,101 @@ export interface Project {
    * to `Date.now()` on load.
    */
   modifiedAt?: number;
+
+  // -----------------------------------------------------------------
+  // v0.6.0 — corpus-driven Project schema additions.
+  //
+  // All fields below are optional so projects created prior to v0.6.0
+  // deserialise without a migration step (`coerceProject` defaults
+  // anything missing to "" or `undefined`). Sensitive PII (bank
+  // routing/account numbers, driver licence, etc.) is NOT given a
+  // separate Rust crypto layer — the entire `Project` blob is
+  // already encrypted at-rest in `projects.enc` (AES-256-GCM with
+  // the key in the OS keychain) and the same envelope ships over
+  // the v0.5.35 sync pipe encrypted with the per-account sync key.
+  // See `services/projectStore.ts` and `src-tauri/src/projects.rs`.
+  // -----------------------------------------------------------------
+
+  // Business identifiers + lineage
+  federalTaxId?: string;
+  dunsNumber?: string;
+  dbaName?: string;
+  parentCompany?: string;
+  yearsInBusiness?: string;
+  dateBusinessStarted?: string;
+  dateIncorporated?: string;
+  resaleTaxCertificate?: string;
+
+  // Authorized signer(s) — distinct from `creditCardHolder` (which
+  // is a payment-method field). Officer-level signers commonly
+  // appear in pairs on credit applications (President + Secretary,
+  // etc.) — hence the `second*` slot for ISS/Camtec-style forms
+  // that explicitly require a counter-signature.
+  authorizedSignerName?: string;
+  authorizedSignerTitle?: string;
+  secondAuthorizedSignerName?: string;
+  secondAuthorizedSignerTitle?: string;
+
+  // Banking + shipping account numbers
+  bankName?: string;
+  bankRoutingNumber?: string;
+  bankAccountNumber?: string;
+  fedExAccountNumber?: string;
+  upsAccountNumber?: string;
+
+  // Rental period + Studio-style rate/hour fields
+  rentalStartDate?: string;
+  rentalEndDate?: string;
+  hourlyRateBuild?: string;
+  hourlyRateShoot?: string;
+  hoursBuild?: string;
+  hoursShoot?: string;
+
+  // Vehicle / DL fields (Omega, FNJ, PSIS DOT)
+  driverLicenseNumber?: string;
+  vehicleVin?: string;
+  vehiclePlate?: string;
+  insuranceCarrier?: string;
+  insurancePolicyNumber?: string;
+
+  // Other accounting / invoicing
+  invoiceNumber?: string;
+  accountingContactName?: string;
+  accountingEmail?: string;
+
+  // Address variants — separate from billingAddress for forms
+  // (ISS, Camtec) that distinguish billing vs ship-to.
+  streetAddress?: string;
+  deliveryAddress?: string;
+
+  // Production metadata (ISS Acro)
+  showName?: string;
+  seasonNumber?: string;
+  productionClassification?: string;
+
+  // Initials value used to fill `clauseInitials` boxes (Studio
+  // Contract, long rental agreements). When empty, the form filler
+  // derives a default from the user's first/last name; users can
+  // override here.
+  initials?: string;
+
+  /**
+   * v0.6.0 — uploaded signature image. When present, the form
+   * filler embeds this image into signature-typed bboxes via
+   * `pdf-lib`'s `embedPng` / `embedJpg`, scaled to fit while
+   * preserving aspect ratio. When absent, the renderer falls
+   * back to the v0.5.x typed/Caveat-font signature draw path.
+   *
+   * `dataUrl` is a base64-encoded PNG/JPEG — `data:image/png;base64,...`
+   * Stored inline on the encrypted project blob (see schema notes
+   * above). 2MB upload cap is enforced in the upload UI; well
+   * within the encryption layer's comfort zone.
+   *
+   * Optional + backwards compatible: existing projects without a
+   * signature image continue to render their typed Caveat
+   * signature unchanged.
+   */
+  signatureImage?: { dataUrl: string; uploadedAt: number };
 }
 
 /** A single field definition on a template (position + mapping) */
@@ -211,6 +349,19 @@ export interface TemplateField {
   /** For checkbox fields: which value triggers this checkbox to be checked */
   checkboxValue?: string;
   /**
+   * v0.6.0 — section label this field belongs to, derived from the
+   * deterministic `detectSections` walk in `geminiFieldDetector.ts`.
+   * Headers like `BASIC INFORMATION`, `CREDIT CARD INFORMATION`,
+   * `SECTION 1` get harvested from ALL-CAPS text rows and each
+   * field's bbox falls into one of the resulting bands. Used for
+   * cross-page dedup (the same canonical id can appear on different
+   * sections legitimately) and for B2's name-disambiguation guard
+   * (a `Name` blank in a `CREDIT CARD` section maps to
+   * `creditCardHolder`; one in `SECTION 1` falls through to the
+   * officer/signer canonical).
+   */
+  section?: string;
+  /**
    * For `option-group` fields (v0.5.25): the per-option sub-rectangles
    * within (or near) the parent bbox. Each option's bbox is in PDF
    * user-space points and tight around just that option label's text.
@@ -218,6 +369,29 @@ export interface TemplateField {
    * option's bbox at fill time.
    */
   options?: FieldOption[];
+  /**
+   * v0.6.0 — single-shared-stroke option-group flag. Set to `true`
+   * by the v0.6.0 `optionBlankDetector.ts` extension when a row
+   * like `Type: ____ Visa  Mastercard  Amex  Discover` is rendered
+   * with ONE continuous underline spanning every label rather than
+   * per-option blanks. When `true`, `sharedUnderlineRect` carries
+   * the stroke's bounding rect and the renderer draws an X at the
+   * horizontal center of the SELECTED option's label projected onto
+   * the shared stroke (rather than per-option Xs). Replaces the
+   * v0.5.36 punt that left these rows un-marked.
+   */
+  sharedUnderline?: boolean;
+  /**
+   * v0.6.0 — bounding rect of the shared underline stroke (PDF
+   * user-space points, top-down origin matching `TemplateField.y`).
+   * Only meaningful when `sharedUnderline === true`.
+   */
+  sharedUnderlineRect?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
   /**
    * For `option-group` fields (v0.5.25): the `label` of the currently
    * selected option, or `null`/`undefined` when nothing is selected.

@@ -92,6 +92,44 @@ export async function writeFilledPdfBytes(
     repairedTemplate.fields.map((f) => f.mappedProjectKey).filter(Boolean)
   );
 
+  // v0.6.0 — signature image embed. We embed the user-uploaded
+  // signature image (if any) ONCE up front and re-use the resulting
+  // PDFImage object for every signature field. pdf-lib only ships
+  // `embedPng` / `embedJpg`; SVGs are pre-rasterized to PNG by the
+  // upload handler in `ProjectDetailForm.tsx`, so by the time we
+  // get here the dataUrl always starts with `data:image/png` or
+  // `data:image/jpeg`. If the dataUrl is malformed or pdf-lib
+  // rejects the bytes, we silently fall back to the typed-Caveat
+  // signature path — better to ship a typed signature than a
+  // broken PDF.
+  let signatureImagePdf: import("pdf-lib").PDFImage | undefined;
+  if (project.signatureImage?.dataUrl) {
+    const dataUrl = project.signatureImage.dataUrl;
+    try {
+      const commaIdx = dataUrl.indexOf(",");
+      if (commaIdx > 0) {
+        const meta = dataUrl.slice(0, commaIdx);
+        const b64 = dataUrl.slice(commaIdx + 1);
+        const isPng = /image\/png/i.test(meta);
+        const isJpeg = /image\/jpe?g/i.test(meta);
+        if (isPng || isJpeg) {
+          const bin = atob(b64);
+          const bytes = new Uint8Array(bin.length);
+          for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+          signatureImagePdf = isPng
+            ? await pdfDoc.embedPng(bytes)
+            : await pdfDoc.embedJpg(bytes);
+        }
+      }
+    } catch (err) {
+      console.warn(
+        "[pdfWriter] Failed to embed signature image; falling back to typed signature.",
+        err
+      );
+      signatureImagePdf = undefined;
+    }
+  }
+
   for (const field of repairedTemplate.fields) {
     const pageIndex = Math.max(0, Math.min(pages.length - 1, field.pageNumber - 1));
     const page = pages[pageIndex];
@@ -123,6 +161,41 @@ export async function writeFilledPdfBytes(
         return false;
       });
       if (!chosen) continue;
+
+      // v0.6.0 (B4) — shared-stroke X. When the field carries a
+      // single shared underline (`sharedUnderline === true` with
+      // `sharedUnderlineRect`), the chosen option's mark is an X
+      // centred horizontally on the option label's x-centre and
+      // vertically on the shared stroke. We render BEFORE the
+      // per-option blank check because shared-stroke and per-
+      // option blanks are mutually exclusive paths in the
+      // detector — but the field-level shared marker takes
+      // priority over any option-level oval that would
+      // otherwise apply.
+      if (field.sharedUnderline && field.sharedUnderlineRect) {
+        const xRect = field.sharedUnderlineRect;
+        const optCenterX = chosen.bbox.x + chosen.bbox.width / 2;
+        const xSize = Math.max(8, chosen.bbox.height * 0.8);
+        const half = xSize / 2;
+        const cx = optCenterX;
+        const cyTopDown = xRect.y + xRect.height / 2;
+        const cyPdf = pageHeight - cyTopDown;
+        const color = rgb(0.08, 0.08, 0.08);
+        const thickness = Math.max(1, xSize * 0.12);
+        page.drawLine({
+          start: { x: cx - half, y: cyPdf - half },
+          end: { x: cx + half, y: cyPdf + half },
+          thickness,
+          color,
+        });
+        page.drawLine({
+          start: { x: cx - half, y: cyPdf + half },
+          end: { x: cx + half, y: cyPdf - half },
+          thickness,
+          color,
+        });
+        continue;
+      }
 
       // v0.5.36 — X-on-blank rendering. Forms whose option-group
       // options carry a writable `___` blank to the LEFT of each
@@ -196,7 +269,11 @@ export async function writeFilledPdfBytes(
     }
 
     const rawValue = getTemplateFieldValue(project, field, promptValues, siblingKeys);
-    if (!rawValue) continue;
+    // v0.6.0 — signature fields fall through the empty-value gate
+    // when an uploaded signature image is available, even if the
+    // typed-Caveat string is blank. The image alone is enough to
+    // render the field.
+    if (!rawValue && !(isSignatureField(field) && signatureImagePdf)) continue;
 
     const x = field.x;
     const yPdfBottom = pageHeight - (field.y + field.height);
@@ -228,19 +305,55 @@ export async function writeFilledPdfBytes(
         });
       }
     } else if (isSignatureField(field)) {
-      const baseFontSize = field.estimatedFontSize
-        ? field.estimatedFontSize * 3
-        : Math.floor(field.height * 0.85);
-      const sigFontSize = Math.max(10, Math.min(28, baseFontSize));
-      const value = fitTextToWidth(rawValue, field.width, signatureFont, sigFontSize);
+      // v0.6.0 — image-first signature rendering. If the user
+      // uploaded a signature image, scale it to fit the field bbox
+      // while preserving aspect ratio and centre it horizontally
+      // inside the field width with a small inset (~3pt) so the
+      // image doesn't bleed into the form's underline or column
+      // border. Falls through to the typed-Caveat path when no
+      // image is uploaded OR when the embed step at the top of the
+      // function failed.
+      if (signatureImagePdf) {
+        const insetX = 3;
+        const insetY = 2;
+        const availW = Math.max(1, field.width - 2 * insetX);
+        const availH = Math.max(1, field.height - 2 * insetY);
+        const imgW = signatureImagePdf.width;
+        const imgH = signatureImagePdf.height;
+        const aspect = imgW / Math.max(imgH, 1);
+        let drawW = availW;
+        let drawH = drawW / aspect;
+        if (drawH > availH) {
+          drawH = availH;
+          drawW = drawH * aspect;
+        }
+        // Centre horizontally within the field width; align the
+        // image's bottom roughly with the field's text baseline so
+        // a flat-bottom signature sits on the underline like a
+        // typed signature would.
+        const drawX = x + (field.width - drawW) / 2;
+        const drawY = yPdfBottom + insetY;
+        page.drawImage(signatureImagePdf, {
+          x: drawX,
+          y: drawY,
+          width: drawW,
+          height: drawH,
+        });
+      } else {
+        const baseFontSize = field.estimatedFontSize
+          ? field.estimatedFontSize * 3
+          : Math.floor(field.height * 0.85);
+        const sigFontSize = Math.max(10, Math.min(28, baseFontSize));
+        const value = fitTextToWidth(rawValue, field.width, signatureFont, sigFontSize);
 
-      page.drawText(value, {
-        x: x + 3,
-        y: yPdfBottom + Math.max(4, (field.height - sigFontSize) / 2) + 2,
-        size: sigFontSize,
-        font: signatureFont,
-        color: rgb(0.08, 0.08, 0.08),
-      });
+        page.drawText(value, {
+          x: x + 3,
+          y: yPdfBottom + Math.max(4, (field.height - sigFontSize) / 2) + 2,
+          size: sigFontSize,
+          font: signatureFont,
+          color: rgb(0.08, 0.08, 0.08),
+        });
+      }
     } else {
       let fontSize = defaultFontSize;
       if (field.estimatedFontSize) {

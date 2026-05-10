@@ -101,10 +101,39 @@ function coerceProject(raw: unknown): Project | null {
   if (!raw || typeof raw !== "object") return null;
   const r = raw as Record<string, unknown>;
   const str = (key: string): string => (typeof r[key] === "string" ? (r[key] as string) : "");
+  /** v0.6.0 — optional string passthrough. Returns the trimmed value
+   *  when it's a non-empty string, otherwise `undefined` so the field
+   *  is omitted from the resulting Project (the new schema additions
+   *  are all optional and we don't want to populate them with empty
+   *  strings on every legacy project — the form-rendering paths
+   *  treat `undefined` and `""` equivalently, but JSON serialisation
+   *  is leaner with omissions). */
+  const optStr = (key: string): string | undefined => {
+    const v = r[key];
+    return typeof v === "string" && v.length > 0 ? v : undefined;
+  };
   const id =
     typeof r.id === "string" && r.id.length > 0 ? (r.id as string) : newProjectId();
   const cardType = str("creditCardType");
   const allowedCardTypes = new Set(["visa", "mastercard", "discover", "amex", ""]);
+
+  // v0.6.0 — coerce the optional uploaded signature image. Defensive
+  // against partially-corrupt records: must be an object with a
+  // string `dataUrl` and numeric `uploadedAt`. Anything else is
+  // dropped (the field is optional and the renderer falls back to
+  // the typed Caveat path).
+  let signatureImage: Project["signatureImage"] | undefined;
+  if (r.signatureImage && typeof r.signatureImage === "object") {
+    const sig = r.signatureImage as Record<string, unknown>;
+    if (typeof sig.dataUrl === "string" && sig.dataUrl.startsWith("data:")) {
+      signatureImage = {
+        dataUrl: sig.dataUrl,
+        uploadedAt:
+          typeof sig.uploadedAt === "number" ? sig.uploadedAt : Date.now(),
+      };
+    }
+  }
+
   return {
     id,
     label: str("label"),
@@ -137,6 +166,49 @@ function coerceProject(raw: unknown): Project | null {
     updatedAt: str("updatedAt") || new Date().toISOString(),
     modifiedAt:
       typeof r.modifiedAt === "number" ? (r.modifiedAt as number) : Date.now(),
+
+    // v0.6.0 — corpus-driven optional fields. Stored straight onto the
+    // encrypted project blob; legacy projects without these keys
+    // deserialise as `undefined` and the form filler / UI treat that
+    // identically to an empty string.
+    federalTaxId: optStr("federalTaxId"),
+    dunsNumber: optStr("dunsNumber"),
+    dbaName: optStr("dbaName"),
+    parentCompany: optStr("parentCompany"),
+    yearsInBusiness: optStr("yearsInBusiness"),
+    dateBusinessStarted: optStr("dateBusinessStarted"),
+    dateIncorporated: optStr("dateIncorporated"),
+    resaleTaxCertificate: optStr("resaleTaxCertificate"),
+    authorizedSignerName: optStr("authorizedSignerName"),
+    authorizedSignerTitle: optStr("authorizedSignerTitle"),
+    secondAuthorizedSignerName: optStr("secondAuthorizedSignerName"),
+    secondAuthorizedSignerTitle: optStr("secondAuthorizedSignerTitle"),
+    bankName: optStr("bankName"),
+    bankRoutingNumber: optStr("bankRoutingNumber"),
+    bankAccountNumber: optStr("bankAccountNumber"),
+    fedExAccountNumber: optStr("fedExAccountNumber"),
+    upsAccountNumber: optStr("upsAccountNumber"),
+    rentalStartDate: optStr("rentalStartDate"),
+    rentalEndDate: optStr("rentalEndDate"),
+    hourlyRateBuild: optStr("hourlyRateBuild"),
+    hourlyRateShoot: optStr("hourlyRateShoot"),
+    hoursBuild: optStr("hoursBuild"),
+    hoursShoot: optStr("hoursShoot"),
+    driverLicenseNumber: optStr("driverLicenseNumber"),
+    vehicleVin: optStr("vehicleVin"),
+    vehiclePlate: optStr("vehiclePlate"),
+    insuranceCarrier: optStr("insuranceCarrier"),
+    insurancePolicyNumber: optStr("insurancePolicyNumber"),
+    invoiceNumber: optStr("invoiceNumber"),
+    accountingContactName: optStr("accountingContactName"),
+    accountingEmail: optStr("accountingEmail"),
+    streetAddress: optStr("streetAddress"),
+    deliveryAddress: optStr("deliveryAddress"),
+    showName: optStr("showName"),
+    seasonNumber: optStr("seasonNumber"),
+    productionClassification: optStr("productionClassification"),
+    initials: optStr("initials"),
+    signatureImage,
   };
 }
 

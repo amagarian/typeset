@@ -95,6 +95,18 @@ export function DraggableField({
           }))
         : null;
 
+      // v0.6.0 (B4) — clone the shared-stroke rect at drag start
+      // so we can translate/scale it in lockstep with the parent
+      // rect on drag/resize. The shared-stroke rect lives in
+      // absolute PDF user-space (same convention as option
+      // bboxes), so a parent move must shift it by dx/dy and a
+      // parent resize scales its position-within-parent
+      // proportionally — identical maths to the per-option
+      // `blankRect` translation.
+      const startSharedRect = field.sharedUnderlineRect
+        ? { ...field.sharedUnderlineRect }
+        : null;
+
       const computeOptions = (
         nextX: number,
         nextY: number,
@@ -132,24 +144,60 @@ export function DraggableField({
         });
       };
 
+      const computeSharedRect = (
+        nextX: number,
+        nextY: number,
+        nextW: number,
+        nextH: number
+      ): TemplateField["sharedUnderlineRect"] | undefined => {
+        if (!startSharedRect) return undefined;
+        const { fieldX, fieldY, fieldW, fieldH } = startPos.current;
+        const sx = fieldW > 0 ? nextW / fieldW : 1;
+        const sy = fieldH > 0 ? nextH / fieldH : 1;
+        const localDx = startSharedRect.x - fieldX;
+        const localDy = startSharedRect.y - fieldY;
+        return {
+          x: nextX + localDx * sx,
+          y: nextY + localDy * sy,
+          width: startSharedRect.width * sx,
+          height: startSharedRect.height * sy,
+        };
+      };
+
       const handleMouseMove = (moveEvent: MouseEvent) => {
         moveEvent.preventDefault();
         const dx = (moveEvent.clientX - startPos.current.x) / scale;
         const dy = (moveEvent.clientY - startPos.current.y) / scale;
         const { fieldX, fieldY, fieldW, fieldH } = startPos.current;
 
+        // v0.6.0 (B4) — small helper shared across all drag/resize
+        // branches. Adds the per-option bbox updates AND the
+        // shared-stroke rect update (when present) onto an
+        // updates object in lockstep, so a drag never desyncs the
+        // shared-stroke marker from the parent rect.
+        const applyDerived = (
+          updates: Partial<TemplateField>,
+          nextX: number,
+          nextY: number,
+          nextW: number,
+          nextH: number
+        ) => {
+          const nextOpts = computeOptions(nextX, nextY, nextW, nextH);
+          if (nextOpts) updates.options = nextOpts;
+          const nextShared = computeSharedRect(nextX, nextY, nextW, nextH);
+          if (nextShared) updates.sharedUnderlineRect = nextShared;
+        };
+
         if (mode === "move") {
           const nextX = Math.max(0, fieldX + dx);
           const nextY = Math.max(0, fieldY + dy);
           const updates: Partial<TemplateField> = { x: nextX, y: nextY };
-          const nextOpts = computeOptions(nextX, nextY, fieldW, fieldH);
-          if (nextOpts) updates.options = nextOpts;
+          applyDerived(updates, nextX, nextY, fieldW, fieldH);
           onChange(updates);
         } else if (mode === "resize-e") {
           const nextW = Math.max(20, fieldW + dx);
           const updates: Partial<TemplateField> = { width: nextW };
-          const nextOpts = computeOptions(fieldX, fieldY, nextW, fieldH);
-          if (nextOpts) updates.options = nextOpts;
+          applyDerived(updates, fieldX, fieldY, nextW, fieldH);
           onChange(updates);
         } else if (mode === "resize-w") {
           const newWidth = Math.max(20, fieldW - dx);
@@ -158,8 +206,7 @@ export function DraggableField({
             x: nextX,
             width: newWidth,
           };
-          const nextOpts = computeOptions(nextX, fieldY, newWidth, fieldH);
-          if (nextOpts) updates.options = nextOpts;
+          applyDerived(updates, nextX, fieldY, newWidth, fieldH);
           onChange(updates);
         } else if (mode === "resize-n") {
           const newHeight = Math.max(10, fieldH - dy);
@@ -168,14 +215,12 @@ export function DraggableField({
             y: nextY,
             height: newHeight,
           };
-          const nextOpts = computeOptions(fieldX, nextY, fieldW, newHeight);
-          if (nextOpts) updates.options = nextOpts;
+          applyDerived(updates, fieldX, nextY, fieldW, newHeight);
           onChange(updates);
         } else if (mode === "resize-s") {
           const newHeight = Math.max(10, fieldH + dy);
           const updates: Partial<TemplateField> = { height: newHeight };
-          const nextOpts = computeOptions(fieldX, fieldY, fieldW, newHeight);
-          if (nextOpts) updates.options = nextOpts;
+          applyDerived(updates, fieldX, fieldY, fieldW, newHeight);
           onChange(updates);
         } else if (mode === "resize-nw") {
           const newWidth = Math.max(20, fieldW - dx);
@@ -188,8 +233,7 @@ export function DraggableField({
             width: newWidth,
             height: newHeight,
           };
-          const nextOpts = computeOptions(nextX, nextY, newWidth, newHeight);
-          if (nextOpts) updates.options = nextOpts;
+          applyDerived(updates, nextX, nextY, newWidth, newHeight);
           onChange(updates);
         } else if (mode === "resize-ne") {
           const newHeight = Math.max(10, fieldH - dy);
@@ -200,8 +244,7 @@ export function DraggableField({
             width: newWidth,
             height: newHeight,
           };
-          const nextOpts = computeOptions(fieldX, nextY, newWidth, newHeight);
-          if (nextOpts) updates.options = nextOpts;
+          applyDerived(updates, fieldX, nextY, newWidth, newHeight);
           onChange(updates);
         } else if (mode === "resize-sw") {
           const newWidth = Math.max(20, fieldW - dx);
@@ -212,8 +255,7 @@ export function DraggableField({
             width: newWidth,
             height: newHeight,
           };
-          const nextOpts = computeOptions(nextX, fieldY, newWidth, newHeight);
-          if (nextOpts) updates.options = nextOpts;
+          applyDerived(updates, nextX, fieldY, newWidth, newHeight);
           onChange(updates);
         } else if (mode === "resize-se") {
           const newWidth = Math.max(20, fieldW + dx);
@@ -222,8 +264,7 @@ export function DraggableField({
             width: newWidth,
             height: newHeight,
           };
-          const nextOpts = computeOptions(fieldX, fieldY, newWidth, newHeight);
-          if (nextOpts) updates.options = nextOpts;
+          applyDerived(updates, fieldX, fieldY, newWidth, newHeight);
           onChange(updates);
         }
       };
@@ -282,6 +323,26 @@ export function DraggableField({
 
   if (isOptionGroup) {
     const selectedLabel = (field.selectedOption ?? "").toLowerCase();
+    // v0.6.0 (B4) — shared-stroke render path. When the field
+    // carries a single underline serving multiple options
+    // (`sharedUnderline === true`), draw the stroke outline
+    // ALWAYS (so users can see the writable target even before
+    // a selection) and overlay an X centred horizontally on the
+    // selected option's label x-centre, vertically aligned to
+    // the stroke. We deliberately render the stroke marker for
+    // BOTH the shared-stroke and per-option paths so the canvas
+    // review reads identically — the only difference is whether
+    // the X anchors at the option-label centre (shared path) or
+    // at the per-option blank's centre.
+    const sharedStrokeRect =
+      field.sharedUnderline && field.sharedUnderlineRect
+        ? field.sharedUnderlineRect
+        : null;
+    const selectedOption = sharedStrokeRect
+      ? (field.options ?? []).find(
+          (o) => o.label.toLowerCase() === selectedLabel
+        )
+      : null;
     return (
       <div
         ref={containerRef}
@@ -292,6 +353,85 @@ export function DraggableField({
         title={`${field.label} — drag to move (option group)`}
       >
         <span className={styles.label}>{field.label}</span>
+
+        {sharedStrokeRect && (() => {
+          // Always draw the dashed marker over the detected
+          // shared stroke so the user can see the target.
+          const left = (sharedStrokeRect.x - field.x) * scale;
+          const top = (sharedStrokeRect.y - field.y) * scale;
+          const width = Math.max(2, sharedStrokeRect.width * scale);
+          const height = Math.max(2, sharedStrokeRect.height * scale);
+          return (
+            <div
+              key="shared-stroke-marker"
+              style={{
+                position: "absolute",
+                left,
+                top,
+                width,
+                height,
+                pointerEvents: "none",
+                boxSizing: "border-box",
+                border: `1px dashed ${selected ? "rgba(40, 70, 200, 0.55)" : "rgba(40, 70, 200, 0.35)"}`,
+                borderRadius: 1,
+              }}
+            />
+          );
+        })()}
+
+        {sharedStrokeRect && selectedOption && (() => {
+          // X centred horizontally at the selected option's label
+          // x-centre, vertically anchored ABOVE the shared stroke
+          // so the arms cross the option label's baseline (same
+          // text-baseline geometry as per-option Xs). The stroke
+          // rect itself is only ~2pt tall, so we size the X
+          // against the option label's height for visual parity
+          // with per-option Xs.
+          const optCenterX = selectedOption.bbox.x + selectedOption.bbox.width / 2;
+          const xSizePt = Math.max(8, selectedOption.bbox.height * 0.8);
+          const xLeft = (optCenterX - xSizePt / 2 - field.x) * scale;
+          const xTop =
+            (sharedStrokeRect.y + sharedStrokeRect.height / 2 - xSizePt / 2 - field.y) *
+            scale;
+          const sizePx = xSizePt * scale;
+          const half = sizePx / 2;
+          const strokeWidth = selected ? 2 : 1.5;
+          return (
+            <svg
+              key="shared-stroke-x"
+              width={sizePx}
+              height={sizePx}
+              viewBox={`0 0 ${sizePx} ${sizePx}`}
+              style={{
+                position: "absolute",
+                left: xLeft,
+                top: xTop,
+                overflow: "visible",
+                color: "#0a7c2c",
+                pointerEvents: "none",
+              }}
+            >
+              <line
+                x1={half - half}
+                y1={half - half}
+                x2={half + half}
+                y2={half + half}
+                stroke="currentColor"
+                strokeWidth={strokeWidth}
+                strokeLinecap="round"
+              />
+              <line
+                x1={half - half}
+                y1={half + half}
+                x2={half + half}
+                y2={half - half}
+                stroke="currentColor"
+                strokeWidth={strokeWidth}
+                strokeLinecap="round"
+              />
+            </svg>
+          );
+        })()}
 
         {(field.options ?? []).map((opt, idx) => {
           const isSel = opt.label.toLowerCase() === selectedLabel;
@@ -390,6 +530,14 @@ export function DraggableField({
               </div>
             );
           }
+
+          // v0.6.0 (B4) — when the field carries a sharedUnderline,
+          // skip the per-label oval marker entirely. The shared
+          // stroke + X-on-selected-option marker (rendered above)
+          // is the complete affordance for shared-stroke fields;
+          // an additional oval around each label would visually
+          // compete with the X and confuse the selection target.
+          if (sharedStrokeRect) return null;
 
           const ovalLeft = (opt.bbox.x - field.x) * scale;
           const ovalTop = (opt.bbox.y - field.y) * scale;

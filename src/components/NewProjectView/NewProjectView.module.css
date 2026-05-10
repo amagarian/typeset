@@ -137,3 +137,47 @@
 .syncIndicatorError {
   color: #991b1b;
 }
+
+/*
+ * v0.6.0 — explicit Save button row. Sits at the bottom of the
+ * form column with the button left-aligned (per spec), wrapped
+ * inside a small bar so the button has breathing room from the
+ * last form input. The bar shares the form's surface tone
+ * (`--bg-input`) so it reads as continuation rather than a
+ * separate panel.
+ */
+.saveBar {
+  display: flex;
+  justify-content: flex-start;
+  padding: 16px 16px 24px;
+  background: var(--bg-input);
+  border-top: 1px solid var(--border);
+  margin-top: -1px;
+}
+
+.saveBtn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 16px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
+}
+
+.saveBtn:hover {
+  border-color: var(--border-focus);
+  background: var(--bg-input);
+}
+
+.saveBtnShortcut {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-muted);
+  letter-spacing: 0.04em;
+}
