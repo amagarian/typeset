@@ -1,4 +1,4 @@
-@import url('https://fonts.googleapis.com/css2?family=Caveat:wght@400;600&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600;700&family=Caveat:wght@400;600&display=swap');
 
 :root {
   --bg-app: #f2f2f0;
@@ -7,6 +7,16 @@
   --bg-input: #eaeae8;
   --border: #d4d4d2;
   --border-focus: #a0a09e;
+  /*
+   * v0.5.35 — selection/active row tone.
+   *
+   * Sits perceptibly darker than --border (the sidebar's hover token,
+   * #d4d4d2) so the *current* selection reads as a stronger commitment
+   * than a transient hover, without crossing into --border-focus
+   * territory (#a0a09e) where it would start to feel like a button
+   * rather than a row. Used by ProjectList for `.itemActive`.
+   */
+  --bg-row-active: #c4c4c2;
   --text: #1a1a1a;
   --text-muted: #6b6b69;
   --text-label: #8a8a88;
@@ -14,53 +24,27 @@
   --radius-sm: 4px;
   --shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
   /*
-   * v0.5.26 — typography system: full sans-serif consolidation.
+   * v0.5.24 — typography system.
    *
-   * v0.5.24 mixed body sans with a JetBrains Mono display face for
-   * h1/h2/brand and a separate mono stack for code-shaped data.
-   * The mono runs read as code blocks rather than UI in the chrome
-   * and competed with body content. v0.5.26 collapses everything
-   * to the system sans stack.
+   * Body / UI / labels / buttons / modal copy / tooltips / errors /
+   * inputs use a system sans stack. Display (h1, h2, brand wordmark,
+   * large stat numbers) uses JetBrains Mono with mild negative
+   * letter-spacing for typographic weight contrast. Mono is reserved
+   * for code-shaped data (field IDs, fingerprints, version strings,
+   * file names, template names in the registry list).
    *
-   * `--font-display` and `--font-mono` are RETAINED as aliases for
-   * `--font-sans` so the dozens of existing component-CSS
-   * references (`var(--font-mono)`, `var(--font-display)`) keep
-   * working without a sweeping rename. Numeric-width stability for
-   * counters and version strings is restored on a per-component
-   * basis with `font-variant-numeric: tabular-nums;` rather than
-   * by reaching for a monospaced face.
-   *
-   * `--font-signature` keeps the Caveat script face for inline
-   * signatures only.
+   * Components must always go through these variables — never hard-
+   * code "JetBrains Mono" in component CSS — so a future swap of the
+   * mono / display family stays a single-file change.
    */
   --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", "Segoe UI", system-ui, sans-serif;
-  --font-display: var(--font-sans);
-  --font-mono: var(--font-sans);
+  --font-display: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", "Menlo", monospace;
   --sidebar-width: 200px;
   --header-uppercase: 600;
   --letter-wide: 0.05em;
   --letter-normal: 0;
   --letter-display: -0.01em;
-  /*
-   * v0.5.26 — unified section-header text treatment.
-   *
-   * All in-app section headers (Settings groups, project JOB INFO,
-   * modal titles, fill prompt heading, template review heading,
-   * field-list count, etc.) share the same recipe:
-   *
-   *   font-size: 11px;
-   *   font-weight: 500;
-   *   letter-spacing: var(--letter-section);   (= 0.08em)
-   *   text-transform: uppercase;
-   *   color: var(--text-label);                (the dim variable)
-   *
-   * Goal: section headers recede into the chrome instead of
-   * competing with body content. Prior versions ranged from 9-13px
-   * with weights 500-600 and a mix of `--text` / `--text-muted`
-   * colors, which read as load-bearing labels. v0.5.26 unifies
-   * them into a single, quieter treatment.
-   */
-  --letter-section: 0.08em;
   --font-signature: "Caveat", cursive;
 }
 
@@ -99,23 +83,21 @@ body {
 }
 
 /*
- * v0.5.26 — display headings now share the body sans stack. We get
- * weight contrast from a heavier `font-weight` and a tighter
- * negative `letter-spacing`, instead of a different family.
+ * Display headings. Mono via the display variable (same family as
+ * --font-mono today, but kept distinct so the display face can drift
+ * later without touching code spans). Negative tracking + bold weight
+ * gives the headline the visual weight monospace needs to read as a
+ * heading rather than a code block.
  */
 h1, h2 {
   font-family: var(--font-display);
+  letter-spacing: var(--letter-display);
+  font-weight: 600;
   margin: 0;
 }
 
 h1 {
   font-weight: 700;
-  letter-spacing: -0.02em;
-}
-
-h2 {
-  font-weight: 600;
-  letter-spacing: -0.01em;
 }
 
 button {

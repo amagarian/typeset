@@ -15,11 +15,26 @@
 }
 
 /*
- * v0.5.27 — list row hover unified with the rest of the sidebar
- * (`+ New project`, search focus) and with the `Import from PDF`
- * button in NewProjectView. Same 0.15s background/colour fade,
- * same `--bg-input` hover tone. Active row keeps a slightly
- * deeper ink so it still reads as the current selection.
+ * v0.5.35 — restore distinct row shading.
+ *
+ * v0.5.27 unified hover and active onto `--bg-input`, which on the
+ * sidebar's `--bg-sidebar` (#e8e8e6) surface is only 1-2 steps
+ * different — the active row visually disappeared. We now match
+ * the rest of the sidebar chrome:
+ *
+ *   - Hover: `--border` (#d4d4d2). Same token the `+ New project`
+ *     button uses for hover (Sidebar.module.css, post v0.5.32) — so
+ *     all interactive elements in the sidebar share one hover tone.
+ *   - Active / selected: `--bg-row-active` (#c4c4c2). One step
+ *     darker than hover, well short of `--border-focus` (#a0a09e),
+ *     so the current selection reads as a deliberate commitment
+ *     rather than a transient hover.
+ *
+ * Hovering a row that's already active stays at the active tone — we
+ * never lift back up to the lighter hover, otherwise the selection
+ * appears to weaken on mouseover.
+ *
+ * Typography is intentionally unchanged.
  */
 .item,
 .itemActive {
@@ -36,14 +51,14 @@
 }
 
 .item:hover {
-  background: var(--bg-input);
+  background: var(--border);
 }
 
 .itemActive {
-  background: var(--bg-input);
+  background: var(--bg-row-active);
   font-weight: 500;
 }
 
 .itemActive:hover {
-  background: var(--bg-input);
+  background: var(--bg-row-active);
 }
