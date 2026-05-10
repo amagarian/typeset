@@ -1292,112 +1292,100 @@ function mapToTemplateField(
     return null;
   }
 
-  // v0.5.17 — detection-time pre-shift is `-height/2` (v0.5.15-style).
-  // The snap target in `underlineSnap.ts` STAYS at
-  // `bbox_bottom == strokeRow` (v0.5.16). The two paths intentionally
-  // do NOT converge — the asymmetry buys snap-search-center stability,
-  // which v0.5.16's full-height shift broke.
+  // v0.5.18 — detection-time pre-shift is REMOVED. Gemini's prompt
+  // already places the bbox so its bottom edge sits on the underline
+  // stroke (text-baseline geometry: bbox_bottom = stroke_y), and the
+  // snap target in `underlineSnap.ts` is anchored on the same point
+  // (`newY = strokeRow - height`). With both ends of the pipeline
+  // targeting the same anchor, any detection-time shift is redundant
+  // AND actively harmful: it drags the snap's row-search center off
+  // the real stroke, where Step 6 picks the closest candidate.
   //
-  // Why decouple — the v0.5.16 search-center coupling bug:
+  // Why removal — the v0.5.17 search-center drift bug:
   //   `underlineSnap.ts` computes its row-search center from the
-  //   already-pre-shifted bbox:
+  //   already-shifted bbox:
   //     bboxCenterYPx = (field.y + field.height / 2) * pixelsPerPoint
-  //   When the v0.5.16 detection-time correction shifted `field.y` up
-  //   by an additional `height/2` (relative to v0.5.15), the snap's
-  //   search center rode that shift upward by ~6pt. The snap scans a
-  //   ±24pt window around the center, picks the candidate row CLOSEST
-  //   to the center, and snaps the bbox bottom to it — so when the
-  //   center crossed into the row above on dense top-of-form regions
-  //   (line spacing ~22pt, asterisk separators, header rules, tight
-  //   contact-info clusters), Step 6 selected the WRONG stroke. Snap
-  //   target `strokeRow - height` then anchored the bbox onto a stroke
-  //   one row above the intended one. Real-user v0.5.16 evidence:
-  //   bottom-of-page fields (looser vertical breathing room → search
-  //   band only contains the intended stroke) snapped correctly, while
-  //   top-half fields shifted up an entire row.
+  //   In v0.5.17 we kept the v0.5.15-style `-height/2` pre-shift on
+  //   the assumption that Gemini still placed `bbox_center` on the
+  //   stroke. But the v0.5.16 prompt rule had been changed to "place
+  //   bbox so its bottom edge sits on the underline" — Gemini now
+  //   returns `raw_y = stroke - height`. The v0.5.17 pre-shift then
+  //   produced `field.y = stroke - 1.5*height` and a search center at
+  //   `stroke - height`, i.e. an entire `height` ABOVE the actual
+  //   stroke. On dense top-of-form rows (line spacing ~22pt) the
+  //   search center landed within ~10pt of the row-above stroke and
+  //   only ~12pt from the intended stroke; Step 6 picked the wrong
+  //   one. Real-user v0.5.17 evidence: Billing Address snapping to
+  //   COMPANY's stroke; Stylist Designer Name snapping to
+  //   CONTACT PHONE / Email's stroke. Bottom-of-page fields with
+  //   looser breathing room continued to snap correctly because
+  //   their search bands only contained one stroke.
   //
-  // Decoupling restores stable stroke selection:
-  //   v0.5.15's `-height/2` pre-shift left the snap search center at
-  //   the bbox center as Gemini reported it — the v0.5.15 cardholder
-  //   feedback ("fixed the cardholder line inconsistency") confirmed
-  //   stroke selection was correct at that center. We restore it here
-  //   while keeping the v0.5.16 snap target (`strokeRow - height`),
-  //   which is the geometrically right anchor for the snapped path
-  //   (the v0.5.16 bottom-row evidence proved the target equation
-  //   itself is sound — only the search-center shift was wrong).
+  // Removing the shift restores convergence by construction:
+  //   raw_y = stroke - height                    (Gemini follows prompt)
+  //   field.y = raw_y                            (no pre-shift)
+  //   snap search center = field.y + height/2 = stroke - height/2
+  //     → 6pt from intended stroke, ~16pt from row-above stroke ✅
+  //   SNAPPED path: newY = strokeRow - height → bbox_bottom = stroke ✅
+  //   UNSNAPPED path: stays at field.y = stroke - height
+  //     → bbox_bottom = stroke ✅
+  //   Both paths land on the same anchor — the v0.5.16 design intent,
+  //   without v0.5.16's search-center shift.
   //
-  // Net behaviour:
-  //   - SNAPPED text-on-a-line fields (16/17 typical): snap REPLACES
-  //     `y` with `strokeRow - height`, so `bbox_bottom == strokeRow`
-  //     (text-baseline geometry — typed text sits ABOVE the line).
-  //     Pre-shift is irrelevant for these.
-  //   - UNSNAPPED text-on-a-line fields (1/17 typical, e.g. no stroke
-  //     found, ambiguous, beyond maxSnapPoints): pre-shift only —
-  //     `bbox_center == raw_y`, identical to v0.5.15's unsnapped
-  //     behaviour. These will sit ~h/2 below the intended baseline
-  //     visually; unsnapped is rare and a future tightening of the
-  //     snap predicate can catch more cases.
-  //
-  // Geometry (snapped path — the common case):
-  //   Gemini returns bbox with `bbox_top` ≈ `strokeRow`. We shift
-  //   `rect.y` UPWARD by `height/2` (does not affect snap target —
-  //   shifts only the search-center input). Snap then computes
-  //   `newY = strokeRow_pt - height` → `bbox_bottom = strokeRow`.
-  //   Math trace (upper-section field, raw_y = 724.68, h = 12):
-  //     pre-shift: corrected_y = 718.68
-  //     snap search center: 718.68 + 6 = 724.68 (back at raw stroke y)
-  //     snap selects stroke at row 724.68
-  //     newY = 724.68 - 12 = 712.68
-  //   Compare v0.5.16: pre-shift would have set corrected_y = 712.68
-  //   and the snap search center would have moved to 718.68 — 6pt off
-  //   the actual stroke and within reach of the row above on dense
-  //   top-of-form lines. v0.5.17 keeps the search center at 724.68
-  //   exactly where v0.5.15 had it.
+  // Geometry (math trace — upper-section field, h = 12, intended
+  // stroke at 724.68, prior-row stroke at 702.68 i.e. 22pt above):
+  //   raw_y                        = 712.68 (Gemini: stroke - h)
+  //   field.y (no shift)           = 712.68
+  //   snap search center           = 718.68
+  //   distance to intended (724.68)= 6  ← closest, picked ✅
+  //   distance to row-above (702.68)= 16 (rejected)
+  //   newY = 724.68 - 12           = 712.68 → bbox_bottom = 724.68 ✅
+  // Compare v0.5.17 on the same field:
+  //   field.y (after -h/2)         = 706.68
+  //   snap search center           = 712.68
+  //   distance to intended         = 12
+  //   distance to row-above        = 10  ← closest, picked ❌
+  //   newY                         = 690.68 → wrong row.
   //
   // History:
   //   v0.5.11 flat `TEXT_BASELINE_BIAS_PT = 5` — under-corrected
   //   typical heights.
   //   v0.5.13 kept the flat 5pt — same problem.
-  //   v0.5.15 replaced the flat constant with `height/2` (centered
-  //   on stroke) — converged unsnapped on `bbox_center == strokeRow`.
-  //   Stroke selection was correct but the visual anchor was ~h/2 low.
-  //   v0.5.16 shifted to `-height` (bottom on stroke), converging both
-  //   paths on `bbox_bottom == strokeRow`. Snap target was correct but
-  //   the same shift moved the snap search center, breaking stroke
-  //   selection on dense top-of-form rows.
-  //   v0.5.17 (this) — keeps the v0.5.16 snap target (`strokeRow -
-  //   height`) and reverts the detection-time pre-shift to `-height/2`
-  //   so the snap search center returns to the v0.5.15 position. The
-  //   two paths no longer mathematically converge; the snapped path is
-  //   correct, the unsnapped path lands at v0.5.15's position. Trade
-  //   accepted because the snapped path covers ~16/17 of typical
-  //   detections.
+  //   v0.5.15 replaced the flat constant with `height/2` (centered on
+  //   stroke) — converged unsnapped on `bbox_center == strokeRow`,
+  //   but the visual anchor was ~h/2 low (text needs to sit ABOVE
+  //   the line, not centered on it).
+  //   v0.5.16 changed the PROMPT to "bottom edge on stroke" AND
+  //   shifted both pre-shift and snap target to full `-height`. Both
+  //   paths converged on bbox_bottom == strokeRow, but the shift
+  //   moved the snap search center too, breaking stroke selection
+  //   on dense top-of-form rows.
+  //   v0.5.17 reverted the pre-shift to `-height/2` thinking that
+  //   would restore the v0.5.15 search center. Wrong: the v0.5.16
+  //   prompt change had moved Gemini's `raw_y` itself by `-height/2`,
+  //   so the v0.5.17 pre-shift took the search center an extra
+  //   `-height/2` past the stroke. Billing Address + Stylist Designer
+  //   Name still snapped to the row above on tight rows.
+  //   v0.5.18 (this) — removes the pre-shift entirely. Prompt does
+  //   the placement work; snap acts as a verifier/corrector against
+  //   the same anchor. No double-correction; both paths converge.
   //
   // Why this is safe alongside the snap: the snap REPLACES `y` with
-  // its stroke-anchored target — it does not ADD to the existing `y`.
-  // So snapped fields end at `bbox_bottom == strokeRow` regardless of
-  // whatever pre-shift we did here. The pre-shift's only function
-  // post-v0.5.17 is (a) to keep the snap search center stable at the
-  // raw stroke row, and (b) to give unsnapped fields a v0.5.15-style
-  // fallback position (`bbox_center == raw_y`).
+  // its stroke-anchored target — it does not ADD to the existing
+  // `y`. With the prompt placing `raw_y = stroke - height` and snap
+  // target `newY = strokeRow - height`, snapped and unsnapped fields
+  // both land at `bbox_bottom == strokeRow` (text-baseline geometry,
+  // typed text sits above the line). The snap search center
+  // (`field.y + height/2 = stroke - height/2`) is half a height
+  // below the stroke — a stable, well-separated anchor against the
+  // row-above stroke (~16pt away on typical 22pt line spacing).
   //
-  // Predicate ("text-on-a-line") — unchanged from v0.5.15/v0.5.16:
-  //   - `text` field type: yes (every text-typed field).
-  //   - `signature` field kind: yes — v0.5.13. Signatures sit on a
-  //     baseline like text.
-  //   - `multiline` field kind: NO. Multilines cover tall regions
-  //     with no single underline stroke; their `y` represents the
-  //     top of a band, not a baseline.
-  //   - `checkbox` field type: NO. Checkbox glyphs anchor on the
-  //     printed box, not on a baseline; the predicate excludes
-  //     checkboxes via `fieldType === "text" || fieldKind === "signature"`.
+  // Predicate ("text-on-a-line") — kept as a no-op flag for now so
+  // future shifts (if needed) have a clear target. `correctionApplied`
+  // is always false; `rect.y` is always `rawY`. Comment + diag log
+  // both reflect this.
   const rawY = rect.y;
-  const correctionApplied =
-    (fieldType === "text" || fieldKind === "signature") &&
-    fieldKind !== "multiline";
-  if (correctionApplied) {
-    rect.y = Math.max(0, rect.y - rect.height / 2);
-  }
+  const correctionApplied = false;
 
   console.log(
     `[Typeset Diag] Field ${index} pdf rect: x=${rect.x.toFixed(2)}, y=${rect.y.toFixed(2)}, w=${rect.width.toFixed(2)}, h=${rect.height.toFixed(2)}`
@@ -1418,8 +1406,17 @@ function mapToTemplateField(
   // Dev builds (`import.meta.env.DEV`) always print these so we
   // see them locally without flipping the flag.
   if (alignmentDebugEnabled()) {
+    // v0.5.18 — `corrected_y` always equals `raw_y` and `corrected`
+    // is always false: the detection-time pre-shift was removed,
+    // because Gemini's prompt now places the bbox so its bottom
+    // edge sits on the underline (`raw_y = stroke - height`) and
+    // any further shift here drags the snap's search center off
+    // the real stroke. The `pre_shift=` field present in
+    // v0.5.15-v0.5.17 logs is gone for the same reason. Snapped and
+    // unsnapped fields both land at `bbox_bottom = stroke`; the
+    // post-snap y is still reported separately by underlineSnap.
     console.log(
-      `[Typeset Align] field=${index} label="${(raw.label ?? "").slice(0, 32)}" type=${fieldType} kind=${fieldKind} raw_y=${rawY.toFixed(2)} corrected_y=${rect.y.toFixed(2)} corrected=${correctionApplied} height=${rect.height.toFixed(2)} anchor=bbox_bottom_on_stroke${correctionApplied ? " pre_shift=height/2" : ""} (snapped fields land at bbox_bottom=stroke; unsnapped fields land at bbox_center≈raw_y per pre_shift; post-snap y reported separately by underlineSnap)`
+      `[Typeset Align] field=${index} label="${(raw.label ?? "").slice(0, 32)}" type=${fieldType} kind=${fieldKind} raw_y=${rawY.toFixed(2)} corrected_y=${rect.y.toFixed(2)} corrected=${correctionApplied} height=${rect.height.toFixed(2)} anchor=bbox_bottom_on_stroke (no detection-time shift; snapped + unsnapped converge on bbox_bottom=stroke; post-snap y reported separately by underlineSnap)`
     );
   }
 
