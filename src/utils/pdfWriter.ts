@@ -68,22 +68,49 @@ function fitTextToWidth(text: string, width: number, font: any, fontSize: number
  * should use to skip past the printed prefix. Returns 0 (no shift)
  * when there's no signal that the label sits inside the bbox.
  *
- * Triggers (ALL required):
- *   1. Field is a regular text field (not checkbox/option-group/signature).
- *   2. `printedLabel` is non-empty and ends with a colon (`:` or `：`).
- *   3. Bbox is at least ~100pt wide — narrow bboxes are usually genuine
- *      post-colon writable areas and must not be shifted.
- *   4. `contextBefore` is either empty OR doesn't already echo the
- *      prefix label. If `contextBefore` already carries the label
- *      text, the label sits OUTSIDE the bbox and the bbox already
- *      starts past the colon — shifting would push us off the right
- *      edge.
+ * Two trigger paths (either fires the shift, both gated by the same
+ * disqualifiers):
  *
- * The shift width is `widthOf(printedLabel) + 4pt` for breathing room
- * past the punctuation, clamped to `0.6 * field.width` so even when
- * the heuristic fires on a wrong label we never push past the bbox
- * midpoint.
+ *   PATH A — explicit colon. `printedLabel` ends with a colon
+ *   (`:` or `：`), AND bbox is at least ~100pt wide, AND
+ *   `contextBefore` doesn't already echo the printed label.
+ *
+ *   PATH B — known label-prefix canonical (v0.6.12). The field maps
+ *   to one of a small set of canonicals that are ALWAYS labelled with
+ *   a printed prefix in real-world boxed-cell layouts (cardholder
+ *   name, billing address, security code, etc.), AND the bbox is
+ *   ≥ ~150pt wide, AND `contextBefore` doesn't already echo the
+ *   printed label, AND the field is text-typed. Gemini's `raw.label`
+ *   is a Title-Case description (e.g. `"Cardholder Name"`, no colon),
+ *   so PATH A misses canonical-mapped fields where the form's literal
+ *   prefix has a colon. PATH B catches those.
+ *
+ * Shared disqualifiers:
+ *   - Field is checkbox / option-group / signature (signatures get
+ *     their own image-or-typed render path; checkboxes draw glyphs).
+ *   - `contextBefore` echoes the printed-label stem → label sits
+ *     OUTSIDE the bbox to the left and the bbox already starts past
+ *     the colon. Shifting would push the value off the right edge.
+ *
+ * The shift width is `widthOf(measureLabel) + 4pt` where
+ * `measureLabel` is `printedLabel` (path A) or `printedLabel + ":"`
+ * fallback (path B; we add a virtual colon so the measurement matches
+ * what the form actually prints). The shift is clamped to `0.6 *
+ * field.width` so even when the heuristic fires on a wrong label we
+ * never push past the bbox midpoint.
  */
+const LABEL_PREFIX_CANONICAL_IDS = new Set([
+  "creditCardHolder",
+  "billingAddress",
+  "ccv",
+  "cardholderSignature",
+  "creditCardNumber",
+  "phone",
+  "email",
+  "authorizationDate",
+  "cardType",
+]);
+
 function computePrefixLabelShiftX(
   field: TemplateField,
   font: any,
@@ -96,10 +123,23 @@ function computePrefixLabelShiftX(
   ) {
     return 0;
   }
+
   const printed = (field.printedLabel ?? "").trim();
   if (!printed) return 0;
-  if (!/[:：]\s*$/.test(printed)) return 0;
-  if (field.width < 100) return 0;
+
+  const endsWithColon = /[:：]\s*$/.test(printed);
+  const canonicalMatch =
+    typeof field.canonicalFieldId === "string" &&
+    LABEL_PREFIX_CANONICAL_IDS.has(field.canonicalFieldId);
+
+  // PATH A requires width ≥ 100pt; PATH B requires width ≥ 150pt
+  // (canonical-only paths are riskier, so we demand a wider bbox to
+  // reduce the chance of shifting a genuinely post-colon writable
+  // area). If neither gate is satisfied, no shift.
+  const widthOk =
+    (endsWithColon && field.width >= 100) ||
+    (canonicalMatch && field.width >= 150);
+  if (!widthOk) return 0;
 
   const ctx = (field.contextBefore ?? "").trim().toLowerCase();
   if (ctx.length > 0) {
@@ -113,7 +153,8 @@ function computePrefixLabelShiftX(
     }
   }
 
-  const labelWidth = font.widthOfTextAtSize(printed, fontSize);
+  const measureLabel = endsWithColon ? printed : `${printed}:`;
+  const labelWidth = font.widthOfTextAtSize(measureLabel, fontSize);
   const shift = labelWidth + 4;
   const ceiling = field.width * 0.6;
   return Math.min(shift, ceiling);
