@@ -3252,7 +3252,14 @@ function mergeStackedBillingAddress(fields: TemplateField[]): TemplateField[] {
       const prev = fields[cluster[cluster.length - 1]];
       const cur = fields[idx];
       const gap = cur.y - (prev.y + prev.height);
-      const slack = 1.5 * Math.min(prev.height, cur.height);
+      // v0.6.6 — widened the proximity envelope from 1.5× → 5× the
+      // smaller field height. The Arrow CC Authorization layout has
+      // ~12pt tall underlines spaced ~24-30pt apart (>1.5× threshold
+      // didn't fire, leaving two single-line widgets each rendering
+      // the address). We still cap at "5× heights AND ≤ 80pt" so we
+      // don't fuse a header billing-address with a totally unrelated
+      // signature-block billing-address far down the page.
+      const slack = Math.min(80, 5 * Math.min(prev.height, cur.height));
       if (gap <= slack) {
         cluster.push(idx);
       } else {

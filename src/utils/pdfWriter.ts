@@ -353,16 +353,17 @@ export async function writeFilledPdfBytes(
         });
       }
     } else {
-      // v0.6.5 — multiline-aware rendering. The vertical-centre baseline
-      // we use for single-line text fields drops the value into the
-      // middle of tall multi-line bboxes (e.g. the merged Billing
-      // Address block on the Arrow CC Authorization form), leaving the
-      // first physical line blank. For `multiline` fields we instead
-      // top-align (so a single-line value like a street address lands
-      // on the first underline next to the caption) and split the value
-      // on newlines so a multi-line value spreads down the bbox at
-      // ~1.25× line height.
-      const isMultiline = field.fieldKind === "multiline";
+      // v0.6.5 — multiline-aware rendering. v0.6.6 broadened the trigger
+      // from `fieldKind === "multiline"` to ALSO include any single-line
+      // field whose value contains an explicit newline. That covers the
+      // Arrow CC Authorization billing-address case where the
+      // `mergeStackedBillingAddress` pass didn't fire (gap was just
+      // outside threshold) so we still have two un-merged single-line
+      // widgets, and `composeMultilineAddress` produced
+      // `street\nCity, ST ZIP` — the second un-merged widget needs to
+      // render the second line of that value rather than truncating it.
+      const valueHasNewline = rawValue.includes("\n");
+      const isMultiline = field.fieldKind === "multiline" || valueHasNewline;
 
       if (isMultiline) {
         const lineHeightFactor = 1.25;
