@@ -1,5 +1,5 @@
 /**
- * Underline snap (v0.5.20).
+ * Underline snap (v0.5.21).
  *
  * Deterministic post-processor that nudges Gemini-detected text-field
  * bboxes so their BOTTOM EDGE sits exactly on the writable underline
@@ -28,35 +28,51 @@
  *
  * Three safety caps on the horizontal snap, all designed to fail
  * conservatively (leave x/width alone rather than invent a wrong
- * extent):
- *   - `maxHorizontalDeltaPoints` (30pt strict / 60pt relaxed) — if
- *     either edge would move more than this, abort. Mirrors
- *     `maxSnapPoints` for vertical. v0.5.20 made this cap
- *     overlap-aware: the per-edge limit DOUBLES (30 → 60pt) when
- *     the proposed new bbox interval substantially overlaps the
- *     original (≥ 50% on BOTH the old-side and new-side ratios —
- *     a "resize-to-fit": refining the edges of the SAME stroke
- *     the bbox is already on). When overlap is below 50% on
- *     either side ("relocate": moving onto a different stroke),
- *     the strict 30pt cap still applies. The old/new overlap
- *     check cleanly separates legitimate "Gemini got the
- *     centre right but mis-sized the bbox" cases from
- *     "run-walk escaped onto a neighbour underline" cases —
- *     a neighbour-jump has ~0% old-side overlap (different x
- *     range entirely), so it falls through to the strict cap.
+ * extent). v0.5.21 splits each cap by mode (resize-fit vs
+ * relocate); the relocate column matches v0.5.19's strict defaults,
+ * the resize-fit column matches the looser bounds the overlap
+ * rule has earned us:
+ *   - `maxHorizontalDeltaPoints` (relocate only) — if either edge
+ *     would move more than 30pt, abort. Mirrors `maxSnapPoints` for
+ *     vertical. In v0.5.21 this cap applies ONLY to relocate
+ *     candidates (< 50% bbox-interval overlap on either side —
+ *     the snap would be moving the bbox onto a DIFFERENT stroke).
+ *     Resize-fit candidates (≥ 50% old-vs-new overlap on BOTH
+ *     sides — refining the edges of the SAME stroke the bbox is
+ *     already on) skip the per-edge cap entirely: the overlap
+ *     rule is itself proof that the new run is the same stroke
+ *     the bbox sits on (a wrong-underline neighbour-jump has ~0%
+ *     old-side overlap and is automatically classified as
+ *     relocate, where the strict 30pt cap still applies). v0.5.20
+ *     attempted to absorb resize-fit deltas by doubling the cap
+ *     to 60pt, but real Gemini under-detection of left edges
+ *     can exceed 60pt on inline-row text fields (e.g. Print
+ *     Name on the v0.5.20 form: -70pt to -80pt left delta on a
+ *     run with 80%+ overlap). Removing the cap on resize-fit
+ *     trusts the overlap rule end-to-end and makes
+ *     `maxWidthRatio` the single active bound on runaway
+ *     extents.
  *   - `minWidthPoints` (12pt) — if the run is shorter than this, the
  *     center column is probably under a label glyph that happens to
  *     intersect the snap row, not on a real underline; abort. 12pt
  *     ≈ one or two characters of body text, well below any real
- *     fillable underline width. (Unchanged in v0.5.20; applies
- *     uniformly to both resize-fit and relocate.)
- *   - `maxWidthRatio` (1.5×) — if the run is more than 1.5× the
- *     original bbox width, abort. Prevents a short field (e.g.
- *     "Date") from being extended across an entire row's underline
- *     when the model meant only a fragment of it. (Unchanged in
- *     v0.5.20; applies uniformly to both resize-fit and relocate
- *     — the overlap-aware cap relaxes only the per-edge delta,
- *     never the new-vs-old width-ratio guard.)
+ *     fillable underline width. Applies uniformly to both
+ *     resize-fit and relocate (unchanged in v0.5.21).
+ *   - `maxWidthRatio` (resize-fit 2.0× / relocate 1.5×) — if the
+ *     run is more than this multiple of the original bbox width,
+ *     abort. Prevents a short field (e.g. "Date") from being
+ *     extended across an entire row's underline when the model
+ *     meant only a fragment of it. v0.5.21 raises the resize-fit
+ *     ratio to 2.0× because (a) with the per-edge cap removed on
+ *     resize-fit, this ratio is now the only thing standing
+ *     between us and a runaway extension across a connected
+ *     multi-segment underline, AND (b) Gemini routinely
+ *     under-detects width by 33–45% on real fields, so 1.5× was
+ *     clipping legitimate snaps. 2.0× absorbs the worst observed
+ *     under-detection without admitting an entire row's connected
+ *     underline (which would be ~3–4× the bbox width on dense
+ *     forms). Relocate keeps 1.5× — relocate is rare and we want
+ *     it to stay conservative.
  *
  * Why the dependency on a successful vertical snap: horizontal snap
  * needs a known stroke row to walk along. Without a vertical snap
@@ -201,6 +217,33 @@
  *   (`hSnappedResizeFit`, `hSnappedRelocate`) replace the
  *   single `hSnapped`; the per-page summary line surfaces
  *   the breakdown (`hSnap N/M (X fit, Y relocate)`).
+ *   v0.5.21 (this) — drops the per-edge cap entirely on
+ *   resize-fit and bumps `maxWidthRatio` (resize-fit only) from
+ *   1.5× → 2.0×. Real v0.5.20 evidence: Print Name on the Ruby
+ *   form has bbox `x=315.18, width=120.56` (centre 375.46) but
+ *   the actual underline starts ~235–245pt — a -70 to -80pt
+ *   left-edge delta. The run-walk correctly identifies the
+ *   underline (≥ 50% bbox-interval overlap on both sides ⇒
+ *   classified as resize-fit), but the v0.5.20 60pt cap rejects
+ *   it as `hSkippedTooFar`. The cap was redundant defense:
+ *   ≥ 50% overlap on both sides is itself proof we're on the
+ *   same stroke (a wrong-underline neighbour-jump has ~0%
+ *   old-side overlap, automatically falls into the relocate
+ *   branch, and is still capped at 30pt). With the per-edge
+ *   cap removed, `maxWidthRatio` becomes the active bound on
+ *   resize-fit; bumping it to 2.0× absorbs the observed
+ *   33–45% Gemini under-detection of width without admitting
+ *   an entire row's connected underline (those score ~3–4× the
+ *   bbox width and trip the 2.0× ratio). The relocate-mode
+ *   caps (30pt per-edge, 1.5× width) are unchanged — relocate
+ *   is rare and stays conservative. v0.5.21 also gates the
+ *   per-field snap log on `localStorage["typeset.debug.alignment"]`
+ *   (in addition to `import.meta.env.DEV`) so users on a
+ *   shipped production build can opt into per-field
+ *   diagnostics with the same flag they already use for
+ *   `[Typeset Align]` lines, without rebuilding from source.
+ *   The aggregate `[underlineSnap] snapped …` summary line
+ *   is unchanged and still always logs.
  *
  * Signatures are snap-eligible (added in v0.5.13). They follow the
  * same prompt rule (bottom edge on stroke), receive no detection-
@@ -392,38 +435,44 @@ export interface SnapOptions {
    */
   ambiguityGapPoints?: number;
   /**
-   * Baseline maximum distance (in PDF points) the horizontal snap
-   * may move EITHER the left or right edge of the bbox. Mirrors
-   * `maxSnapPoints` for the vertical snap: anything bigger is
-   * almost certainly the run-walk having escaped onto a different
-   * stroke (e.g. the underline of an adjacent field on the same
-   * row, joined to ours by a thin connecting line), so we leave
-   * `x`/`width` alone rather than drag the bbox into a wrong
-   * extent. Default: 30pt.
+   * Maximum per-edge delta (in PDF points) for relocate-mode
+   * horizontal snaps — i.e. snaps where the proposed new bbox
+   * interval overlaps < 50% of the original interval on either
+   * side ("we'd be moving the bbox onto a different stroke").
+   * Mirrors `maxSnapPoints` for the vertical snap: anything
+   * bigger is almost certainly the run-walk having escaped onto
+   * a wrong stroke (e.g. the underline of an adjacent field on
+   * the same row, joined to ours by a thin connecting line), so
+   * we leave `x`/`width` alone rather than drag the bbox into a
+   * wrong extent. Default: 30pt.
    *
-   * 30pt is generous: the worst-observed Gemini drift on a normal
-   * label is ~20pt, and 30pt easily absorbs that while still
-   * rejecting whole-row extensions on a US-Letter form (typical
-   * row underlines are 80-300pt wide, far past this cap on
-   * either side).
+   * 30pt is generous on relocate: the worst-observed Gemini drift
+   * on a normal label is ~20pt, and 30pt easily absorbs that
+   * while still rejecting whole-row extensions on a US-Letter
+   * form (typical row underlines are 80-300pt wide, far past
+   * this cap on either side).
    *
-   * v0.5.20 made the cap overlap-aware: this option remains the
-   * STRICT cap used for "relocate" candidates (snaps where the
-   * proposed new bbox interval overlaps < 50% of the original
-   * interval on either side — the snap would be moving the bbox
-   * onto a different stroke). For "resize-to-fit" candidates
-   * (≥ 50% old-vs-new interval overlap on BOTH sides — refining
-   * the edges of the same stroke the bbox is already on) the
-   * effective cap doubles to `2 × maxHorizontalDeltaPoints` (60pt
-   * by default). 60pt absorbs the worst real edge misalignments
-   * we've observed on resize-fit cases (Print Name on the
-   * v0.5.19 test form was 55pt) while still rejecting truly
-   * runaway edges; the `maxWidthRatio` and `minWidthPoints` caps
-   * continue to apply uniformly so that even a relaxed edge cap
-   * cannot extend across a multi-segment connected line.
+   * v0.5.21 narrowed the scope of this cap to relocate ONLY.
+   * Resize-fit candidates (≥ 50% old-vs-new interval overlap on
+   * BOTH sides — refining the edges of the same stroke the bbox
+   * is already on) skip the per-edge cap entirely: the overlap
+   * rule is itself the proof that the new run is the same stroke
+   * the bbox sits on, so the cap is redundant defense. Real
+   * Gemini under-detection of left/right edges on inline-row
+   * text fields exceeds the v0.5.20 60pt resize-fit cap (Print
+   * Name on the v0.5.20 Ruby form: -70 to -80pt left-edge
+   * delta), and the only thing the cap was doing was rejecting
+   * legitimate snaps. With it gone on resize-fit, `maxWidthRatio`
+   * is the single active bound (resize-fit 2.0× / relocate 1.5×)
+   * — runaway extensions across a connected multi-segment line
+   * trip the ratio at ~3–4× regardless of how big a per-edge
+   * delta the cap removal would otherwise allow.
    *
-   * Introduced in v0.5.19 alongside the horizontal snap;
-   * overlap-aware doubling added in v0.5.20.
+   * v0.5.19 introduced this alongside the horizontal snap with a
+   * uniform 30pt cap. v0.5.20 made the cap overlap-aware
+   * (relocate 30pt / resize-fit 60pt). v0.5.21 (current) drops
+   * the resize-fit branch entirely; relocate keeps the strict
+   * 30pt default.
    */
   maxHorizontalDeltaPoints?: number;
   /**
@@ -443,9 +492,9 @@ export interface SnapOptions {
    */
   minWidthPoints?: number;
   /**
-   * Maximum ratio of new horizontal-snap width to the original bbox
-   * width. If the run is more than `maxWidthRatio × original
-   * width`, abort. Default: 1.5.
+   * Maximum ratio of new horizontal-snap width to the original
+   * bbox width, FOR RELOCATE-MODE snaps. If the run is more than
+   * `maxWidthRatio × original width`, abort. Default: 1.5.
    *
    * Prevents a short field (e.g. "Date") from being extended across
    * an entire row's underline when the row is one continuous stroke
@@ -456,14 +505,37 @@ export interface SnapOptions {
    * `minWidthPoints` cap above handles the case where the run is
    * just a glyph slice.
    *
-   * Introduced in v0.5.19 alongside the horizontal snap.
+   * v0.5.21 SPLIT this cap by mode. For resize-fit candidates the
+   * effective cap is 2.0× (hard-coded inside `tryHorizontalSnap`,
+   * not exposed as an option). The 1.5× → 2.0× bump matters
+   * because (a) v0.5.21 removed the per-edge cap on resize-fit,
+   * making this ratio the only active runaway-extent bound, and
+   * (b) Gemini routinely under-detects width by 33–45% on real
+   * text fields, so 1.5× was rejecting legitimate snaps. 2.0×
+   * absorbs the observed under-detection without admitting an
+   * entire row's connected underline (those score ~3–4× the bbox
+   * width). Relocate keeps 1.5× — relocate is rare and stays
+   * conservative.
+   *
+   * Introduced in v0.5.19 alongside the horizontal snap; mode
+   * split added in v0.5.21.
    */
   maxWidthRatio?: number;
   /**
-   * If true AND the build is in development mode (`import.meta.env.DEV`),
-   * log per-field snap decisions to the console. Used by the
-   * detector's diagnostic dumps and ignored in production builds so
-   * shipping bundles stay quiet.
+   * If true, log per-field snap decisions to the console when
+   * EITHER `localStorage["typeset.debug.alignment"] === "true"` OR
+   * the build is in DEV mode (`import.meta.env.DEV`). The
+   * localStorage opt-in (added in v0.5.21) lets users on a
+   * shipped production bundle diagnose alignment issues with the
+   * same flag that already gates the `[Typeset Align]` lines,
+   * without rebuilding from source. Used by the detector's
+   * diagnostic dumps; the call sites pass `verbose: true`
+   * unconditionally and the localStorage gate keeps shipping
+   * bundles quiet for users who haven't opted in.
+   *
+   * The aggregate `[underlineSnap] snapped …` summary line is
+   * unconditional and ignores both this flag and the
+   * localStorage opt-in.
    */
   verbose?: boolean;
 }
@@ -535,18 +607,21 @@ interface SnapCounts {
   skippedNonText: number;
   skippedNoPage: number;
   /**
-   * v0.5.20: horizontal snap fired AND the new run substantially
+   * Horizontal snap fired AND the new run substantially
    * overlapped (≥ 50% on both old and new) the original bbox —
-   * we were refining edges of the same stroke, so a relaxed
-   * (2× default) per-edge cap was used.
+   * we were refining edges of the same stroke. v0.5.21: no
+   * per-edge cap on resize-fit (the overlap rule subsumes it);
+   * the 2.0× width-ratio bound is the only active runaway-extent
+   * guard.
    */
   hSnappedResizeFit: number;
   /**
-   * v0.5.20: horizontal snap fired AND the new run did NOT
-   * substantially overlap the original bbox — we'd be moving the
-   * bbox onto a different stroke. Strict per-edge cap was used.
-   * Rare in practice because the run-walk anchors at the bbox
-   * center, so a relocate that survives the cap is unusual.
+   * Horizontal snap fired AND the new run did NOT substantially
+   * overlap the original bbox — we'd be moving the bbox onto a
+   * different stroke. Strict per-edge cap (30pt default) and
+   * 1.5× width-ratio cap apply. Rare in practice because the
+   * run-walk anchors at the bbox center, so a relocate that
+   * survives both caps is unusual.
    */
   hSnappedRelocate: number;
   hSkippedNoStroke: number;
@@ -568,15 +643,37 @@ interface StrokeCandidate {
 
 /**
  * True iff per-field verbose logging should print. Per-field logs
- * are gated by BOTH the `verbose` option AND the build mode so
- * that production bundles are silent regardless of how the option
- * is plumbed through.
+ * are gated by `opts.verbose` AND one of two opt-ins: the
+ * typeset-wide alignment debug flag in localStorage (preferred —
+ * users on a production build can flip it from DevTools without
+ * rebuilding) OR the Vite-injected `import.meta.env.DEV` boolean
+ * (true in development bundles, baked false in production
+ * bundles). The localStorage check runs first so a user with the
+ * flag set sees per-field decisions even on a release build.
+ *
+ * v0.5.21: previously the gate was `opts.verbose && DEV` only, so
+ * production bundles were unconditionally quiet — users had to
+ * rebuild from source to diagnose snap behaviour. The aggregate
+ * `[underlineSnap] snapped …` summary line is logged
+ * unconditionally and is unaffected by this gate.
  */
 function verboseLogEnabled(opts: Required<SnapOptions>): boolean {
   if (!opts.verbose) return false;
+  try {
+    if (
+      typeof localStorage !== "undefined" &&
+      localStorage.getItem("typeset.debug.alignment") === "true"
+    ) {
+      return true;
+    }
+  } catch {
+    // localStorage may be inaccessible (e.g. SSR or sandboxed
+    // contexts). Fall through to the DEV check.
+  }
   // Vite injects `import.meta.env.DEV` as a boolean literal at
   // build time; in production builds the whole branch tree-shakes
-  // away, which is exactly what we want.
+  // away — the localStorage check above is what surfaces logs in
+  // shipped bundles.
   try {
     return import.meta.env?.DEV === true;
   } catch {
@@ -782,12 +879,12 @@ function logDecision(
 }
 
 /**
- * Horizontal underline snap (v0.5.19, overlap-aware cap v0.5.20).
+ * Horizontal underline snap (v0.5.19, mode-aware caps v0.5.21).
  * Called from {@link snapOneField} ONLY after a successful vertical
  * snap, with `strokeRow` being the image row the vertical snap
  * chose. Returns the new `{ x, width }` in PDF points if the snap
- * fires, or `null` if any of the four skip gates trips (in which
- * case the caller leaves x/width alone).
+ * fires, or `null` if any skip gate trips (in which case the
+ * caller leaves x/width alone).
  *
  * The algorithm:
  *   1. Find the continuous dark-pixel run on `strokeRow` that
@@ -806,28 +903,33 @@ function logDecision(
  *          `[newX, newX + newWidth]` and the two ratios
  *          `overlapWidth/oldWidth` and `overlapWidth/newWidth`.
  *        - If BOTH ratios ≥ 0.5 → "resize-to-fit" (we're refining
- *          the same stroke the bbox is already on). Effective
- *          per-edge cap = `2 × maxHorizontalDeltaPoints`.
- *        - Otherwise → "relocate" (we'd be moving onto a
- *          different stroke, which is risky). Effective per-edge
- *          cap = `maxHorizontalDeltaPoints` (the strict
- *          v0.5.19 default).
- *   4. Apply three safety caps in order:
- *        - `effectiveDeltaCap` from step 3 (`hSkippedTooFar`):
- *          either edge moving > the (mode-dependent) cap means
- *          the run-walk likely escaped onto an adjacent stroke
- *          OR — for resize-to-fit — that the proposed extension
- *          is implausibly far.
- *        - `minWidthPoints` (`hSkippedTooNarrow`): a run shorter
- *          than N pt is probably under a label glyph crossing
- *          the snap row, not on a real underline. Applies
- *          uniformly to both modes.
- *        - `maxWidthRatio` (`hSkippedTooWide`): a run wider than
- *          N× the original bbox almost certainly means the bbox
- *          was meant for a fragment of a continuous row underline,
- *          not the whole row. Applies uniformly to both modes —
- *          this is what stops a relaxed edge cap from extending
- *          a resize-to-fit across a multi-segment connected line.
+ *          the edges of the SAME stroke the bbox is already on).
+ *        - Otherwise → "relocate" (we'd be moving onto a different
+ *          stroke, which is risky).
+ *   4. Apply safety caps:
+ *        - `minWidthPoints` (`hSkippedTooNarrow`): applies in BOTH
+ *          modes. A run shorter than 12pt (default) is probably
+ *          under a label glyph crossing the snap row, not a real
+ *          underline.
+ *        - `maxWidthRatio` (`hSkippedTooWide`): mode-dependent.
+ *          Resize-fit uses 2.0× (hard-coded), relocate uses the
+ *          option default 1.5×. A run wider than this multiple of
+ *          the original almost certainly means the bbox was meant
+ *          for a fragment of a continuous row underline. v0.5.21
+ *          made this the single active runaway-extent bound on
+ *          resize-fit.
+ *        - `maxHorizontalDeltaPoints` (`hSkippedTooFar`): RELOCATE
+ *          ONLY. Resize-fit candidates skip the per-edge cap
+ *          entirely — the ≥ 50% overlap rule is itself the
+ *          proof that the new run is the same stroke the bbox
+ *          sits on; a wrong-underline neighbour-jump has ~0%
+ *          old-side overlap and is automatically classified as
+ *          relocate, where the strict 30pt cap still applies.
+ *          v0.5.20 had a relaxed 60pt resize-fit cap, but real
+ *          Gemini under-detection of left edges on inline-row
+ *          fields exceeds 60pt (Print Name on the v0.5.20 Ruby
+ *          form: -70 to -80pt), so the cap was rejecting
+ *          legitimate snaps it had no other reason to gate.
  *
  * Skip list — signatures are excluded BEFORE step 1. Their
  * underlines are intentionally extensible (the writer assumes the
@@ -889,36 +991,52 @@ function tryHorizontalSnap(
   const leftDeltaPt = newX - oldX;
   const rightDeltaPt = newRight - oldRight;
 
-  // v0.5.20: overlap-aware per-edge cap. Classify the snap as
-  // either "resize-to-fit" (the new run substantially overlaps the
-  // original bbox — we're refining edges of the SAME stroke the
-  // bbox is already on) or "relocate" (little/no overlap — we'd be
-  // moving the bbox onto a DIFFERENT stroke, which is risky and
-  // usually wrong). Real evidence motivating this split: v0.5.19's
-  // strict 30pt cap rejected the bottom-row "Print Name" field on
-  // the test form even though the run-walk correctly identified
-  // its underline — Gemini's bbox started 55pt right of the actual
-  // left edge but sat squarely on the right portion of the same
-  // stroke, so a 55pt left-edge delta legitimately needed to fire.
+  // v0.5.20–v0.5.21: classify the snap as either "resize-to-fit"
+  // (the new run substantially overlaps the original bbox —
+  // we're refining edges of the SAME stroke the bbox is already
+  // on) or "relocate" (little/no overlap — we'd be moving the
+  // bbox onto a DIFFERENT stroke, which is risky and usually
+  // wrong). The classification controls which safety caps fire:
+  //   - resize-fit: NO per-edge cap (overlap rule subsumes it),
+  //                 width ratio bound at 2.0×.
+  //   - relocate:   strict 30pt per-edge cap, width ratio
+  //                 bound at the option default 1.5×.
   //
   // Detection rule: ≥ 50% overlap on BOTH the old and new
   // intervals. Both sides matter — a wrong-underline neighbour-
   // jump has ~0% old-side overlap (the new run is in a different
   // x range entirely), and a runaway extension across a multi-
-  // segment connected line has ~old-width / new-width new-side
+  // segment connected line has `oldWidth / newWidth` new-side
   // overlap that drops below 0.5 once the new run is more than
   // 2× the old. 50% on both sides cleanly separates "we're
   // refining the same stroke" from "we'd be jumping onto a new
   // stroke" / "we'd be ballooning past the original extent".
   //
-  // For resize-to-fit, the per-edge cap doubles (30pt → 60pt by
-  // default). 60pt absorbs the worst real misalignments observed
-  // (Print Name was 55pt) while still rejecting truly runaway
-  // edges. The other two caps (`minWidthPoints`, `maxWidthRatio`)
-  // continue to apply uniformly, so a resize-to-fit can't
-  // arbitrarily extend across a multi-segment connected line
-  // (those trip `maxWidthRatio` regardless of how big a delta the
-  // edge cap allows).
+  // Why no per-edge cap on resize-fit (v0.5.21): the ≥ 50%
+  // bbox-interval overlap on BOTH sides is itself the geometric
+  // proof that the new run shares the same stroke the bbox sits
+  // on. A "wrong stroke" snap (neighbour-jump or runaway
+  // extension) cannot satisfy both overlap halves: it either has
+  // ~0% old-side overlap (entirely different x range) or its new
+  // run is wider than ~2× the old (so new-side overlap drops
+  // below 0.5). Either way it falls into the relocate branch,
+  // where the strict 30pt cap still applies. With the cap
+  // removed on resize-fit, `maxWidthRatio` (2.0× for resize-fit)
+  // is the only thing keeping a single fragment from being
+  // extended across a connected multi-segment underline; 2.0× is
+  // tight enough to gate that — connected multi-segment runs
+  // routinely measure 3–4× the original fragment width on dense
+  // forms — while loose enough to absorb Gemini's observed
+  // 33–45% width under-detection on real text fields.
+  //
+  // Real evidence motivating the cap removal: Print Name on the
+  // v0.5.20 Ruby form had bbox `x=315.18, width=120.56`
+  // (centre 375.46) but the actual underline starts ~235–245pt,
+  // a -70 to -80pt left-edge delta. The bbox-interval overlap
+  // was ~80%+ on both sides (resize-fit), but the v0.5.20 60pt
+  // cap rejected it. With the cap gone, the snap fires; the
+  // 2.0× width-ratio bound still rejects the case where the
+  // run-walk escapes onto a connected adjacent fragment.
   const overlapLeft = Math.max(oldX, newX);
   const overlapRight = Math.min(oldRight, newRight);
   const overlapWidth = Math.max(0, overlapRight - overlapLeft);
@@ -926,59 +1044,69 @@ function tryHorizontalSnap(
   const overlapRatioNew = newWidth > 0 ? overlapWidth / newWidth : 0;
   const isResizeToFit = overlapRatioOld >= 0.5 && overlapRatioNew >= 0.5;
 
-  const effectiveDeltaCap = isResizeToFit
-    ? opts.maxHorizontalDeltaPoints * 2
-    : opts.maxHorizontalDeltaPoints;
   const mode: "resizeFit" | "relocate" = isResizeToFit
     ? "resizeFit"
     : "relocate";
+  // Resize-fit gets a looser 2.0× width-ratio bound (hard-coded;
+  // see module header for rationale). Relocate uses the option
+  // default 1.5× — relocate is rare and stays conservative.
+  const widthRatioCap = isResizeToFit ? 2.0 : opts.maxWidthRatio;
 
-  // Cap 1: per-edge delta against `effectiveDeltaCap`. For
-  // resize-to-fit we trust larger deltas (we already know the new
-  // run shares ≥ 50% of its space with the old bbox); for
-  // relocate we keep the strict 30pt default — a relocate-style
-  // snap is the run-walk having escaped onto an adjacent stroke
-  // far more often than not.
-  if (
-    Math.abs(leftDeltaPt) > effectiveDeltaCap ||
-    Math.abs(rightDeltaPt) > effectiveDeltaCap
-  ) {
-    counts.hSkippedTooFar += 1;
-    if (wantLog) {
-      console.log(
-        `[underlineSnap] field=${field.id} hSnap=skipped:too-far mode=${mode} effectiveCap=${effectiveDeltaCap}pt (leftΔ=${leftDeltaPt.toFixed(2)}pt rightΔ=${rightDeltaPt.toFixed(2)}pt > ±${effectiveDeltaCap}pt, overlapOld=${overlapRatioOld.toFixed(2)} overlapNew=${overlapRatioNew.toFixed(2)})`
-      );
-    }
-    return null;
-  }
-
-  // Cap 2: minWidthPoints — a run shorter than 12pt (default) is
+  // Cap 1: minWidthPoints — a run shorter than 12pt (default) is
   // probably under a label glyph that happens to intersect the
   // snap row, not a real underline. Real fillable underlines are
-  // wider than this even for single-character entries.
+  // wider than this even for single-character entries. Applies
+  // uniformly to both modes.
   if (newWidth < opts.minWidthPoints) {
     counts.hSkippedTooNarrow += 1;
     if (wantLog) {
       console.log(
-        `[underlineSnap] field=${field.id} hSnap=skipped:too-narrow (newWidth=${newWidth.toFixed(2)}pt < ${opts.minWidthPoints}pt)`
+        `[underlineSnap] field=${field.id} hSnap=skipped:too-narrow mode=${mode} (newWidth=${newWidth.toFixed(2)}pt < ${opts.minWidthPoints}pt)`
       );
     }
     return null;
   }
 
-  // Cap 3: maxWidthRatio — a run more than 1.5× (default) the
-  // original bbox width almost certainly means the bbox was meant
-  // for a fragment of a continuous row underline (e.g. a "Date"
-  // segment of a long combined line). Extending across the whole
-  // row would overlap adjacent fields and damage the layout.
-  if (newWidth > field.width * opts.maxWidthRatio) {
+  // Cap 2: maxWidthRatio — a run more than `widthRatioCap` ×
+  // (resize-fit 2.0× / relocate 1.5×) the original bbox width
+  // almost certainly means the bbox was meant for a fragment of
+  // a continuous row underline (e.g. a "Date" segment of a long
+  // combined line). Extending across the whole row would overlap
+  // adjacent fields and damage the layout. This is the single
+  // active runaway-extent bound on resize-fit (v0.5.21 dropped
+  // the per-edge cap on resize-fit, see classification block
+  // above); it backstops both modes uniformly.
+  if (newWidth > oldWidth * widthRatioCap) {
     counts.hSkippedTooWide += 1;
     if (wantLog) {
       console.log(
-        `[underlineSnap] field=${field.id} hSnap=skipped:too-wide (newWidth=${newWidth.toFixed(2)}pt > ${(field.width * opts.maxWidthRatio).toFixed(2)}pt = ${opts.maxWidthRatio}× original ${field.width.toFixed(2)}pt)`
+        `[underlineSnap] field=${field.id} hSnap=skipped:too-wide mode=${mode} widthRatioCap=${widthRatioCap.toFixed(1)}× (newWidth=${newWidth.toFixed(2)}pt > ${(oldWidth * widthRatioCap).toFixed(2)}pt = ${widthRatioCap.toFixed(1)}× original ${oldWidth.toFixed(2)}pt)`
       );
     }
     return null;
+  }
+
+  // Cap 3: per-edge delta — RELOCATE ONLY (v0.5.21). Resize-fit
+  // candidates skip this cap entirely; the ≥ 50% overlap rule is
+  // itself proof we're on the same stroke (any wrong-stroke snap
+  // — neighbour-jump or runaway extension — fails the overlap
+  // rule and falls into the relocate branch). For relocate, a
+  // run that pushes either edge past the strict 30pt default is
+  // almost always the run-walk having escaped onto an adjacent
+  // stroke, so we abort.
+  if (mode === "relocate") {
+    if (
+      Math.abs(leftDeltaPt) > opts.maxHorizontalDeltaPoints ||
+      Math.abs(rightDeltaPt) > opts.maxHorizontalDeltaPoints
+    ) {
+      counts.hSkippedTooFar += 1;
+      if (wantLog) {
+        console.log(
+          `[underlineSnap] field=${field.id} hSnap=skipped:too-far mode=${mode} cap=${opts.maxHorizontalDeltaPoints}pt (leftΔ=${leftDeltaPt.toFixed(2)}pt rightΔ=${rightDeltaPt.toFixed(2)}pt > ±${opts.maxHorizontalDeltaPoints}pt, overlapOld=${overlapRatioOld.toFixed(2)} overlapNew=${overlapRatioNew.toFixed(2)})`
+        );
+      }
+      return null;
+    }
   }
 
   if (isResizeToFit) {
@@ -988,7 +1116,7 @@ function tryHorizontalSnap(
   }
   if (wantLog) {
     console.log(
-      `[underlineSnap] field=${field.id} hSnap=snapped mode=${mode} (x: ${oldX.toFixed(2)}→${newX.toFixed(2)}pt [Δ=${leftDeltaPt.toFixed(2)}pt], width: ${oldWidth.toFixed(2)}→${newWidth.toFixed(2)}pt, right: ${oldRight.toFixed(2)}→${newRight.toFixed(2)}pt [Δ=${rightDeltaPt.toFixed(2)}pt], overlapOld=${overlapRatioOld.toFixed(2)} overlapNew=${overlapRatioNew.toFixed(2)}, runPx=[${run.leftPx},${run.rightPx}])`
+      `[underlineSnap] field=${field.id} hSnap=snapped mode=${mode} widthRatioCap=${widthRatioCap.toFixed(1)}× (x: ${oldX.toFixed(2)}→${newX.toFixed(2)}pt [Δ=${leftDeltaPt.toFixed(2)}pt], width: ${oldWidth.toFixed(2)}→${newWidth.toFixed(2)}pt, right: ${oldRight.toFixed(2)}→${newRight.toFixed(2)}pt [Δ=${rightDeltaPt.toFixed(2)}pt], overlapOld=${overlapRatioOld.toFixed(2)} overlapNew=${overlapRatioNew.toFixed(2)}, runPx=[${run.leftPx},${run.rightPx}])`
     );
   }
 
