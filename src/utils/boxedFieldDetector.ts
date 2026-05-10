@@ -360,17 +360,74 @@ function emissionForBox(
   };
 }
 
-function bboxesOverlap(
+function intersectionArea(
   a: { x: number; y: number; width: number; height: number },
-  b: { x: number; y: number; width: number; height: number },
-  tolPt: number
-): boolean {
-  return (
-    Math.abs(a.x - b.x) <= tolPt &&
-    Math.abs(a.y - b.y) <= tolPt &&
-    Math.abs(a.x + a.width - (b.x + b.width)) <= tolPt + 20 &&
-    Math.abs(a.y + a.height - (b.y + b.height)) <= tolPt + 12
-  );
+  b: { x: number; y: number; width: number; height: number }
+): number {
+  const ix1 = Math.max(a.x, b.x);
+  const iy1 = Math.max(a.y, b.y);
+  const ix2 = Math.min(a.x + a.width, b.x + b.width);
+  const iy2 = Math.min(a.y + a.height, b.y + b.height);
+  const w = Math.max(0, ix2 - ix1);
+  const h = Math.max(0, iy2 - iy1);
+  return w * h;
+}
+
+/**
+ * Pair a Gemini field bbox to a boxed-cell label rect. Combines IoU with
+ * label-coverage so narrow label rows still score well when the model drew
+ * a tall box that fully covers the label strip.
+ */
+function labelFieldMatchScore(
+  field: { x: number; y: number; width: number; height: number },
+  label: { x: number; y: number; width: number; height: number }
+): number {
+  const inter = intersectionArea(field, label);
+  if (inter <= 0) return 0;
+  const aLabel = Math.max(1e-6, label.width * label.height);
+  const aField = Math.max(1e-6, field.width * field.height);
+  const union = aLabel + aField - inter;
+  const iou = union > 0 ? inter / union : 0;
+  const labelCover = inter / aLabel;
+  return Math.max(iou, labelCover);
+}
+
+const MIN_LABEL_FIELD_MATCH = 0.22;
+
+function findBestFieldIndexForBoxedLabel(
+  fields: TemplateField[],
+  page: number,
+  labelRect: { x: number; y: number; width: number; height: number },
+  consumed: Set<number>
+): { idx: number; score: number } {
+  let best = -1;
+  let bestScore = 0;
+  for (let i = 0; i < fields.length; i++) {
+    if (consumed.has(i)) continue;
+    const f = fields[i];
+    if (f.pageNumber !== page) continue;
+    if (
+      f.fieldKind === "option-group" ||
+      f.fieldKind === "checkbox-group" ||
+      f.fieldKind === "boolean-checkbox" ||
+      f.fieldType === "option-group" ||
+      f.fieldType === "checkbox"
+    ) {
+      continue;
+    }
+    const s = labelFieldMatchScore(
+      { x: f.x, y: f.y, width: f.width, height: f.height },
+      labelRect
+    );
+    if (s > bestScore) {
+      bestScore = s;
+      best = i;
+    }
+  }
+  if (best < 0 || bestScore < MIN_LABEL_FIELD_MATCH) {
+    return { idx: -1, score: 0 };
+  }
+  return { idx: best, score: bestScore };
 }
 
 export interface BoxedFieldDetectorTextSource {
@@ -417,23 +474,22 @@ export function annotateBoxedFields(
   let replaced = 0;
   let added = 0;
 
-  for (const e of emissions) {
-    // Find an existing field whose bbox overlaps the LABEL portion
-    // of the box. A field whose bbox covers the label is a candidate
-    // for replacement (Gemini latched onto the label location and
-    // produced a wide bbox bleeding to the right).
-    const idx = out.findIndex(
-      (f) =>
-        f.pageNumber === e.page &&
-        bboxesOverlap(
-          { x: f.x, y: f.y, width: f.width, height: f.height },
-          e.labelRect,
-          opts.overlapTolPt
-        )
+  const consumed = new Set<number>();
+  const sortedEmissions = [...emissions].sort(
+    (a, b) => a.page - b.page || a.labelRect.y - b.labelRect.y
+  );
+
+  for (const e of sortedEmissions) {
+    const { idx } = findBestFieldIndexForBoxedLabel(
+      out,
+      e.page,
+      e.labelRect,
+      consumed
     );
 
     if (idx >= 0) {
       const existing = out[idx];
+      consumed.add(idx);
       out[idx] = {
         ...existing,
         x: e.writableRect.x,

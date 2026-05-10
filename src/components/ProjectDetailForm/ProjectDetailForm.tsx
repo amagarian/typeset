@@ -1,5 +1,6 @@
 import { useCallback, useRef } from "react";
 import type { Project, CreditCardType } from "@/types";
+import { trimSignatureDataUrl } from "@/utils/signatureImageTrim";
 import styles from "./ProjectDetailForm.module.css";
 
 interface ProjectDetailFormProps {
@@ -184,6 +185,7 @@ export function ProjectDetailForm({ project, onChange, readOnly, onSignatureErro
         onSignatureError?.("Could not read signature image. Please try again.");
       };
       reader.onload = () => {
+        void (async () => {
         const result = reader.result;
         if (typeof result !== "string") {
           onSignatureError?.("Could not read signature image. Please try again.");
@@ -203,6 +205,7 @@ export function ProjectDetailForm({ project, onChange, readOnly, onSignatureErro
         if (file.type === "image/svg+xml") {
           const img = new Image();
           img.onload = () => {
+            void (async () => {
             const targetW = 1024;
             const aspect = img.height / Math.max(img.width, 1);
             const targetH = Math.max(1, Math.round(targetW * aspect));
@@ -217,12 +220,14 @@ export function ProjectDetailForm({ project, onChange, readOnly, onSignatureErro
             ctx.drawImage(img, 0, 0, targetW, targetH);
             try {
               const pngDataUrl = canvas.toDataURL("image/png");
+              const trimmed = await trimSignatureDataUrl(pngDataUrl);
               onChange({
-                signatureImage: { dataUrl: pngDataUrl, uploadedAt: Date.now() },
+                signatureImage: { dataUrl: trimmed, uploadedAt: Date.now() },
               });
             } catch {
               onSignatureError?.("Could not convert SVG to PNG. Try uploading a PNG instead.");
             }
+            })();
           };
           img.onerror = () => {
             onSignatureError?.("Could not load SVG signature. Try a PNG instead.");
@@ -231,9 +236,15 @@ export function ProjectDetailForm({ project, onChange, readOnly, onSignatureErro
           return;
         }
 
-        onChange({
-          signatureImage: { dataUrl: result, uploadedAt: Date.now() },
-        });
+        try {
+          const trimmed = await trimSignatureDataUrl(result);
+          onChange({
+            signatureImage: { dataUrl: trimmed, uploadedAt: Date.now() },
+          });
+        } catch {
+          onSignatureError?.("Could not process signature image. Try another file.");
+        }
+        })();
       };
       reader.readAsDataURL(file);
     },

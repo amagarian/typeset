@@ -9,6 +9,8 @@ import {
 } from "@/utils/fill";
 import { normalizeCardTypeLabel } from "@/utils/fieldCatalog";
 
+import { trimSignatureDataUrl } from "@/utils/signatureImageTrim";
+
 function isCheckboxField(field: TemplateField): boolean {
   return (
     field.fieldType === "checkbox" ||
@@ -19,8 +21,9 @@ function isCheckboxField(field: TemplateField): boolean {
 
 function isSignatureField(field: TemplateField): boolean {
   return (
-    field.mappedProjectKey === "cardholderSignature" ||
-    field.fieldKind === "signature"
+    field.fieldKind === "signature" ||
+    field.canonicalFieldId === "cardholderSignature" ||
+    field.mappedProjectKey === "cardholderSignature"
   );
 }
 
@@ -106,10 +109,11 @@ export async function writeFilledPdfBytes(
   if (project.signatureImage?.dataUrl) {
     const dataUrl = project.signatureImage.dataUrl;
     try {
-      const commaIdx = dataUrl.indexOf(",");
+      const trimmed = await trimSignatureDataUrl(dataUrl);
+      const commaIdx = trimmed.indexOf(",");
       if (commaIdx > 0) {
-        const meta = dataUrl.slice(0, commaIdx);
-        const b64 = dataUrl.slice(commaIdx + 1);
+        const meta = trimmed.slice(0, commaIdx);
+        const b64 = trimmed.slice(commaIdx + 1);
         const isPng = /image\/png/i.test(meta);
         const isJpeg = /image\/jpe?g/i.test(meta);
         if (isPng || isJpeg) {
@@ -320,18 +324,12 @@ export async function writeFilledPdfBytes(
         const availH = Math.max(1, field.height - 2 * insetY);
         const imgW = signatureImagePdf.width;
         const imgH = signatureImagePdf.height;
-        const aspect = imgW / Math.max(imgH, 1);
-        let drawW = availW;
-        let drawH = drawW / aspect;
-        if (drawH > availH) {
-          drawH = availH;
-          drawW = drawH * aspect;
-        }
-        // Centre horizontally within the field width; align the
-        // image's bottom roughly with the field's text baseline so
-        // a flat-bottom signature sits on the underline like a
-        // typed signature would.
+        const contain = Math.min(availW / Math.max(imgW, 1), availH / Math.max(imgH, 1));
+        const scale = Math.max(0.05, Math.min(1, contain * 0.94));
+        const drawW = imgW * scale;
+        const drawH = imgH * scale;
         const drawX = x + (field.width - drawW) / 2;
+        // Bottom-align inside the field so the ink sits on the signature line.
         const drawY = yPdfBottom + insetY;
         page.drawImage(signatureImagePdf, {
           x: drawX,
