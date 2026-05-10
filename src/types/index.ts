@@ -68,6 +68,44 @@ export interface FieldOption {
     width: number;
     height: number;
   };
+  /**
+   * v0.5.36 — true when this option has a writable blank (typically
+   * a short underscore or drawn underline) immediately to the LEFT
+   * of the printed label, e.g. `___ Visa  ___ Mastercard  ___ Amex`.
+   * Detected per-option from the raster of the page during the
+   * detection pipeline (see `optionBlankDetector.ts`). When true,
+   * the form filler draws an X glyph centred on `blankRect` instead
+   * of the v0.5.25 hand-drawn-style oval around the label —
+   * matching how a human marks an underline-selector form.
+   *
+   * Per-option (NOT per-field) because malformed groups can mix
+   * styles: some options may have detectable blanks and some may
+   * not. The renderer falls back to circle-around-label for any
+   * option where this is false / undefined, preserving the v0.5.25
+   * inline-checkbox/button-style behaviour.
+   */
+  hasUnderlineBlank?: boolean;
+  /**
+   * v0.5.36 — when {@link hasUnderlineBlank} is true, the rectangle
+   * (PDF user-space pt) where the X glyph should be drawn. Sized so
+   * the X sits centred over the detected underline stroke, with the
+   * rect's BOTTOM edge resting on the stroke (text-baseline
+   * geometry — same convention as `TemplateField.y` storage and the
+   * `bbox_bottom == strokeRow` snap target in `underlineSnap.ts`).
+   * Width matches the stroke's actual horizontal extent; height is
+   * set to the option label's local row height so the X arms have
+   * room to render visibly.
+   *
+   * Only meaningful when `hasUnderlineBlank` is true. Drag/resize
+   * scaling in `DraggableField.tsx` translates this rect in lockstep
+   * with both the parent field rect and the option's `bbox`.
+   */
+  blankRect?: {
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+  };
 }
 
 export type TemplateFieldSource =

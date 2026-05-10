@@ -98,6 +98,7 @@ import {
   snapFieldsToUnderlines,
   type PageRender,
 } from "@/utils/underlineSnap";
+import { annotateOptionGroupBlanks } from "@/utils/optionBlankDetector";
 
 export {
   GeminiNotConfiguredError as ClaudeNotConfiguredError, // back-compat alias
@@ -2955,8 +2956,17 @@ async function detectFieldsImpl(
     const snapped = snapFieldsToUnderlines(pass1.fields, pageRenders, {
       verbose: true,
     });
-    onStatus?.(`Gemini detected ${snapped.length} field(s).`, 1);
-    return snapped;
+    // v0.5.36 — annotate option-group fields whose options have a
+    // per-option underline blank (e.g. `___ Visa  ___ Mastercard`).
+    // Runs AFTER the snap so the option bboxes are already at
+    // their final, snap-corrected coordinates. The renderer
+    // (DraggableField, pdfWriter) draws an X on the blank for
+    // annotated options and a circle around the label otherwise.
+    const annotated = annotateOptionGroupBlanks(snapped, pageRenders, {
+      verbose: true,
+    });
+    onStatus?.(`Gemini detected ${annotated.length} field(s).`, 1);
+    return annotated;
   }
 
   // ----- Pass 2: quality-control audit ------------------------------------
@@ -2988,21 +2998,27 @@ async function detectFieldsImpl(
     const snapped = snapFieldsToUnderlines(pass1.fields, pageRenders, {
       verbose: true,
     });
+    const annotated = annotateOptionGroupBlanks(snapped, pageRenders, {
+      verbose: true,
+    });
     onStatus?.(
-      `Verification failed; using Pass 1 results (${snapped.length} field(s)).`,
+      `Verification failed; using Pass 1 results (${annotated.length} field(s)).`,
       1
     );
-    return snapped;
+    return annotated;
   }
 
   const snapped = snapFieldsToUnderlines(qcFields, pageRenders, {
     verbose: true,
   });
+  const annotated = annotateOptionGroupBlanks(snapped, pageRenders, {
+    verbose: true,
+  });
   onStatus?.(
-    `Detection complete — ${snapped.length} field(s) after verification.`,
+    `Detection complete — ${annotated.length} field(s) after verification.`,
     1
   );
-  return snapped;
+  return annotated;
 }
 
 // ---------------------------------------------------------------------------

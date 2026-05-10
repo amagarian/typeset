@@ -80,8 +80,19 @@ export function DraggableField({
       // PDF user-space, so a parent move must shift each option by
       // the same dx/dy and a parent resize scales each option's
       // offset within the parent proportionally.
+      //
+      // v0.5.36 — also clone `blankRect` (when present) so the
+      // X-on-blank renderer's target rect tracks the parent move/
+      // resize identically to the option's label bbox. The blank
+      // rect is in the same PDF user-space and lives or dies with
+      // the option, so we apply the same proportional scaling
+      // (sx/sy) and translation (nextX - fieldX) to it.
       const startOptions = field.options
-        ? field.options.map((o) => ({ ...o, bbox: { ...o.bbox } }))
+        ? field.options.map((o) => ({
+            ...o,
+            bbox: { ...o.bbox },
+            blankRect: o.blankRect ? { ...o.blankRect } : undefined,
+          }))
         : null;
 
       const computeOptions = (
@@ -97,7 +108,7 @@ export function DraggableField({
         return startOptions.map((opt) => {
           const localDx = opt.bbox.x - fieldX;
           const localDy = opt.bbox.y - fieldY;
-          return {
+          const next: NonNullable<TemplateField["options"]>[number] = {
             label: opt.label,
             bbox: {
               x: nextX + localDx * sx,
@@ -106,6 +117,18 @@ export function DraggableField({
               height: opt.bbox.height * sy,
             },
           };
+          if (opt.hasUnderlineBlank) next.hasUnderlineBlank = true;
+          if (opt.blankRect) {
+            const blankDx = opt.blankRect.x - fieldX;
+            const blankDy = opt.blankRect.y - fieldY;
+            next.blankRect = {
+              x: nextX + blankDx * sx,
+              y: nextY + blankDy * sy,
+              width: opt.blankRect.width * sx,
+              height: opt.blankRect.height * sy,
+            };
+          }
+          return next;
         });
       };
 
@@ -272,6 +295,102 @@ export function DraggableField({
 
         {(field.options ?? []).map((opt, idx) => {
           const isSel = opt.label.toLowerCase() === selectedLabel;
+          // v0.5.36 — branch per-option (NOT per-field) on the
+          // detected per-option blank. Two render paths:
+          //
+          //   1. `hasUnderlineBlank` + `blankRect` present
+          //      (`___ Visa`-style row): the option's writable
+          //      area IS the blank, not the label. Draw a faint
+          //      outline around the blank rect ALWAYS (so the
+          //      user can see where the X target sits, even when
+          //      nothing is picked yet) and overlay an X centred
+          //      on the rect when this option is the selection.
+          //      The label rect is left bare — circling a label
+          //      that has its own blank to the left would be
+          //      visually redundant and would compete with the X
+          //      mark for the user's attention.
+          //
+          //   2. No detected blank (inline-checkbox / button-style
+          //      row): keep the v0.5.25 circle-around-label
+          //      rendering — the label IS the selector target,
+          //      and the circle communicates that.
+          if (opt.hasUnderlineBlank && opt.blankRect) {
+            const blankLeft = (opt.blankRect.x - field.x) * scale;
+            const blankTop = (opt.blankRect.y - field.y) * scale;
+            const blankWidth = Math.max(4, opt.blankRect.width * scale);
+            const blankHeight = Math.max(4, opt.blankRect.height * scale);
+            // X drawn at 80% of the rect's height, centred on the
+            // rect (so the arms cross above the underline stroke
+            // — same text-baseline geometry the rect itself
+            // encodes). Two SVG <line>s; stroke currentColor so a
+            // future theme override can restyle without touching
+            // this component. Stroke width tracks the
+            // selected/unselected affordance the way the circle
+            // marker's border width does (2px / 1px).
+            const xSize = blankHeight * 0.8;
+            const cx = blankWidth / 2;
+            const cy = blankHeight / 2;
+            const half = xSize / 2;
+            const strokeWidth = selected ? 2 : 1.5;
+            return (
+              <div
+                key={`${opt.label}-${idx}`}
+                style={{
+                  position: "absolute",
+                  left: blankLeft,
+                  top: blankTop,
+                  width: blankWidth,
+                  height: blankHeight,
+                  pointerEvents: "none",
+                  boxSizing: "border-box",
+                  // Faint dashed outline around the blank target —
+                  // visible even when nothing is selected, so the
+                  // canvas review communicates "this is the X
+                  // target" without competing with the selected
+                  // X glyph itself.
+                  border: isSel
+                    ? "none"
+                    : `1px dashed ${selected ? "rgba(40, 70, 200, 0.55)" : "rgba(40, 70, 200, 0.35)"}`,
+                  borderRadius: 2,
+                }}
+              >
+                {isSel && (
+                  <svg
+                    width={blankWidth}
+                    height={blankHeight}
+                    viewBox={`0 0 ${blankWidth} ${blankHeight}`}
+                    style={{
+                      position: "absolute",
+                      left: 0,
+                      top: 0,
+                      overflow: "visible",
+                      color: "#0a7c2c",
+                    }}
+                  >
+                    <line
+                      x1={cx - half}
+                      y1={cy - half}
+                      x2={cx + half}
+                      y2={cy + half}
+                      stroke="currentColor"
+                      strokeWidth={strokeWidth}
+                      strokeLinecap="round"
+                    />
+                    <line
+                      x1={cx - half}
+                      y1={cy + half}
+                      x2={cx + half}
+                      y2={cy - half}
+                      stroke="currentColor"
+                      strokeWidth={strokeWidth}
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                )}
+              </div>
+            );
+          }
+
           const ovalLeft = (opt.bbox.x - field.x) * scale;
           const ovalTop = (opt.bbox.y - field.y) * scale;
           const ovalWidth = opt.bbox.width * scale;

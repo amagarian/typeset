@@ -124,6 +124,52 @@ export async function writeFilledPdfBytes(
       });
       if (!chosen) continue;
 
+      // v0.5.36 — X-on-blank rendering. Forms whose option-group
+      // options carry a writable `___` blank to the LEFT of each
+      // label (e.g. `___ Visa  ___ Mastercard`) get the chosen
+      // option's blank rect marked with a hand-written-style X
+      // glyph instead of the v0.5.25 oval around the label. The
+      // X mirrors the on-canvas review rendering in
+      // `DraggableField.tsx` — two crossed lines centred on
+      // `blankRect`, sized to ~80% of its height — so what the
+      // user reviews on the canvas matches the printed result.
+      // `hasUnderlineBlank` and `blankRect` are populated by
+      // `optionBlankDetector.ts` during the detection pipeline
+      // (v0.5.36 wiring in `geminiFieldDetector.ts`).
+      if (chosen.hasUnderlineBlank && chosen.blankRect) {
+        const xRect = chosen.blankRect;
+        const xSize = Math.max(4, xRect.height * 0.8);
+        const half = xSize / 2;
+        const cx = xRect.x + xRect.width / 2;
+        // The blank rect is stored top-down (pageHeight-anchored
+        // origin matches `TemplateField.y` storage). Flip its
+        // top-down y-centre to pdf-lib's bottom-up convention by
+        // subtracting the centre's distance from the top of the
+        // page.
+        const cyTopDown = xRect.y + xRect.height / 2;
+        const cyPdf = pageHeight - cyTopDown;
+        const color = rgb(0.08, 0.08, 0.08);
+        // Stroke thickness scales with the X size so the mark
+        // reads as a single confident pen stroke at any scale —
+        // ~12% of the X arm length, with a 1pt floor for very
+        // small blanks.
+        const thickness = Math.max(1, xSize * 0.12);
+
+        page.drawLine({
+          start: { x: cx - half, y: cyPdf - half },
+          end: { x: cx + half, y: cyPdf + half },
+          thickness,
+          color,
+        });
+        page.drawLine({
+          start: { x: cx - half, y: cyPdf + half },
+          end: { x: cx + half, y: cyPdf - half },
+          thickness,
+          color,
+        });
+        continue;
+      }
+
       // Hand-drawn-style oval around the selected option's bbox. ~3pt
       // padding on each side, ~1pt stroke. pdf-lib's `drawEllipse`
       // takes a center point + xScale/yScale (radii), drawing a true
