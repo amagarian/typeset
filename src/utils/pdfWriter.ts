@@ -148,10 +148,12 @@ function findInternalLabelRightEdge(
   // labels often sit with a baseline very close to the bbox bottom.
   const vTol = Math.max(2, field.height * 0.25);
 
-  // Only treat text items as "internal labels" when their LEFT edge
-  // sits inside the LEFT 60% of the field bbox. Items further right
-  // are likely value-tail decoration ("per rental", "(date)") that
-  // shouldn't anchor a shift.
+  // The shift target is the rightmost RIGHT-EDGE of any qualifying
+  // text item, capped at the LEFT 60% of the bbox. Items whose right
+  // edge sits past 60% are either values we don't want to shift past
+  // (the user's existing pre-fill or AcroForm flatten residue) or
+  // suffix tails like `per rental` / `(date)` that should never
+  // anchor a shift.
   const leftHalfRight = field.x + field.width * 0.6;
 
   let rightmost: number | null = null;
@@ -164,17 +166,29 @@ function findInternalLabelRightEdge(
     // Vertical band check (with tolerance both sides).
     if (itemBottom < fieldTop - vTol) continue;
     if (itemTop > fieldBottom + vTol) continue;
-    // Horizontal: item must START inside the field's left half AND
-    // overlap horizontally with the field bbox.
-    if (itemLeft < fieldLeft - 1) continue;
-    if (itemLeft > leftHalfRight) continue;
-    if (itemRight > fieldRight + 1) continue;
+    // Horizontal: the item's right edge must sit INSIDE the field
+    // bbox (between the field's left edge and the left-60% mark).
+    // This catches THREE shapes of printed text relevant to a shift:
+    //   1. Label entirely INSIDE the bbox (itemLeft ≥ fieldLeft).
+    //   2. Label SPILLING IN from the left (itemLeft < fieldLeft
+    //      but itemRight is inside the bbox). v0.6.14 missed this
+    //      case, so the `CVV2/Security Code:` label whose bbox
+    //      started mid-word kept overlapping the value.
+    //   3. Label whose right edge is exactly at the bbox left edge
+    //      is OUTSIDE the bbox — don't shift.
+    if (itemRight <= fieldLeft + 1) continue;
+    if (itemRight > leftHalfRight) continue;
+    if (itemLeft > fieldRight + 1) continue;
 
     if (rightmost === null || itemRight > rightmost) {
       rightmost = itemRight;
     }
   }
-  return rightmost;
+  // Clamp the returned edge to NEVER exceed the bbox's left-60% mark
+  // even if the qualifying item ends exactly at it — gives the value
+  // room to actually render in the writable portion.
+  if (rightmost === null) return null;
+  return Math.min(rightmost, leftHalfRight);
 }
 
 function isCheckboxField(field: TemplateField): boolean {
@@ -749,7 +763,7 @@ export async function writeFilledPdfBytes(
         : findInternalLabelRightEdge(pagePrinted, field);
       const printedShift =
         printedRightEdge !== null
-          ? Math.max(0, printedRightEdge - field.x + 4)
+          ? Math.max(0, printedRightEdge - field.x + 6)
           : 0;
 
       const heuristicShift = computePrefixLabelShiftX(field, font, probeFontSize);
