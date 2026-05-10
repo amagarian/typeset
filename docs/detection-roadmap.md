@@ -61,26 +61,151 @@ User-requested for the next batch:
   `Type of Organization`) are recognized correctly — the issues are concentrated
   in the boxed-grid layout and the bare-Name alias.
 
-## Pending: corpus-wide analysis (32 forms)
+## Corpus analysis (32 forms — May 10 2026)
 
-Worker analyzing
-`/Users/aidenmagarian/TYPEFACE Dropbox/Aiden Magarian/_AI DOCUMENTS/Archive.zip`
-(22 rental agreements + 10 credit card auths). Output will be written to
-`/tmp/typeset-corpus-analysis.md` and the high-level findings will be appended to
-this doc once it returns.
+Full report: `/tmp/typeset-corpus-analysis.md` (~23k chars, tables, AcroForm
+field names, per-form failure notes, implementation sketches). High-level
+findings consolidated below.
 
-Specifically looking for:
+### Inventory headlines
 
-- Layout patterns the current detector likely fails on (boxed fields, tables,
-  multi-page, multi-line text areas, repeated row groups, initial boxes,
-  date ranges, conditional sections, single-shared underlines)
-- New canonical field categories (Tax ID, EIN, driver's license, insurance,
-  bank info, daily/hourly rates, deposits, rental periods, job/PO numbers, etc.)
-- AcroForm presence (high-value: skip Gemini for forms with native fields)
-- Predicted failure modes per form
-- Project schema additions to support the new canonicals
-- High-value architectural shifts (multi-page orchestration, table extraction,
-  section-aware detection, AcroForm-first pipeline)
+- **31 PDFs + 1 .docx**
+- **8 PDFs have native AcroForm fields** (authoritative via `pdf-lib`):
+  - `credit card auths/204 Credit Card Authorization Form 2019.pdf` — 26 fields
+  - `credit card auths/BLP_CC_auth_InteractForm1.pdf` — 9 fields (`Text1`–`Text9`,
+    no semantic names)
+  - `credit card auths/MILK CC Auth Form BLANK.pdf` — 17 fields
+  - `rental agreements/204 New Account Form 2018.pdf` — 48 fields
+  - `rental agreements/###Camtec Account Set-Up__2025-01.pdf` — 52 fields
+  - `rental agreements/ISS Deposit COD Account Agreement Form.pdf` — 49 fields
+  - `rental agreements/ISS PO Account Agreement Form.pdf` — 68 fields
+  - `rental agreements/Studio Contract Hollywood.pdf` — 58 fields
+- **19 multi-page PDFs**, longest at 12 pages (`RENTAL AGREEMENT_2023.pdf`),
+  8 pages (`Camtec`, `Rental Agreement_aiden`), 6 pages (`SYNCRentalPaperwork`)
+- Visual-only PDFs (no AcroForm) dominate the long rental-agreement set
+
+### Top architectural shifts (must-have)
+
+1. **AcroForm-first ingestion pipeline.** When `pdf-lib` reports interactive
+   widgets, map them directly to `TemplateField` and skip Gemini for those pages.
+   Hybrid: Gemini still runs on AcroForm-empty pages of partial-coverage forms.
+   Marks `detectionSource: 'acroform'` in templates.
+2. **Multi-page orchestration with section-aware merging.** Per-page detection
+   budgets, page-local rendering, global dedup that respects section IDs (so
+   officer Name on page 1 doesn't collide with cardholder Name on page 3).
+3. **Table / line-item extraction stage** (optional second pass). Equipment +
+   rate grids on HydroFlex, PSIS, Studio Contract, Daily Rental, Production
+   Agreement won't be solved by prompt tweaks alone.
+
+### P0 items (corpus quality unblockers)
+
+1. **AcroForm-first ingestion** for the 8 interactive PDFs (paths above)
+2. **Fix `inferByLabel` bare `Name` → `creditCardHolder` hijack** using section
+   cues or negating patterns (`officer`, `title`, `president`, `authorized signer`).
+   Driven by: 204 New Account, ISS, Camtec.
+3. **Add `tel` / `tel.` / `telephone` aliases** to `phone` canonical
+4. **Multi-page reliability**: per-page field budget + merge pass that rejects
+   duplicate labels across pages unless explicitly allowed. Driven by:
+   `RENTAL AGREEMENT_2023.pdf` (12p), Camtec (8p), SYNCRental (6p).
+5. **Template fingerprint for alias-less AcroForm** (BLP `Text1`-`Text9`):
+   store coordinate + page + neighbor label OCR in template registry so users
+   don't re-map every time.
+
+### P1 (post-P0 polish)
+
+- **Dual CC blocks** (Camtec, MILK) with group IDs / suffixes
+- **Initial field detector**: short square bbox clusters after clause numbers
+  → `clauseInitials` prompt fields (Studio Contract, long rentals)
+- **Rate + hour row pairing** near `Rate`/`Hr` tokens (Studio Contract)
+- **Single-shared-stroke option-groups** (Arrow CC card-type row): detect
+  one stroke spanning all labels, draw underline tick at computed offset
+
+### P2 (future)
+
+- Full table extraction pipeline (equipment rows) as second model pass with
+  JSON schema
+- Section-aware canonical resolution (cluster on bold ALL-CAPS lines to
+  partition `inferByLabel` scope)
+- Workflow flags UI: parse "initial each page", "wet ink", "notarize" from
+  text layer
+
+### New canonical fields proposed (~22)
+
+Highlights — full list in `/tmp/typeset-corpus-analysis.md` §3:
+
+| Canonical | Aliases | Source | Auto/Prompt |
+|---|---|---|---|
+| `federalTaxId` | Federal ID, Tax ID, EIN, FEIN | 204 New Account, Rental Agreement Jan 25 2021 | Both |
+| `dunsNumber` | DUNS, D.U.N.S. | 204 New Account | Prompt |
+| `dbaName` | DBA, d/b/a | ISS Deposit/PO | Both |
+| `authorizedSignerName` | Name (officer) — must NOT map to `creditCardHolder` | 204 New Account, ISS, Camtec | Both |
+| `authorizedSignerTitle` | Title (officer) | 204 New Account, Studio | Both |
+| `bankName` / `bankRoutingNumber` / `bankAccountNumber` | Routing, ABA, Account # | ISS PO, FS Rental, RA Onelight | Prompt + encrypt |
+| `fedExAccountNumber` / `upsAccountNumber` | FedEx #, UPS # | ISS Acro | Prompt |
+| `rentalStartDate` / `rentalEndDate` | Start, End, Pickup, Return | Studio, all rentals | Both |
+| `hourlyRateBuild` / `hourlyRateShoot` / `hoursBuild` / `hoursShoot` | Build Rate, Shoot Rate, Build Hr, Shoot Hr | Studio Contract | Prompt |
+| `driverLicenseNumber` / `vehicleVin` / `vehiclePlate` | DL #, VIN, Plate | Omega Application Credit, FNJ Studios, PSIS DOT | Prompt |
+| `insuranceCarrier` / `insurancePolicyNumber` | Insurance, Policy # | Omega, PSIS | Prompt |
+| `invoiceNumber` | Invoice # | 204 CC Auth Acro | Prompt |
+| `accountingContactName` / `accountingEmail` | Accounting Contact | Camtec | Both |
+| `clauseInitials` | (per-section initial boxes) | Long rentals, Studio | Prompt + special render |
+
+### `Project` schema additions (TypeScript sketch)
+
+Full sketch in corpus report §6. Highlights:
+
+```ts
+// Encrypt bank/SSN/account fields at rest (mirror credit card handling)
+federalTaxId?: string;
+dunsNumber?: string;
+dbaName?: string;
+authorizedSignerName?: string;
+authorizedSignerTitle?: string;
+bankName?: string;
+bankRoutingNumber?: string;
+bankAccountNumber?: string;
+fedExAccountNumber?: string;
+upsAccountNumber?: string;
+rentalStartDate?: string;
+rentalEndDate?: string;
+hourlyRateBuild?: string;
+hourlyRateShoot?: string;
+driverLicenseNumber?: string;
+vehicleVin?: string;
+vehiclePlate?: string;
+insuranceCarrier?: string;
+insurancePolicyNumber?: string;
+invoiceNumber?: string;
+// Consider contacts: Array<{ role; name; phone; email }> for ISS/Camtec
+// repeated contact rows instead of unbounded `*Name_2` fields.
+```
+
+### Key risks (corpus-driven)
+
+- AcroForm pages may omit visual-only annex pages → hybrid pipeline + UI
+  warning when page count > AcroForm coverage
+- Aggressive `Name` disambiguation may hurt true cardholder blanks → gate
+  negation on proximity to payment section headers OR AcroForm field names
+- Table extraction stage risks over-segmentation → keep user review UI for
+  manual merge
+- New Project PII fields (bank, SSN, DL) widen attack surface → keep
+  encryption + opt-in "sensitive data" expander
+- Per-page Gemini cost on 12p forms could spike usage → page cap or
+  template-fingerprint cache priority
+
+### Suggested release sequencing (informed by corpus)
+
+- **v0.5.38**: P0 user-requested items (signature upload, save button) +
+  P0 detection items 2 + 3 (Name disambiguation, Tel alias) — small,
+  surgical fixes that unlock the 204 form
+- **v0.5.39**: P0 architectural shift 1 (AcroForm-first pipeline) —
+  unlocks 8 of the most complex forms
+- **v0.6.0**: P0 architectural shift 2 (multi-page orchestration) —
+  unlocks 19 of the longest forms
+- **v0.6.x**: Tables, initials, dual-CC blocks, single-shared-stroke
+  option-groups, section-aware canonical resolution
+
+Per-version scope and exact ordering subject to user direction.
 
 ## Cross-cutting risks
 
