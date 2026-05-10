@@ -32,6 +32,7 @@ import {
   installSessionPersistence,
   linkAnonymousDeviceToAccount,
   onAuthStateChange,
+  signInWithApple as signInWithAppleImpl,
   signInWithMagicLink,
   signOut as signOutImpl,
   subscribeAuthEvents,
@@ -50,6 +51,16 @@ export interface UseAuthResult {
   /** Send a magic link. Resolves on dispatch; the actual sign-in
    *  completes asynchronously when the user clicks the link. */
   signIn(email: string): Promise<void>;
+  /**
+   * v0.5.36 — Sign in with Apple via Supabase OAuth. Resolves once
+   * the OAuth authorize URL is opened in the user's default browser
+   * (the `tauri-plugin-shell` `open` command resolves immediately
+   * on dispatch); the actual sign-in completes asynchronously when
+   * Apple redirects back via `typeset://auth/callback#access_token=…`
+   * and the deep-link handler flips `isSignedIn` → true via the
+   * existing supabase-js auth state subscription.
+   */
+  signInWithApple(): Promise<void>;
   signOut(): Promise<void>;
 }
 
@@ -120,6 +131,10 @@ export function useAuth(): UseAuthResult {
     await signInWithMagicLink({ email: email.trim() });
   }, []);
 
+  const signInWithApple = useCallback(async () => {
+    await signInWithAppleImpl();
+  }, []);
+
   const signOut = useCallback(async () => {
     await signOutImpl();
   }, []);
@@ -130,6 +145,7 @@ export function useAuth(): UseAuthResult {
     isSignedIn: Boolean(session),
     isLoading,
     signIn,
+    signInWithApple,
     signOut,
   };
 }

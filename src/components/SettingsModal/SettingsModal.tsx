@@ -84,13 +84,25 @@ export function SettingsModal({
   // render the corresponding section. The two locally-tracked
   // statuses (`signInPending` and `signInError`) are scoped to
   // the in-modal flow — they live and die with the modal close.
-  const { user, isSignedIn, signIn, signOut, isLoading: authLoading } = useAuth();
+  const {
+    user,
+    isSignedIn,
+    signIn,
+    signInWithApple,
+    signOut,
+    isLoading: authLoading,
+  } = useAuth();
   const [emailInput, setEmailInput] = useState("");
   const [signInStatus, setSignInStatus] = useState<
     "idle" | "sending" | "sent" | "error"
   >("idle");
   const [signInError, setSignInError] = useState<string | null>(null);
   const [signOutPending, setSignOutPending] = useState(false);
+  // v0.5.36 — separate spinner for the Apple OAuth flow so the email
+  // form's "Sending…" state doesn't share its disabled affordance
+  // with the Apple button (and vice versa). Both flows can be
+  // started from the same panel; only one should ever be in flight.
+  const [applePending, setApplePending] = useState(false);
 
   // Bubble verifyOtp / token-rejected errors into the modal as toast-
   // style copy. Local state (not the global Toast) because the modal
@@ -244,6 +256,32 @@ export function SettingsModal({
       setSignInStatus("error");
     }
   }, [emailInput, signIn]);
+
+  // v0.5.36 — Apple OAuth handler. signInWithApple resolves as soon
+  // as the system browser is asked to open the Supabase-issued
+  // authorize URL; the actual sign-in completes asynchronously when
+  // Apple → Supabase → typeset:// callback fires the deep-link
+  // listener (see services/authClient.ts). The "Opening Apple
+  // sign-in…" UI state lasts only until shell:open returns;
+  // post-shell-open the modal is back in idle state, ready for
+  // either the deep-link to flip isSignedIn or the user to retry.
+  const handleSignInWithApple = useCallback(async () => {
+    setApplePending(true);
+    setSignInError(null);
+    setSignInStatus("idle");
+    try {
+      await signInWithApple();
+    } catch (err) {
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Couldn't open the Apple sign-in page.";
+      setSignInError(message);
+      setSignInStatus("error");
+    } finally {
+      setApplePending(false);
+    }
+  }, [signInWithApple]);
 
   const handleSignOut = useCallback(async () => {
     setSignOutPending(true);
@@ -447,11 +485,45 @@ export function SettingsModal({
               {!isSignedIn && signInStatus !== "sent" && (
                 <>
                   <p className={styles.helpText}>
-                    Sign in with your email to sync projects across
-                    devices and keep your community contributions
-                    attributed when you switch machines. We&apos;ll send a
-                    one-time magic link — no password.
+                    Sign in to sync projects across devices and keep
+                    your community contributions attributed when you
+                    switch machines.
                   </p>
+                  {/*
+                    v0.5.36 — Apple's Human Interface Guidelines ask
+                    that "Sign in with Apple" be presented at least as
+                    prominently as any other sign-in option, so the
+                    Apple button leads. Black background + white text
+                    + Apple glyph (U+F8FF private-use char that the
+                    SF Pro family renders as the  glyph on Apple
+                    platforms; falls back to a small box on Linux/
+                    Windows but Typeset is macOS-only today, so the
+                    glyph always renders correctly in production).
+                    aria-label is set on the button itself so screen
+                    readers don't read "PUA character + Sign in with
+                    Apple"; the visual span is hidden from a11y.
+                  */}
+                  <button
+                    type="button"
+                    className={styles.appleSignInBtn}
+                    onClick={handleSignInWithApple}
+                    disabled={applePending || signInStatus === "sending"}
+                    aria-label="Sign in with Apple"
+                  >
+                    <span className={styles.appleGlyph} aria-hidden="true">
+                      
+                    </span>
+                    <span className={styles.appleLabel}>
+                      {applePending ? "Opening…" : "Sign in with Apple"}
+                    </span>
+                  </button>
+                  <div
+                    className={styles.authDivider}
+                    role="separator"
+                    aria-label="or"
+                  >
+                    <span className={styles.authDividerLabel}>or</span>
+                  </div>
                   <input
                     type="email"
                     className={styles.input}
@@ -478,7 +550,8 @@ export function SettingsModal({
                       onClick={handleSendMagicLink}
                       disabled={
                         emailInput.trim().length === 0 ||
-                        signInStatus === "sending"
+                        signInStatus === "sending" ||
+                        applePending
                       }
                     >
                       {signInStatus === "sending"

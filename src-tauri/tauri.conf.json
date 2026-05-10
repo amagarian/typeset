@@ -76,7 +76,7 @@
   },
   "plugins": {
     "shell": {
-      "open": true
+      "open": "https://(([a-z0-9-]+\\.)*supabase\\.co|appleid\\.apple\\.com)/[^\\s]*"
     },
     "deep-link": {
       "desktop": {

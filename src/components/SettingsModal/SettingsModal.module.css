@@ -433,3 +433,105 @@
   line-height: 1.5;
   margin: 0;
 }
+
+/*
+ * v0.5.36 — Sign in with Apple. Apple's design guidelines mandate
+ * a black-on-white bubble with the  glyph leading the label and
+ * sufficient contrast against the background. We adopt the
+ * black-fill variant (the canonical "dark" SIWA button) since the
+ * surrounding modal is a light surface.
+ *
+ * Height is matched to the magic-link button (~36px including the
+ * 1px border) so the two stack visually without a step. The
+ * button is full-width to read as the primary auth surface, with
+ * the email form recessed below the divider as the secondary
+ * option.
+ */
+.appleSignInBtn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  width: 100%;
+  height: 36px;
+  padding: 0 14px;
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 500;
+  color: #ffffff;
+  background: #000000;
+  border: 1px solid #000000;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  margin-top: 4px;
+  transition: opacity 0.15s;
+}
+
+.appleSignInBtn:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.appleSignInBtn:active:not(:disabled) {
+  opacity: 0.78;
+}
+
+.appleSignInBtn:disabled {
+  opacity: 0.55;
+  cursor: default;
+}
+
+/*
+ * Apple glyph rendered via the SF Pro Display private-use codepoint
+ * U+F8FF. The font stack falls through to the system UI font, which
+ * on macOS is San Francisco — that's where the glyph maps to the
+ * Apple logo. Sized slightly larger than the surrounding text to
+ * match Apple's reference SIWA mark proportions.
+ */
+.appleGlyph {
+  font-family: -apple-system, "SF Pro Display", "SF Pro Text",
+    BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font-size: 17px;
+  line-height: 1;
+  margin-top: -2px;
+}
+
+.appleLabel {
+  font-family: inherit;
+  letter-spacing: -0.01em;
+}
+
+/*
+ * "or" divider between the Apple button (primary) and the magic-
+ * link form (secondary). A thin horizontal rule with the word "or"
+ * floated on top, sized to look quiet between two action surfaces
+ * rather than competing with them.
+ */
+.authDivider {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 8px 0 4px;
+  height: 12px;
+}
+
+.authDivider::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 50%;
+  height: 1px;
+  background: var(--border);
+}
+
+.authDividerLabel {
+  position: relative;
+  background: var(--bg-panel);
+  padding: 0 8px;
+  font-size: 10px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: var(--letter-section);
+  color: var(--text-muted);
+}

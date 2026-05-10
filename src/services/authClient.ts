@@ -465,6 +465,80 @@ export async function signInWithMagicLink(options: SignInOptions): Promise<void>
   }
 }
 
+/**
+ * v0.5.36 — Sign in with Apple via Supabase OAuth + Tauri shell:open.
+ *
+ * Web-based OAuth flow (NOT the native AuthenticationServices SDK).
+ * Why web-based:
+ *   - Native ASAuthorizationAppleIDProvider would require shipping
+ *     a Rust↔ Swift bridge for AuthenticationServices.framework, plus
+ *     the macOS-Catalyst entitlement plumbing. The web flow keeps
+ *     v0.5.36 a pure-Tauri-2 release with no platform-specific code.
+ *   - Supabase normalises Apple's OIDC token into a standard
+ *     `#access_token=…&refresh_token=…` callback URL, so the same
+ *     deep-link handler that already powers the magic-link
+ *     flow (v0.5.35) catches the response without any new parser
+ *     logic — see `parseCallbackUrl` above, which already accepts
+ *     both the `?token_hash=…` (magic link) and `#access_token=…`
+ *     (OAuth implicit) shapes.
+ *
+ * Flow:
+ *   1. Ask supabase-js to mint the Apple authorize URL (it takes
+ *      care of attaching the `state`, `nonce`, `redirect_uri`, etc.
+ *      that the Apple OAuth dance requires). `skipBrowserRedirect`
+ *      tells supabase-js to return the URL instead of trying to
+ *      `window.location = …`, since the renderer is inside Tauri's
+ *      webview and can't navigate the system browser directly.
+ *   2. Hand the URL to Tauri's `shell:open` plugin so the OS
+ *      opens it in the user's default browser. The capability scope
+ *      in `tauri.conf.json > plugins > shell > open` is locked to
+ *      `https://(*.supabase.co|appleid.apple.com)/...` so this
+ *      command can't be abused to open arbitrary URLs even if the
+ *      `data.url` were tampered with.
+ *   3. The user signs in with Apple in the system browser; Apple
+ *      redirects to Supabase's `/auth/v1/callback`; Supabase
+ *      redirects to `typeset://auth/callback#access_token=…`.
+ *   4. The OS hands the URL to Typeset via `tauri-plugin-deep-link`;
+ *      the v0.5.35 `processCallbackUrl` reads the access/refresh
+ *      tokens out of the URL fragment, calls `setSession`, and
+ *      `onAuthStateChange` flips `isSignedIn` → true via
+ *      `useAuth`'s subscription.
+ *
+ * Caveats:
+ *   - Web preview / non-Tauri contexts: `invoke` will throw.
+ *     We don't try to fall back to `window.open` because the
+ *     `typeset://` callback won't reach a browser-only build
+ *     anyway; the right response is "this needs the desktop
+ *     app".
+ *   - `data.url` can theoretically be `null` if Supabase changes
+ *     its API; we throw a typed error rather than silently no-op.
+ */
+export async function signInWithApple(): Promise<void> {
+  const client = getAuthClient();
+  const { data, error } = await client.auth.signInWithOAuth({
+    provider: "apple",
+    options: {
+      redirectTo: AUTH_REDIRECT_URL,
+      skipBrowserRedirect: true,
+    },
+  });
+  if (error) {
+    throw new Error(humanReadableAuthError(error.message));
+  }
+  if (!data?.url) {
+    throw new Error("Supabase did not return an Apple authorize URL.");
+  }
+  if (!isTauriAvailable()) {
+    throw new Error(
+      "Sign in with Apple requires the Typeset desktop app (the OAuth callback is delivered via the typeset:// URL scheme)."
+    );
+  }
+  // Tauri 2 plugin invoke convention: `plugin:<name>|<command>`.
+  // Mirrors the `@tauri-apps/plugin-shell` JS wrapper without
+  // pulling in another npm dep — the only call site is here.
+  await invoke<void>("plugin:shell|open", { path: data.url });
+}
+
 export async function signOut(): Promise<void> {
   const client = getAuthClient();
   // Don't fail the sign-out if the network call rejects; we always
