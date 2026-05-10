@@ -628,6 +628,33 @@ interface SnapCounts {
   hSkippedTooFar: number;
   hSkippedTooNarrow: number;
   hSkippedTooWide: number;
+  /**
+   * v0.5.22 — the run-walk traced an underline whose width is
+   * MUCH larger than the field's bbox (newWidth > 2.5× oldWidth).
+   * On dense forms (e.g. 204 Credit Card Authorization Form) a
+   * single horizontal stroke spans Address + City + State + Zip,
+   * or Credit Card Number + Exp Date + CVV, or Name on Card +
+   * Email + Phone. The walker correctly identifies the connected
+   * stroke and proposes the entire row as the new extent; for
+   * each individual field the resulting snap is geometrically
+   * wrong (it would extend across all sibling fields' columns).
+   *
+   * Pre-v0.5.22 these tripped `hSkippedTooWide` (relocate-mode
+   * 1.5× cap or resize-fit 2.0× cap) — but lumping them with
+   * "Date extended across the whole row" obscured the form-design
+   * signal: 16 fields all blocked at the SAME `newWidth ≈ 480pt`
+   * means the row underline is the issue, not Gemini's bbox
+   * sizing. v0.5.22 splits the "obvious row connector"
+   * (newWidth > 2.5× oldWidth, well past every other cap) into
+   * its own counter so the per-page summary surfaces the form
+   * geometry directly.
+   *
+   * Behaviourally identical to `hSkippedTooWide` from the user's
+   * perspective: the field stays at Gemini's vertical-snapped
+   * `(x, width)`, and the layout is unchanged. Only the
+   * classification — and the per-field log line — differs.
+   */
+  hSkippedRowConnector: number;
 }
 
 /**
@@ -1067,6 +1094,53 @@ function tryHorizontalSnap(
     return null;
   }
 
+  // Cap 2a (v0.5.22): row-connector skip class. When the run-walk
+  // traces a stroke MUCH wider than the bbox (newWidth > 2.5× the
+  // old width), it almost always means we walked along a row
+  // underline that spans multiple sibling fields without internal
+  // separators — e.g. on the 204 Credit Card Authorization Form
+  // the Billing Address row is one continuous stroke under
+  // Address + City + State + Zip; same for Credit Card Number +
+  // Exp Date + CVV and Name on Card + Email + Phone. v0.5.21
+  // evidence: 16 fields on that form all rejected at the same
+  // `newWidth ≈ 480pt` despite `oldWidth` ranging from 60 to
+  // 130pt. That's a form-design signal worth surfacing
+  // separately from "Gemini sized a single field too narrow"
+  // (`hSkippedTooWide`). 2.5× sits well past every other active
+  // cap (resize-fit 2.0× / relocate 1.5×), so anything that
+  // trips this check would have tripped tooWide anyway — we
+  // just classify it more informatively.
+  //
+  // Behavioural intent: SAME outcome as v0.5.21 (no x/width
+  // change, field stays at Gemini's bbox), just routed through
+  // a distinct counter and log line so the user can tell at a
+  // glance "this form has connected row underlines" vs "Gemini
+  // under-sized this individual field". A future v0.6.x could
+  // try to bisect the connected run at sibling-field boundaries
+  // (option B in the v0.5.22 design discussion); we don't
+  // attempt that here because different forms use different
+  // sub-division conventions (gap pixels, vertical separators,
+  // label text in between) and getting it wrong would drag
+  // bboxes across the wrong column boundary.
+  //
+  // Order: this cap fires BEFORE `hSkippedTooWide` so the more
+  // specific row-connector classification wins on the
+  // overlap. The `mode` (resizeFit/relocate) is logged for
+  // completeness — connected rows almost always classify as
+  // relocate (the new run barely overlaps the old bbox by
+  // ratio) but the threshold doesn't depend on mode.
+  const ROW_CONNECTOR_RATIO = 2.5;
+  if (newWidth > oldWidth * ROW_CONNECTOR_RATIO) {
+    counts.hSkippedRowConnector += 1;
+    if (wantLog) {
+      const ratio = oldWidth > 0 ? newWidth / oldWidth : 0;
+      console.log(
+        `[underlineSnap] field=${field.id} hSnap=skipped:rowConnector mode=${mode} runWidth=${newWidth.toFixed(2)}pt oldWidth=${oldWidth.toFixed(2)}pt ratio=${ratio.toFixed(2)}× (newWidth > ${ROW_CONNECTOR_RATIO.toFixed(1)}× oldWidth — stroke spans multiple sibling fields, leaving bbox at Gemini's extent)`
+      );
+    }
+    return null;
+  }
+
   // Cap 2: maxWidthRatio — a run more than `widthRatioCap` ×
   // (resize-fit 2.0× / relocate 1.5×) the original bbox width
   // almost certainly means the bbox was meant for a fragment of
@@ -1076,6 +1150,14 @@ function tryHorizontalSnap(
   // active runaway-extent bound on resize-fit (v0.5.21 dropped
   // the per-edge cap on resize-fit, see classification block
   // above); it backstops both modes uniformly.
+  //
+  // v0.5.22: the more obvious "row connector" case
+  // (newWidth > 2.5× oldWidth) is now caught above with a
+  // dedicated counter and log line; this remains the catch-all
+  // for the 1.5×–2.5× / 2.0×–2.5× band where the run is wider
+  // than the field expects but not so much wider that the
+  // row-connector heuristic is the more informative
+  // classification.
   if (newWidth > oldWidth * widthRatioCap) {
     counts.hSkippedTooWide += 1;
     if (wantLog) {
@@ -1438,6 +1520,7 @@ export function snapFieldsToUnderlines(
     hSkippedTooFar: 0,
     hSkippedTooNarrow: 0,
     hSkippedTooWide: 0,
+    hSkippedRowConnector: 0,
   };
 
   const out = fields.map((f) => snapOneField(f, pageRenders, opts, counts));
@@ -1463,12 +1546,21 @@ export function snapFieldsToUnderlines(
   // the per-field log.
   const hSnappedTotal =
     counts.hSnappedResizeFit + counts.hSnappedRelocate;
+  // v0.5.22 — surface `hSkippedRowConnector` next to the other
+  // horizontal skip counters. Connected row underlines (one
+  // stroke spanning multiple sibling fields) are common enough
+  // on dense forms — 16 fields on the 204 Credit Card
+  // Authorization Form trip it — that lumping them with
+  // `hSkippedTooWide` was hiding a real form-design pattern.
+  // The order of the skip counters mirrors the order of the
+  // checks in `tryHorizontalSnap` so a reader can match the
+  // summary back to the per-field decisions.
   console.log(
     `[underlineSnap] snapped ${counts.snapped}/${textConsidered} text fields, skipped ${counts.noStroke} (no stroke), ${counts.ambiguous} (ambiguous), ${counts.tooFar} (too far)` +
       (counts.skippedNonText > 0 || counts.skippedNoPage > 0
         ? ` — ignored ${counts.skippedNonText} non-text + ${counts.skippedNoPage} unrendered`
         : "") +
-      ` | hSnap ${hSnappedTotal}/${counts.snapped} (${counts.hSnappedResizeFit} fit, ${counts.hSnappedRelocate} relocate), hSkipped ${counts.hSkippedNoStroke} (no stroke), ${counts.hSkippedTooFar} (too far), ${counts.hSkippedTooNarrow} (too narrow), ${counts.hSkippedTooWide} (too wide)`
+      ` | hSnap ${hSnappedTotal}/${counts.snapped} (${counts.hSnappedResizeFit} fit, ${counts.hSnappedRelocate} relocate), hSkipped ${counts.hSkippedNoStroke} (no stroke), ${counts.hSkippedTooFar} (too far), ${counts.hSkippedTooNarrow} (too narrow), ${counts.hSkippedTooWide} (too wide), ${counts.hSkippedRowConnector} (row connector)`
   );
 
   return out;

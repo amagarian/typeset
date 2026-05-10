@@ -1157,10 +1157,59 @@ function mapToTemplateField(
   const rawFieldType: "text" | "checkbox" =
     raw.field_type === "checkbox" ? "checkbox" : "text";
 
-  const pageNumber =
-    typeof raw.page_number === "number" && raw.page_number >= 1
-      ? Math.floor(raw.page_number)
-      : 1;
+  // v0.5.22 — defensive page-number clamp. Gemini is supposed to
+  // return `page_number` in `[1, pdf.numPages]` (the prompt says
+  // "1-based and corresponds to the position of the page image in
+  // the parts list" and the response schema declares
+  // `{ type: "integer", minimum: 1 }`), but real evidence proves
+  // the model occasionally emits garbage values. v0.5.21 user log
+  // on the 204 Credit Card Authorization Form — Field 2
+  // (Invoice Number / poNumber) shipped with `page_number=271`,
+  // which happened to equal the raw bbox's first element
+  // (`y_min=271`), strongly suggesting the JSON returned by
+  // Gemini either confused `page_number` with a bbox coord OR
+  // emitted a bbox-shaped array in the page slot that we
+  // truncated. The downstream effect: `pageRenders[271]` doesn't
+  // exist, so the underline snap counts the field as
+  // `skippedNoPage` ("1 unrendered" in the aggregate summary
+  // line) and we ship Gemini's raw rect with no underline
+  // correction. The field also lands in
+  // `field.pageNumber === 271`, which means save-time and
+  // fill-time consumers that look up the page by number get
+  // nothing too. Clamping here recovers the field for the snap
+  // pipeline AND for downstream consumers; the worst case
+  // (Gemini truly returned page-2 for a page-1 form) is the same
+  // as the v0.5.21 worst case (no snap), only with a sane
+  // `pageNumber` so the field is at least visible/editable.
+  //
+  // Strategy: validate `raw.page_number` is a positive integer in
+  // `[1, pages.length]`. If invalid (NaN, ≤ 0, > totalPages, or
+  // not an integer), warn loudly so the next user report carries
+  // evidence and fall back to page 1. Page 1 is the right
+  // fallback for single-page forms (the overwhelming majority of
+  // production paperwork) and a defensible default for
+  // multi-page forms because (a) the snap will still skip the
+  // field if the bbox doesn't match anything on page 1 and (b)
+  // it's better than `undefined`/`pages[0]` which would silently
+  // hide the field on lookup-by-pageNumber paths.
+  const totalPages = pages.length;
+  const rawPageNumber = raw.page_number;
+  let pageNumber: number;
+  if (
+    typeof rawPageNumber === "number" &&
+    Number.isFinite(rawPageNumber) &&
+    rawPageNumber >= 1 &&
+    rawPageNumber <= totalPages
+  ) {
+    pageNumber = Math.floor(rawPageNumber);
+  } else {
+    if (rawPageNumber !== undefined && rawPageNumber !== null) {
+      console.warn(
+        `[Typeset Diag] Field ${index} returned out-of-range page_number=${JSON.stringify(rawPageNumber)} (totalPages=${totalPages}); clamping to 1. This usually means Gemini emitted a bbox-shaped value in the page slot — see field's raw bbox for correlation.`
+      );
+    }
+    pageNumber = 1;
+  }
   const page =
     pages.find((p) => p.pageNumber === pageNumber) ?? pages[0];
   if (!page) return null;
@@ -1391,6 +1440,70 @@ function mapToTemplateField(
     `[Typeset Diag] Field ${index} pdf rect: x=${rect.x.toFixed(2)}, y=${rect.y.toFixed(2)}, w=${rect.width.toFixed(2)}, h=${rect.height.toFixed(2)}`
   );
 
+  const isCardCheckbox = canonicalId && CREDIT_CARD_CHECKBOX_IDS.has(canonicalId);
+  const isBooleanCheckbox = fieldType === "checkbox" && !isCardCheckbox;
+
+  // v0.5.22 — height-gated canonical multiline override. Some
+  // canonicals (currently only `billingAddress`) carry
+  // `fieldKind: "multiline"` in `fieldCatalog.ts` to express that
+  // their writable region CAN span multiple rows on forms that
+  // bundle Address + City/State/Zip into one boxed area. Prior to
+  // v0.5.22 we applied that catalog hint unconditionally, which
+  // promoted SINGLE-row Billing Address fields (h ≈ 21pt, one
+  // underline only) to `multiline` and made the underline snap
+  // skip them — `snapOneField` early-returns on
+  // `fieldKind === "multiline"` and counts the field as
+  // `skippedNonText`. Real-user v0.5.21 evidence (204 Credit Card
+  // Authorization Form): Field 15 "Billing Address" with raw
+  // bbox h=21.38pt and a clean single underline was completely
+  // absent from the per-field `[underlineSnap]` log and counted
+  // toward the aggregate's `7 non-text + 1 unrendered` bucket
+  // alongside the 6 visible checkboxes.
+  //
+  // Why a height heuristic and not a bbox-spans-multiple-strokes
+  // check: the snap's row-search hasn't run yet at this point in
+  // the pipeline. Bbox height is the only geometric signal we
+  // have, and on every form the prompt rule places
+  // `bbox_bottom = stroke` so a single-row bbox is just one row
+  // tall. 30pt cleanly separates the single-row case (typical
+  // 14–21pt heights) from the genuinely-multiline case (Address +
+  // City + State + Zip merged into one bbox measures 60–90pt on
+  // every form we've seen). Picking 30pt instead of, say, 25pt
+  // gives a margin against unusual line-spacing without
+  // admitting any single-row bbox we've observed.
+  //
+  // Only the catalog override is gated. If Gemini's response
+  // itself returned `field_kind: "multiline"` (the local
+  // `fieldKind` from `normalizeFieldKind` above), we keep that —
+  // the model has explicit visual evidence of a multi-row
+  // region. The gate ONLY suppresses the case where the catalog
+  // unconditionally promotes a canonical to multiline despite
+  // the bbox geometry saying otherwise.
+  //
+  // Safety: `pdfWriter.ts` (fill-renderer), `DraggableField`,
+  // `FillPromptModal`, and `TemplateReviewModal` (UI) all branch
+  // ONLY on `checkbox-group`, `boolean-checkbox`, and
+  // `signature` — none branch on `multiline`. The only consumer
+  // of `fieldKind === "multiline"` in v0.5.21 is
+  // `underlineSnap.snapOneField`, so changing this kind for
+  // single-row bboxes affects nothing except the snap's
+  // eligibility gate (the desired behaviour).
+  const HEIGHT_MULTILINE_THRESHOLD_PT = 30;
+  let resolvedFieldKind: TemplateFieldKind;
+  if (isBooleanCheckbox) {
+    resolvedFieldKind = "boolean-checkbox";
+  } else if (
+    canonicalDef?.fieldKind === "multiline" &&
+    fieldKind !== "multiline" &&
+    rect.height < HEIGHT_MULTILINE_THRESHOLD_PT
+  ) {
+    // Catalog says multiline but bbox is single-row → trust geometry,
+    // keep Gemini's locally-classified kind so the snap can correct y.
+    resolvedFieldKind = fieldKind;
+  } else {
+    resolvedFieldKind = canonicalDef?.fieldKind ?? fieldKind;
+  }
+
   // Per-field alignment diagnostics. Off by default in production
   // (the regular `[Typeset Diag]` line above already covers the raw
   // bbox + final rect). Users can enable detailed alignment
@@ -1415,13 +1528,22 @@ function mapToTemplateField(
     // v0.5.15-v0.5.17 logs is gone for the same reason. Snapped and
     // unsnapped fields both land at `bbox_bottom = stroke`; the
     // post-snap y is still reported separately by underlineSnap.
+    //
+    // v0.5.22 — `kind=` now reports the FINAL `resolvedFieldKind`
+    // that will land on the constructed `TemplateField`, not the
+    // local `fieldKind` from `normalizeFieldKind`. Prior versions
+    // logged the local kind, which masked the canonical-driven
+    // multiline override (e.g. Field 15 logged `kind=text` but
+    // shipped as `multiline` because of the catalog's billingAddress
+    // entry). The mismatch made it look like the snap was
+    // misclassifying single-row Billing Address as non-text when in
+    // fact `mapToTemplateField` had already promoted it. Logging the
+    // resolved kind makes the diag log faithful to the runtime
+    // value the snap will see.
     console.log(
-      `[Typeset Align] field=${index} label="${(raw.label ?? "").slice(0, 32)}" type=${fieldType} kind=${fieldKind} raw_y=${rawY.toFixed(2)} corrected_y=${rect.y.toFixed(2)} corrected=${correctionApplied} height=${rect.height.toFixed(2)} anchor=bbox_bottom_on_stroke (no detection-time shift; snapped + unsnapped converge on bbox_bottom=stroke; post-snap y reported separately by underlineSnap)`
+      `[Typeset Align] field=${index} label="${(raw.label ?? "").slice(0, 32)}" type=${fieldType} kind=${resolvedFieldKind} raw_y=${rawY.toFixed(2)} corrected_y=${rect.y.toFixed(2)} corrected=${correctionApplied} height=${rect.height.toFixed(2)} anchor=bbox_bottom_on_stroke (no detection-time shift; snapped + unsnapped converge on bbox_bottom=stroke; post-snap y reported separately by underlineSnap)`
     );
   }
-
-  const isCardCheckbox = canonicalId && CREDIT_CARD_CHECKBOX_IDS.has(canonicalId);
-  const isBooleanCheckbox = fieldType === "checkbox" && !isCardCheckbox;
 
   const catalogKey = canonicalDef?.mappedProjectKey ?? "";
   // Label resolution priority:
@@ -1476,9 +1598,13 @@ function mapToTemplateField(
     height: rect.height,
     confidence: 0.92,
     fieldType,
-    fieldKind: isBooleanCheckbox
-      ? "boolean-checkbox"
-      : (canonicalDef?.fieldKind ?? fieldKind),
+    // v0.5.22 — `resolvedFieldKind` already encodes the boolean-checkbox
+    // coercion AND the height-gated canonical multiline override (see
+    // the resolution block above). Prior versions inlined
+    // `canonicalDef?.fieldKind ?? fieldKind` here, which unconditionally
+    // promoted single-row Billing Address bboxes to multiline and then
+    // got them silently skipped by `underlineSnap.snapOneField`.
+    fieldKind: resolvedFieldKind,
     detectionSource: "gemini",
     checkboxValue,
     groupId: raw.group_id ?? canonicalDef?.groupId ?? undefined,
