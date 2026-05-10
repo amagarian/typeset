@@ -278,6 +278,7 @@ function MainApp() {
     updateProject: updateProjectInStore,
     deleteProject: deleteProjectInStore,
     saveStatus,
+    syncStatus,
     error: projectsError,
   } = useProjects();
   const [view, setView] = useState<View>("workspace");
@@ -1546,6 +1547,7 @@ function MainApp() {
             initialProject={selectedProject}
             isEditing={view === "edit-project"}
             saveStatus={saveStatus}
+            syncStatus={syncStatus}
             onChange={(updates) => {
               if (selectedProjectId) {
                 updateProject(selectedProjectId, updates);

@@ -1,6 +1,6 @@
 import { useCallback, useRef } from "react";
 import type { Project } from "@/types";
-import type { SaveStatus } from "@/hooks/useProjects";
+import type { SaveStatus, SyncStatus } from "@/hooks/useProjects";
 import { ProjectDetailForm } from "../ProjectDetailForm/ProjectDetailForm";
 import styles from "./NewProjectView.module.css";
 
@@ -15,6 +15,15 @@ interface NewProjectViewProps {
    * means the user never sees the confirmation.
    */
   saveStatus?: SaveStatus;
+  /**
+   * v0.5.35 — sync status, also from `useProjects()`. Anonymous users
+   * always see `"idle"`; signed-in users see the full
+   * `idle → syncing → synced` cycle on every push, plus `error` and
+   * `offline` for failure modes. Rendered next to the local "Saved"
+   * indicator so the two state machines (local vs cloud) are
+   * visually distinguishable.
+   */
+  syncStatus?: SyncStatus;
   onChange: (updates: Partial<Project>) => void;
   /**
    * v0.5.28 — single close affordance for both the new-project
@@ -33,6 +42,7 @@ export function NewProjectView({
   initialProject,
   isEditing,
   saveStatus = "idle",
+  syncStatus = "idle",
   onChange,
   onClose,
   onImportPdf,
@@ -84,6 +94,27 @@ export function NewProjectView({
   // back on for sub-frame writes. Gray tone, never green.
   const indicatorVisible = saveStatus === "saved" || saveStatus === "saving";
 
+  // v0.5.35 — sync indicator. Independent of the local Saved
+  // indicator; rendered alongside it so both state machines have
+  // their own surface. Only shown when there's something to say —
+  // anonymous users (syncStatus always "idle") never see this slot.
+  const syncIndicatorVisible =
+    syncStatus === "syncing" ||
+    syncStatus === "synced" ||
+    syncStatus === "error" ||
+    syncStatus === "offline";
+
+  const syncIndicatorLabel =
+    syncStatus === "syncing"
+      ? "Syncing…"
+      : syncStatus === "synced"
+      ? "Synced"
+      : syncStatus === "offline"
+      ? "Offline"
+      : syncStatus === "error"
+      ? "Sync error"
+      : "";
+
   return (
     <div className={styles.wrapper}>
       <div className={styles.header}>
@@ -111,6 +142,25 @@ export function NewProjectView({
             </svg>
             <span className={styles.savedIndicatorLabel}>Saved</span>
           </span>
+          {syncIndicatorVisible && (
+            <span
+              className={`${styles.syncIndicator} ${
+                syncStatus === "error"
+                  ? styles.syncIndicatorError
+                  : ""
+              }`}
+              aria-live="polite"
+              title={
+                syncStatus === "error"
+                  ? "Sync to your account failed; we'll retry on the next edit."
+                  : syncStatus === "offline"
+                  ? "Working offline. Local changes will sync when you reconnect."
+                  : undefined
+              }
+            >
+              {syncIndicatorLabel}
+            </span>
+          )}
           {onImportPdf && (
             <>
               <button

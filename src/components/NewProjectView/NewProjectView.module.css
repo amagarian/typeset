@@ -109,3 +109,31 @@
 .savedIndicatorLabel {
   letter-spacing: 0.01em;
 }
+
+/*
+ * v0.5.35 — sync indicator.
+ *
+ * Same restrained tone as the local Saved indicator (no green
+ * tick, no celebration), but rendered as a separate slot so the
+ * user can tell at a glance whether the local autosave or the
+ * cloud sync is the one currently transitioning. Only mounted
+ * when sync has something to say (signed-in users); anonymous
+ * users never see this slot.
+ *
+ * The error variant uses the same red as `statusError` in the
+ * Settings modal — it's an alert, not a destructive action, so
+ * the row tone stays muted but the copy color jumps.
+ */
+.syncIndicator {
+  display: inline-flex;
+  align-items: center;
+  margin-right: 4px;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
+  letter-spacing: 0.01em;
+}
+
+.syncIndicatorError {
+  color: #991b1b;
+}
