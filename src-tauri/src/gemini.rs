@@ -28,7 +28,18 @@
 //!      returns it.
 //!
 //! Authentication is the standard Gemini API key in the `x-goog-api-key`
-//! header, fetched from the OS keychain.
+//! header. As of v0.5.37 the key is baked into the binary so beta
+//! testers don't need to provision their own — the user (Aiden) is
+//! footing the bill during the closed beta. The keychain helpers in
+//! `keychain.rs` and the `set_gemini_key` / `get_gemini_key` /
+//! `has_gemini_key` / `clear_gemini_key` Tauri commands are still
+//! registered for back-compat with any persisted state on existing
+//! installs, but the detection path no longer reads them.
+//!
+//! The hardcoded key is restricted at the Google Cloud project level
+//! (per-minute + daily quota cap) so the worst-case fan-out from a
+//! leaked binary is bounded. Rotate by editing `HARDCODED_GEMINI_API_KEY`
+//! and shipping a new release.
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -38,9 +49,12 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
 
-use crate::keychain;
-
 const GEMINI_API_BASE: &str = "https://generativelanguage.googleapis.com";
+
+/// Beta-cycle Gemini API key. Baked into the binary so testers can drop
+/// a PDF immediately without configuring anything. See module-level
+/// docs for the rationale + quota-cap caveat.
+const HARDCODED_GEMINI_API_KEY: &str = "AIzaSyA0gmkWIXYFToqWRzAp7H6AxwBlSvSp9ik";
 
 /// Streaming progress event emitted to the renderer over the
 /// `gemini-progress` channel while a detection call is in flight. The
@@ -133,9 +147,11 @@ fn build_client() -> Result<reqwest::Client, String> {
         .map_err(|e| format!("HTTP client init failed: {e}"))
 }
 
+/// v0.5.37 — always returns the baked-in key. The previous keychain
+/// lookup is gone; the renderer no longer renders an "API key not
+/// configured" path because the key is guaranteed to be present.
 fn require_key() -> Result<String, String> {
-    keychain::read_api_key()
-        .ok_or_else(|| "Gemini API key is not configured. Open Settings to add one.".to_string())
+    Ok(HARDCODED_GEMINI_API_KEY.to_string())
 }
 
 fn emit_progress(app: &AppHandle, payload: GeminiProgress) {

@@ -35,7 +35,6 @@ import {
   extractProjectFromPdfWithClaude,
   ClaudeNotConfiguredError,
 } from "@/utils/geminiFieldDetector";
-import { hasApiKey } from "@/services/geminiClient";
 import {
   buildPdfFingerprint,
   buildTemplateFingerprintFromTemplate,
@@ -522,17 +521,13 @@ function MainApp() {
     [updateDocumentInProject, projects]
   );
 
+  // v0.5.37 — the Gemini API key is now baked into the binary so the
+  // "is the user configured?" gate is unconditionally satisfied.
+  // Keeping the wrapper (rather than deleting it) so the existing
+  // call sites stay readable as "we're about to spend an API call".
   const ensureClaudeConfigured = useCallback(async (): Promise<boolean> => {
-    const configured = await hasApiKey();
-    if (!configured) {
-      showToast(
-        "Add your Gemini API key in Settings to enable detection.",
-        "info"
-      );
-      setSettingsOpen(true);
-    }
-    return configured;
-  }, [showToast]);
+    return true;
+  }, []);
 
   const processDroppedPdf = useCallback(
     async (
@@ -721,19 +716,9 @@ function MainApp() {
         console.warn("[Typeset] Registry lookup failed; falling back to Gemini:", err);
       }
 
-      // Step 2: nothing in cache or registry. Make sure Gemini is configured.
-      const configured = await hasApiKey();
-      if (!configured) {
-        if (!options.silentToasts) {
-          showToast(
-            "Add your Gemini API key in Settings to detect fields.",
-            "info"
-          );
-        }
-        setSettingsOpen(true);
-        updateDocumentInProject(effectiveProjectId, docId, { status: "pending" });
-        return "no-key";
-      }
+      // Step 2: nothing in cache or registry — fall straight through
+      // to Gemini detection. v0.5.37 bakes the API key into the
+      // binary, so there's no "configured?" gate anymore.
 
       // Step 3: Gemini detection.
       const setDocProcessing = (msg: string, progress?: number) => {
