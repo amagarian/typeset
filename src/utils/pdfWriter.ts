@@ -56,6 +56,37 @@ function fitTextToWidth(text: string, width: number, font: any, fontSize: number
   return text.slice(0, cut) + ellipsis;
 }
 
+/**
+ * v0.6.8 — shrink the font down to a floor before resorting to
+ * ellipsis-truncation. The Arrow CC Authorization Billing Address
+ * single-line render at 9pt ran ~30pt past the right edge of the
+ * row band, so v0.6.7 chopped it to `1115 W SUNSET BLVD #510, LOS
+ * ANGELES, …`. We'd rather see the whole address smaller than half
+ * of it at the "correct" size — addresses are short and stay legible
+ * down to 6.5pt easily, so we step the size down in 0.5pt increments
+ * until the value fits or we hit the floor.
+ */
+function fitWithShrink(
+  text: string,
+  width: number,
+  font: any,
+  baseFontSize: number,
+  minFontSize: number = 6.5
+): { text: string; fontSize: number } {
+  if (!text) return { text: "", fontSize: baseFontSize };
+  const maxWidth = Math.max(0, width - 6);
+  if (maxWidth <= 0) return { text, fontSize: baseFontSize };
+  if (font.widthOfTextAtSize(text, baseFontSize) <= maxWidth) {
+    return { text, fontSize: baseFontSize };
+  }
+  for (let size = baseFontSize - 0.5; size >= minFontSize; size -= 0.5) {
+    if (font.widthOfTextAtSize(text, size) <= maxWidth) {
+      return { text, fontSize: size };
+    }
+  }
+  return { text: fitTextToWidth(text, width, font, minFontSize), fontSize: minFontSize };
+}
+
 export interface WritePdfOptions {
   defaultFontSize?: number;
   promptValues?: PromptFieldValues;
@@ -378,48 +409,60 @@ export async function writeFilledPdfBytes(
         const lines = rawValue.split(/\r?\n/).filter((s) => s.length > 0);
         if (lines.length === 0) continue;
 
-        let fontSize: number;
+        let baseFontSize: number;
         if (field.estimatedFontSize) {
-          fontSize = Math.max(7, Math.min(16, Math.round(field.estimatedFontSize * 1.5)));
+          baseFontSize = Math.max(7, Math.min(16, Math.round(field.estimatedFontSize * 1.5)));
         } else {
           const perLine = field.height / Math.max(1, lines.length);
-          fontSize = Math.max(7, Math.min(12, Math.floor(perLine * 0.6)));
+          baseFontSize = Math.max(7, Math.min(12, Math.floor(perLine * 0.6)));
         }
-        const rowHeight = Math.max(
-          fontSize * 1.25,
-          field.height / Math.max(lines.length, 1)
-        );
 
         let yBaseline = yPdfBottom + field.height - 1;
+        const usableWidth = field.width - (insetX - 3);
 
         for (const line of lines) {
-          const fitted = fitTextToWidth(line, field.width - (insetX - 3), font, fontSize);
+          const { text: fitted, fontSize: actualFontSize } = fitWithShrink(
+            line,
+            usableWidth,
+            font,
+            baseFontSize
+          );
           page.drawText(fitted, {
             x: x + insetX,
             y: yBaseline,
-            size: fontSize,
+            size: actualFontSize,
             font,
             color: rgb(0.1, 0.1, 0.1),
           });
+          const rowHeight = Math.max(
+            actualFontSize * 1.25,
+            field.height / Math.max(lines.length, 1)
+          );
           yBaseline -= rowHeight;
-          if (yBaseline < yPdfBottom - fontSize) break;
+          if (yBaseline < yPdfBottom - actualFontSize) break;
         }
         continue;
       }
 
-      let fontSize = defaultFontSize;
+      let baseFontSize = defaultFontSize;
       if (field.estimatedFontSize) {
-        fontSize = Math.max(7, Math.min(16, Math.round(field.estimatedFontSize * 1.5)));
+        baseFontSize = Math.max(7, Math.min(16, Math.round(field.estimatedFontSize * 1.5)));
       } else if (field.height > 0) {
-        fontSize = Math.max(7, Math.min(12, Math.floor(field.height * 0.75)));
+        baseFontSize = Math.max(7, Math.min(12, Math.floor(field.height * 0.75)));
       }
 
-      const value = fitTextToWidth(rawValue, field.width - (insetX - 3), font, fontSize);
+      const usableWidth = field.width - (insetX - 3);
+      const { text: value, fontSize: actualFontSize } = fitWithShrink(
+        rawValue,
+        usableWidth,
+        font,
+        baseFontSize
+      );
 
       page.drawText(value, {
         x: x + insetX,
-        y: yPdfBottom + Math.max(4, (field.height - fontSize) / 2) + 2,
-        size: fontSize,
+        y: yPdfBottom + Math.max(4, (field.height - actualFontSize) / 2) + 2,
+        size: actualFontSize,
         font,
         color: rgb(0.1, 0.1, 0.1),
       });

@@ -2749,25 +2749,26 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
     const overlapIdx = result.findIndex((existing) => {
       if (existing.pageNumber !== field.pageNumber) return false;
       const iou = bboxIoU(existing, field);
-      // High overlap → always dedupe regardless of fieldType / canonical.
-      // This catches the v0.6.4 escape: a `creditCardHolder` text bbox
-      // dropped onto the same underline as `creditCardNumber` produced
-      // two values written on top of each other (mishmash of letters
-      // and digits) because IoU sat below 0.3 and canonicals differed.
+      // v0.6.8 — thresholds tightened after another regression where a
+      // `creditCardHolder` bbox landed just shy of the previous
+      // 0.25-IoU same-fieldType bar but still painted over the
+      // `creditCardNumber` underline. Now ANY two text bboxes on the
+      // same page with IoU ≥ 0.15 (or one mostly-inside the other) get
+      // collapsed regardless of canonical id, with the larger-area
+      // survivor kept. Cross-fieldType (text vs checkbox, etc.) still
+      // requires the stricter 0.5/0.7 bar so we don't fuse a checkbox
+      // sitting on top of a text-field underline.
       if (iou >= 0.5) return true;
-      // Containment: one bbox is mostly-inside the other (the value
-      // area inside a wider row band, or vice-versa). Same idea —
-      // they're claiming the same writable space.
       const containAB = bboxContainment(existing, field);
       const containBA = bboxContainment(field, existing);
-      if (Math.max(containAB, containBA) >= 0.7) return true;
-      // Same-fieldType + lower-bar overlap: model-emitted
-      // double-detections of the same conceptual field (the original
-      // "two strings on top of each other" failure for the same
-      // canonical, where the row vs digit-area bboxes sit at slightly
-      // different scales).
-      if (existing.fieldType === field.fieldType && iou >= 0.25) return true;
-      // Same canonical id with any overlap is always a dedupe.
+      if (Math.max(containAB, containBA) >= 0.5) return true;
+      if (existing.fieldType === field.fieldType && iou >= 0.15) return true;
+      if (
+        existing.fieldType === field.fieldType &&
+        Math.max(containAB, containBA) >= 0.35
+      ) {
+        return true;
+      }
       if (
         existing.canonicalFieldId &&
         existing.canonicalFieldId === field.canonicalFieldId &&
@@ -2775,8 +2776,6 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
       ) {
         return true;
       }
-      // Legacy corner-distance check: cheap fallback for tightly
-      // co-located detections that the above passes missed.
       return (
         existing.fieldType === field.fieldType &&
         Math.abs(existing.x - field.x) < 12 &&
