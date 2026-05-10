@@ -44,25 +44,27 @@
 }
 
 /*
- * v0.5.32 — icon-only "+" trigger. Lives at the bottom-left of
+ * v0.5.33 — icon-only "+" trigger. Lives at the bottom-left of
  * the sidebar where Settings used to sit. The button itself is
  * still the container (no wrapping `.footer` panel, no nested
  * border). A single top hairline divides it from the project
- * list above. The glyph stays centered and the *primary*
- * visual feedback on hover is the row-wide background fade.
+ * list above. The glyph stays centered and the *only* visual
+ * feedback on hover is the row-wide background fade.
  *
- * Hover token swap (v0.5.32): we previously painted the hover
- * with var(--bg-input) to mirror the Import-from-PDF button,
- * but that token only reads as "darker" because Import sits on
- * var(--bg-app) (#f2f2f0). On the sidebar surface
- * (var(--bg-sidebar) = #e8e8e6) the same --bg-input (#eaeae8)
- * is only ~2/255 brighter — visually indistinguishable, so the
- * hover felt broken. var(--border) (#d4d4d2) is the only
+ * Hover token (v0.5.32): var(--border) (#d4d4d2) is the only
  * existing token that sits perceptibly darker than
  * --bg-sidebar (~20 steps), and it's already the sidebar's
  * right-edge color, so the hover treatment reads as related
- * to the existing chrome rather than a new shade. Color still
- * tightens to var(--text) as a subtle secondary cue.
+ * to the existing chrome rather than a new shade.
+ *
+ * Glyph stays static (v0.5.33 — restored from v0.5.30): the
+ * hover/focus rules touch ONLY background-color. Color stays
+ * pinned to var(--text-muted) in every state (rest, hover,
+ * focus-visible) so the visual feedback is singular — one
+ * surface fades, the glyph never tints. v0.5.32 briefly
+ * re-added `color: var(--text)` to hover/focus, which caused
+ * the `+` to inherit-shift on hover; that regression is
+ * undone here.
  */
 .newProjectBtn {
   display: flex;
@@ -76,17 +78,15 @@
   border-top: 1px solid var(--border);
   border-radius: 0;
   cursor: pointer;
-  transition: color 0.15s, background-color 0.15s ease;
+  transition: background-color 0.15s ease;
 }
 
 .newProjectBtn:hover {
-  color: var(--text);
   background-color: var(--border);
 }
 
 .newProjectBtn:focus-visible {
   outline: none;
-  color: var(--text);
   background-color: var(--border);
 }
 

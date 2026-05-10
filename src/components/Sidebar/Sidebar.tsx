@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { ProjectList } from "../ProjectList/ProjectList";
+import { EmptyStateArrow } from "./EmptyStateArrow";
 import styles from "./Sidebar.module.css";
 
 interface SidebarProps {
@@ -43,14 +44,21 @@ export function Sidebar({ projects, selectedId, onSelect, onNewProject }: Sideba
         onSelect={onSelect}
       />
       {/*
-        v0.5.29 — collapsed to a centered icon-only "+" trigger.
-        The "New project" word-mark is gone; discoverability now
-        comes from the native title tooltip ("New project") and
-        the still-full-width hit target inherited from v0.5.27.
-        Hover treatment is anchored to the row background (fades
-        to var(--bg-input) — the same surface the Import-from-PDF
-        button uses) so the primary visual feedback is the full
-        button shading, not the icon glyph color.
+        v0.5.33 — playful curved arrow shown only when the
+        project list is genuinely empty (no projects AND no
+        search). We deliberately suppress it when a search
+        returns no matches: at that point the empty state is
+        about the query, not the app, and a hint pointing at
+        "+ New project" would be misleading. Lives between the
+        (empty) ProjectList and the trigger button so it reads
+        as a directional cue at the latter.
+      */}
+      {projects.length === 0 && search === "" && <EmptyStateArrow />}
+      {/*
+        v0.5.33 — collapsed to a centered icon-only "+" trigger.
+        Hover anchors to var(--border) (set in the CSS module);
+        the glyph color stays pinned in every state so the only
+        visual feedback is the row-wide background fade.
       */}
       <button
         type="button"

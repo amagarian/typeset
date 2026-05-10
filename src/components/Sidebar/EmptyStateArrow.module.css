@@ -1,0 +1,33 @@
+/*
+ * v0.5.33 — empty-state decorative arrow.
+ *
+ * Renders only when the project list is genuinely empty (no
+ * search), pointing down at the `+ New project` button. The
+ * arrow lives between the (empty) `<ProjectList>` slot and the
+ * footer button: ProjectList's `flex: 1` absorbs the upper
+ * vertical space, so the SVG settles low in the sidebar with
+ * the tip just above the button — exactly where it should
+ * read as a hint at the trigger.
+ *
+ * `pointer-events: none` keeps the button hit-target clean
+ * even when the bob animation dips the arrow tip close to
+ * the button row.
+ */
+.arrow {
+  pointer-events: none;
+  margin: 24px auto;
+  display: block;
+  opacity: 0.7;
+  color: var(--text-muted);
+  animation: bob 2.5s ease-in-out infinite;
+}
+
+@keyframes bob {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-3px);
+  }
+}
