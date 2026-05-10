@@ -2915,6 +2915,13 @@ async function detectFieldsImpl(
     );
   }
 
+  // v0.5.37 — both `getModelPreference` and `getAccuracyMode` now
+  // return locked constants (gemini-3.1-flash-lite + "fast"). The
+  // model dropdown and accuracy radio group were removed from the
+  // SettingsModal so beta testers see a single paved-path
+  // experience. The two-pass / Maximum-mode codepaths below are
+  // still in place but unreachable from the UI; safe to prune in a
+  // future cleanup pass.
   const model = getModelPreference();
   const accuracyMode = getAccuracyMode();
   const twoPass = accuracyMode === "maximum";
