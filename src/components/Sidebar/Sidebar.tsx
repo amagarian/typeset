@@ -1,6 +1,5 @@
-import { useState, useCallback } from "react";
+import { useState } from "react";
 import { ProjectList } from "../ProjectList/ProjectList";
-import { isUpdateInstalled, runUpdateCheck } from "@/utils/autoUpdate";
 import styles from "./Sidebar.module.css";
 
 interface SidebarProps {
@@ -13,64 +12,30 @@ interface SidebarProps {
 
 export function Sidebar({ projects, selectedId, onSelect, onNewProject, onOpenSettings }: SidebarProps) {
   const [search, setSearch] = useState("");
-  const [updateStatus, setUpdateStatus] = useState<"idle" | "checking" | "upToDate" | "error">("idle");
-  const [errorDetail, setErrorDetail] = useState<string | null>(null);
 
   const filtered = search.trim()
     ? projects.filter((p) => p.label.toLowerCase().includes(search.toLowerCase()))
     : projects;
 
-  // v0.5.23 — manual "Check for updates" funnels through the shared
-  // helper alongside the launch/focus auto-checks. The helper handles
-  // the silent download + install; on success it notifies the
-  // useAutoUpdate hook (mounted in App.tsx) which raises the
-  // relaunch banner. We just surface lightweight status text here.
-  const checkForUpdates = useCallback(async () => {
-    if (isUpdateInstalled()) {
-      // Auto-flow already installed and the banner is showing.
-      // No-op per the v0.5.23 behaviour spec.
-      console.log("[AutoUpdate] manual click ignored — update already installed this session");
-      return;
-    }
-    setUpdateStatus("checking");
-    setErrorDetail(null);
-    const result = await runUpdateCheck({ source: "manual" });
-    switch (result.kind) {
-      case "installed":
-      case "already-installed":
-        // Banner is now (or was already) visible; clear any sidebar status.
-        setUpdateStatus("idle");
-        break;
-      case "no-update":
-        setUpdateStatus("upToDate");
-        setTimeout(() => setUpdateStatus("idle"), 3000);
-        break;
-      case "error": {
-        const msg = result.error instanceof Error ? result.error.message : String(result.error);
-        setErrorDetail(msg);
-        setUpdateStatus("error");
-        setTimeout(() => {
-          setUpdateStatus("idle");
-          setErrorDetail(null);
-        }, 8000);
-        break;
-      }
-      case "debounced":
-        // Manual source never returns 'debounced' from the helper, but
-        // the discriminated union forces us to handle it. Reset to idle.
-        setUpdateStatus("idle");
-        break;
-    }
-  }, []);
-
-  const updateLabel =
-    updateStatus === "checking" ? "Checking…" :
-    updateStatus === "upToDate" ? "Up to date" :
-    updateStatus === "error" ? (errorDetail ? `Error: ${errorDetail}` : "Update check failed") :
-    "Check for updates";
-
   return (
     <aside className={styles.sidebar}>
+      {/*
+        v0.5.26 — primary "+ New project" CTA above the search input.
+        The bare-`+` ghost button at the bottom of the footer was
+        the wrong affordance: too small, no label, easy to miss.
+        Linear/Notion both surface their primary "create" action
+        above the list it adds to. The full-width labelled CTA is
+        the standard pattern.
+      */}
+      <button
+        type="button"
+        className={styles.newProjectBtn}
+        onClick={onNewProject}
+        aria-label="New project"
+      >
+        <span className={styles.newProjectIcon} aria-hidden="true">+</span>
+        <span>New project</span>
+      </button>
       <div className={styles.searchRow}>
         <input
           type="text"
@@ -85,11 +50,16 @@ export function Sidebar({ projects, selectedId, onSelect, onNewProject, onOpenSe
         selectedId={selectedId}
         onSelect={onSelect}
       />
-      <div className={styles.footer}>
-        <button type="button" className={styles.addBtn} onClick={onNewProject} title="New project">
-          +
-        </button>
-        {onOpenSettings && (
+      {/*
+        v0.5.26 — sidebar footer carries only the Settings entry.
+        "Check for updates" was relocated into the Settings modal's
+        About row alongside the version literal; the auto-update
+        flow (v0.5.23) handles the common case so the manual button
+        is now a power-user opt-in and doesn't deserve persistent
+        sidebar real estate.
+      */}
+      {onOpenSettings && (
+        <div className={styles.footer}>
           <button
             type="button"
             className={styles.settingsBtn}
@@ -103,16 +73,8 @@ export function Sidebar({ projects, selectedId, onSelect, onNewProject, onOpenSe
             </svg>
             <span>Settings</span>
           </button>
-        )}
-        <button
-          type="button"
-          className={styles.updateBtn}
-          onClick={checkForUpdates}
-          disabled={updateStatus === "checking"}
-        >
-          {updateLabel}
-        </button>
-      </div>
+        </div>
+      )}
     </aside>
   );
 }

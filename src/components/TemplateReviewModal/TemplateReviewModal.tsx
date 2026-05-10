@@ -455,6 +455,7 @@ export function TemplateReviewModal({
             className={styles.closeBtn}
             onClick={onClose}
             aria-label="Close"
+            title="Close (Esc)"
           >
             ×
           </button>

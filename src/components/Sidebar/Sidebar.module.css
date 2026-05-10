@@ -7,11 +7,52 @@
   flex-direction: column;
 }
 
+/*
+ * v0.5.26 — primary "+ New project" CTA above the search input.
+ * Replaces the bare "+" ghost button that used to live in the
+ * footer. Full-width, labelled, mid-weight so it reads as the
+ * canonical "create" affordance without competing with the
+ * project list it adds to.
+ */
+.newProjectBtn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: calc(100% - 24px);
+  margin: 40px 12px 0;
+  padding: 8px 10px;
+  background: var(--bg-panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s, color 0.15s;
+}
+
+.newProjectBtn:hover {
+  background: #ffffff;
+  border-color: var(--border-focus);
+}
+
+.newProjectIcon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  font-size: 16px;
+  font-weight: 400;
+  line-height: 1;
+  color: var(--text-muted);
+}
+
 .searchRow {
   display: flex;
   align-items: center;
   gap: 6px;
-  margin: 40px 12px 8px;
+  margin: 8px 12px 8px;
   padding: 7px 10px;
   background: var(--bg-panel);
   border: 1px solid var(--border);
@@ -37,27 +78,8 @@
   border-top: 1px solid var(--border);
 }
 
-.addBtn {
-  width: 100%;
-  padding: 6px 0;
-  font-size: 18px;
-  font-weight: 300;
-  color: var(--text-muted);
-  background: none;
-  border: 1px dashed var(--border);
-  border-radius: var(--radius-sm);
-  line-height: 1;
-  transition: color 0.15s, border-color 0.15s;
-}
-
-.addBtn:hover {
-  color: var(--text);
-  border-color: var(--border-focus);
-}
-
 .settingsBtn {
   width: 100%;
-  margin-top: 8px;
   padding: 6px 8px;
   display: flex;
   align-items: center;
@@ -76,25 +98,4 @@
   color: var(--text);
   border-color: var(--border);
   background: var(--bg-panel);
-}
-
-.updateBtn {
-  width: 100%;
-  margin-top: 8px;
-  padding: 4px 0;
-  font-size: 11px;
-  color: var(--text-muted);
-  background: none;
-  border: none;
-  cursor: pointer;
-  transition: color 0.15s;
-}
-
-.updateBtn:hover:not(:disabled) {
-  color: var(--text);
-}
-
-.updateBtn:disabled {
-  cursor: default;
-  opacity: 0.7;
 }

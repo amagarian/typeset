@@ -48,6 +48,7 @@ export function UpdateBanner({ version, onRelaunch, onDismiss }: UpdateBannerPro
           className={styles.close}
           onClick={onDismiss}
           aria-label="Dismiss update notice"
+          title="Dismiss"
         >
           ×
         </button>

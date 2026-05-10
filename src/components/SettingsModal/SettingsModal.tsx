@@ -18,7 +18,15 @@ import {
   type AccuracyMode,
 } from "@/services/geminiSettings";
 import { writeLocalTemplates } from "@/services/templateCache";
+import { isUpdateInstalled, runUpdateCheck } from "@/utils/autoUpdate";
+import packageJson from "../../../package.json";
 import styles from "./SettingsModal.module.css";
+
+// v0.5.26 — single source of truth for the version string we print in
+// the Settings "About" footer. Pulled from `package.json` so the
+// label always matches the bundled build (no chance of skew with the
+// Tauri-installed binary).
+const APP_VERSION: string = (packageJson as { version: string }).version;
 
 const CUSTOM_OPTION_VALUE = "__custom__";
 
@@ -62,6 +70,13 @@ export function SettingsModal({
   const [resetConfirming, setResetConfirming] = useState(false);
   const [resetStatus, setResetStatus] = useState<string | null>(null);
   const resetStatusTimerRef = useRef<number | null>(null);
+  // v0.5.26 — manual "Check for updates" relocated here from the
+  // sidebar footer. Auto-update on launch / focus (v0.5.23) handles
+  // the common case; this surface is the power-user opt-in.
+  const [updateStatus, setUpdateStatus] = useState<
+    "idle" | "checking" | "upToDate" | "error"
+  >("idle");
+  const [updateError, setUpdateError] = useState<string | null>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -144,6 +159,42 @@ export function SettingsModal({
     }
   }, []);
 
+  // v0.5.26 — same flow as the v0.5.23 sidebar handler: route through
+  // the shared `runUpdateCheck` helper so the auto-update banner
+  // takes over once an install completes. We just surface the
+  // lightweight "Checking…" / "Up to date" / error state inline next
+  // to the version line.
+  const handleCheckForUpdates = useCallback(async () => {
+    if (isUpdateInstalled()) return;
+    setUpdateStatus("checking");
+    setUpdateError(null);
+    const result = await runUpdateCheck({ source: "manual" });
+    switch (result.kind) {
+      case "installed":
+      case "already-installed":
+        setUpdateStatus("idle");
+        break;
+      case "no-update":
+        setUpdateStatus("upToDate");
+        window.setTimeout(() => setUpdateStatus("idle"), 3000);
+        break;
+      case "error": {
+        const msg =
+          result.error instanceof Error ? result.error.message : String(result.error);
+        setUpdateError(msg);
+        setUpdateStatus("error");
+        window.setTimeout(() => {
+          setUpdateStatus("idle");
+          setUpdateError(null);
+        }, 8000);
+        break;
+      }
+      case "debounced":
+        setUpdateStatus("idle");
+        break;
+    }
+  }, []);
+
   const handleResetLocalTemplates = useCallback(() => {
     writeLocalTemplates([]);
     setResetConfirming(false);
@@ -200,6 +251,7 @@ export function SettingsModal({
             className={styles.closeBtn}
             onClick={onClose}
             aria-label="Close"
+            title="Close"
           >
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
               <path d="M18 6L6 18M6 6l12 12" />
@@ -385,6 +437,31 @@ export function SettingsModal({
             </button>
           </div>
         </footer>
+
+        {/* v0.5.26 — About row. Quiet version line + manual update
+            opt-in, relocated here from the sidebar footer so the
+            sidebar can carry only its primary actions. */}
+        <div className={styles.about}>
+          <span className={styles.aboutVersion}>Typeset {APP_VERSION}</span>
+          <span className={styles.aboutSeparator}>—</span>
+          {updateStatus === "checking" ? (
+            <span className={styles.aboutStatus}>Checking…</span>
+          ) : updateStatus === "upToDate" ? (
+            <span className={styles.aboutStatus}>Up to date</span>
+          ) : updateStatus === "error" ? (
+            <span className={styles.aboutError}>
+              {updateError ? `Update check failed — ${updateError}` : "Update check failed"}
+            </span>
+          ) : (
+            <button
+              type="button"
+              className={styles.aboutLink}
+              onClick={handleCheckForUpdates}
+            >
+              Check for updates
+            </button>
+          )}
+        </div>
       </div>
     </div>
   );

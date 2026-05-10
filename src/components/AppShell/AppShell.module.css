@@ -35,11 +35,18 @@
  * v0.5.24 — main-window header strip.
  *
  * Sits absolutely positioned across the top of `.main` so it shares
- * the 38px-tall drag region row with the existing window dragger
+ * the title-bar drag-region row with the existing window dragger
  * without disturbing the existing column layout (NewProjectView /
  * ProjectWorkspace already pad 40px of clearance from the top).
  * The strip's children remain clickable; `.headerRight` opts out
  * of the drag region so the contribution badge can be clicked.
+ *
+ * v0.5.26 — Typeset wordmark removed from the strip; the
+ * contribution badge is the sole inhabitant. The strip is shorter
+ * (32px) and the right-side gutter is wider (16px) so the badge
+ * reads as a deliberate UI element rather than a corner orphan.
+ * Keeping the strip (rather than removing it entirely) preserves
+ * the drag-region overlap and gives the badge a stable home.
  */
 .mainHeader {
   position: absolute;
@@ -49,23 +56,10 @@
   z-index: 11;
   display: flex;
   align-items: center;
-  justify-content: space-between;
+  justify-content: flex-end;
   gap: 12px;
-  height: 38px;
-  padding: 0 16px;
-  pointer-events: none;
-}
-
-/* Brand wordmark — display face, slight negative tracking, modest
- * weight contrast vs. the body sans elsewhere in the chrome. */
-.brand {
-  font-family: var(--font-display);
-  font-size: 13px;
-  font-weight: 600;
-  letter-spacing: var(--letter-display);
-  color: var(--text);
-  user-select: none;
-  -webkit-user-select: none;
+  height: 32px;
+  padding: 6px 16px 6px 12px;
   pointer-events: none;
 }
 

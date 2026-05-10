@@ -24,7 +24,7 @@ export function Toast({ toast, onDismiss, durationMs = 2600 }: ToastProps) {
   return (
     <div className={styles.toast} role="status" aria-live="polite">
       <span className={styles.message}>{toast.message}</span>
-      <button type="button" className={styles.close} onClick={onDismiss} aria-label="Dismiss">
+      <button type="button" className={styles.close} onClick={onDismiss} aria-label="Dismiss" title="Dismiss">
         ×
       </button>
     </div>

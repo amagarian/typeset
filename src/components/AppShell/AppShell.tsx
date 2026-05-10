@@ -11,8 +11,11 @@ interface AppShellProps {
   onOpenSettings?: () => void;
   /**
    * v0.5.24 — top-right slot in the main-window header. Used by App.tsx
-   * to mount the contribution tally badge alongside the Typeset
-   * wordmark. Optional so legacy call sites (none today) keep working.
+   * to mount the contribution tally badge.
+   *
+   * v0.5.26 — the Typeset wordmark on the left of this strip was
+   * removed in the design pass; the strip now exists solely to host
+   * the contribution badge over the title-bar drag region.
    */
   headerRight?: ReactNode;
 }
@@ -38,7 +41,6 @@ export function AppShell({
       />
       <main className={styles.main}>
         <header className={styles.mainHeader} data-tauri-drag-region>
-          <span className={styles.brand}>Typeset</span>
           <div className={styles.headerRight}>{headerRight}</div>
         </header>
         {children}

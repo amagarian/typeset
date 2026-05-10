@@ -34,7 +34,15 @@ export function FillPromptModal({
   onClose,
   onSubmit,
 }: FillPromptModalProps) {
-  const allPromptFields = useMemo(() => getPromptFields(template), [template]);
+  // v0.5.26 — `getPromptFields` now considers project + initial values
+  // so an option-group field whose selection is already resolvable
+  // (project default or saved prompt value) is hidden from the
+  // modal entirely. Mirrors the behaviour of `checkbox-group` and
+  // every other auto-fillable kind.
+  const allPromptFields = useMemo(
+    () => getPromptFields(template, project ?? undefined, initialValues),
+    [template, project, initialValues]
+  );
   const requiredFields = useMemo(() => allPromptFields.filter((f) => !f.optional), [allPromptFields]);
   const optionalFields = useMemo(() => allPromptFields.filter((f) => f.optional), [allPromptFields]);
   const promptFields = allPromptFields;
@@ -94,7 +102,7 @@ export function FillPromptModal({
           <h2 id="fill-prompt-title" className={styles.title}>
             Fill required values
           </h2>
-          <button type="button" className={styles.closeBtn} onClick={onClose} aria-label="Close">
+          <button type="button" className={styles.closeBtn} onClick={onClose} aria-label="Close" title="Close">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M18 6L6 18M6 6l12 12" /></svg>
           </button>
         </header>

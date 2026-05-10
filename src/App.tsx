@@ -426,13 +426,14 @@ function MainApp() {
 
   const autoFillDocument = useCallback(
     (template: Template, docId: string, projectId: string) => {
-      if (getPromptFields(template).length > 0) return;
+      const project = projects.find((p) => p.id === projectId);
+      if (getPromptFields(template, project).length > 0) return;
       updateDocumentInProject(projectId, docId, {
         status: "filled",
         updatedAt: new Date().toISOString(),
       });
     },
-    [updateDocumentInProject]
+    [updateDocumentInProject, projects]
   );
 
   const ensureClaudeConfigured = useCallback(async (): Promise<boolean> => {
@@ -531,7 +532,7 @@ function MainApp() {
           setMatchModal(result);
         }
 
-        if (options.autoFillVerified && getPromptFields(template).length === 0) {
+        if (options.autoFillVerified && getPromptFields(template, effectiveProject).length === 0) {
           try {
             const filledBytes = await writeFilledPdfBytes(bytes, template, effectiveProject, {
               defaultFontSize: 10,
@@ -1286,16 +1287,20 @@ function MainApp() {
         silentSuccess?: boolean;
       } = {}
     ) => {
-      const promptFields = getPromptFields(template);
+      const savedValues = promptValuesByTemplate[template.id] ?? {};
+      // v0.5.26 — pass `project` + `savedValues` so option-group
+      // fields drop out of the prompt list whenever
+      // `getOptionGroupSelection` can already resolve a label
+      // (project default OR a previously-saved prompt entry).
+      const promptFields = getPromptFields(template, project, savedValues);
       if (promptFields.length === 0) {
         runFillAction(template, mode, project, sourceBytes, fileName, {}, options);
         return;
       }
-      const savedValues = promptValuesByTemplate[template.id];
       const isCheckbox = (f: typeof promptFields[0]) =>
         f.fieldType === "checkbox" || f.fieldKind === "boolean-checkbox";
       const allFilled =
-        savedValues &&
+        Object.keys(savedValues).length > 0 &&
         promptFields.every((f) => isCheckbox(f) || (savedValues[f.id] ?? "").trim());
       if (allFilled) {
         runFillAction(template, mode, project, sourceBytes, fileName, savedValues, options);

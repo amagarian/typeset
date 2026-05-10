@@ -577,11 +577,20 @@ function buildPass1SharedSystemPrompt(): string {
     "  - Visa / MasterCard / Discover / AMEX selector boxes (each with a drawn ☐ checkbox or radio circle next to the label) → `checkbox`.",
     "  - Any ☐ glyph or empty square the size of one letter → `checkbox`.",
     "",
-    "## Option-group rule (v0.5.25) — horizontal label list with NO drawn checkboxes",
+    "## Option-group rule (v0.5.25, tightened v0.5.26) — horizontal label list with NO drawn checkboxes",
     "When you see a horizontal list of mutually-exclusive labels (e.g. `Visa  MasterCard  AMEX  Discover  Other`), where there are NO checkboxes/circles/radio buttons drawn next to each label and the user is expected to circle, underline, or otherwise mark ONE of them — emit a SINGLE field with `field_type: 'option-group'`, `field_kind: 'option-group'`, and an `options` array. Each option entry MUST include:",
     "  - `label`: the option's printed text (Title Case, e.g. `\"Visa\"`, `\"MasterCard\"`, `\"AMEX\"`, `\"Discover\"`, `\"Other\"`).",
     "  - `bbox`: a TIGHT bbox around just THAT option's label text, in normalized 0-1000 `[y_min, x_min, y_max, x_max]` coordinates with the same 2-3pt of padding you would use for any tight label crop.",
     "Do NOT emit individual `checkbox` fields for each label. Do NOT emit five separate `text` fields for the row. ONE field with a populated `options` array. The PARENT bbox covers the entire row of labels (including the leading caption like `Card Type:` if present? — NO: the parent bbox covers ONLY the option labels' horizontal extent, NOT the caption).",
+    "",
+    "### Eligibility — mandatory hard gates",
+    "An option-group field requires ALL of the following. If ANY gate fails, do NOT emit `option-group` for the cluster — emit each label's surrounding writable area as its own field instead.",
+    "  1. **Cardinality:** at least THREE mutually-exclusive labels in a single horizontal row. Two-label groupings (e.g. `Yes  No`, `M  F`, `Visa  MasterCard`) are valid ONLY when the labels are clearly mutually-exclusive selector options drawn as a single picker (no extra punctuation, no trailing colons, no role mismatch). When in doubt with two labels, prefer two separate fields over one option-group.",
+    "  2. **Same row:** every option's bbox must sit on the SAME visual row. Vertical centers must agree within ~6pt. A pair of labels separated by more than a single line height is two unrelated fields, never an option-group.",
+    "  3. **Mutually-exclusive semantics:** every option must read as one of N picker choices (a brand, a method, a tier, etc.). Reject the cluster if any option label has a DIFFERENT semantic role — e.g. one is a write-in continuation tail (`Other:` followed by `____`), one is a separate field's label (`Cardholder Name`, `Card Number`, `Date`), or one is the row caption itself (`Card Type:`).",
+    "  4. **No trailing punctuation in option labels.** A label that ends in `:` (`Other:`, `Date:`, `Name:`) is a label-for-blank, NOT an option — it labels a write-in field rather than naming a selector choice. Strip the colon if and only if you are 100% sure the label is a real option (`Other` standing alone in `Visa  MasterCard  Other:____`); otherwise emit the colon-suffixed item as a `text` field's label instead.",
+    "",
+    "If you cannot satisfy ALL four gates, fall back to per-field emission. We strongly prefer 5 correctly-classified fields over 1 falsely-grouped option-group with stray neighbour labels mixed in.",
     "",
     "If the row has a trailing `Other:___` continuation line (a writable blank after the `Other` option), emit the option-group as described AND ALSO emit a SEPARATE text field for the `Other:___` blank line. The `Other` option's bbox covers the printed word `Other`; the trailing `___` is its own field.",
     "",
@@ -595,6 +604,10 @@ function buildPass1SharedSystemPrompt(): string {
     "    → emit ONE field with `field_type: 'option-group'`, `field_kind: 'option-group'`, `label: 'Method'`, `options: [{label: 'Cash', bbox: [...]}, {label: 'Check', bbox: [...]}, {label: 'Wire', bbox: [...]}, {label: 'Other', bbox: [...]}]`. `canonical_field_id: null` (not a card-type pattern).",
     "  Form text with drawn boxes: `☐ Visa  ☐ MasterCard  ☐ AMEX  ☐ Discover`",
     "    → KEEP existing behaviour: emit four separate `field_type: 'checkbox'` fields, NOT an option-group. The drawn ☐ glyphs are the writable area.",
+    "  ANTI-EXAMPLE — DO NOT emit an option-group here:",
+    "    Page region containing `Other: ____________` on row N (the trailing write-in tail of a prior card-type row) and `Cardholder Name ____________________` on row N+1 (a separate labelled field one row down).",
+    "    → WRONG: ONE `option-group` field with `options: [{label: 'Other:'}, {label: 'Cardholder Name'}]`. The two labels fail every gate above (cardinality < 3, different rows, different semantic roles, one ends in `:`).",
+    "    → RIGHT: emit `Other:____` as a `text` field for the write-in continuation, and `Cardholder Name ____` as a separate `text` field. No option-group.",
     "",
     "If you cannot precisely locate the writable area, OMIT the field. We strongly prefer 10 correctly-placed fields to 20 fields where half are sitting on labels.",
   ].join("\n");
@@ -1889,6 +1902,107 @@ function mapToTemplateField(
  * `__prompt__` mapping (the resulting field maps to `creditCardType`
  * via the `cardType` canonical's catalog entry).
  */
+
+/**
+ * v0.5.26 — deterministic shape filter for model-emitted option-group
+ * fields. Catches the v0.5.25 regression where Gemini occasionally
+ * emitted an `option-group` field whose two "options" were
+ * semantically heterogeneous (e.g. an `Other:` write-in tail from
+ * row N paired with `Cardholder Name` from row N+1). Such groupings
+ * never represent a real picker — they're two unrelated fields the
+ * model glued together because they sit close to each other.
+ *
+ * A model-emitted option-group is REJECTED (dropped from the field
+ * list) when ANY of the following hold:
+ *
+ *   1. Fewer than two surviving options after normalisation. A
+ *      single-option "group" has nothing to pick from.
+ *   2. Any option's label ends in `:` (a colon = label-for-blank,
+ *      not selector option text — see the prompt rule).
+ *   3. Any two options' bbox vertical centers are separated by more
+ *      than ~6pt. Real picker rows lay all labels on the same
+ *      visual baseline; cross-row clusters are always misclassified
+ *      neighbours.
+ *   4. The option count is exactly 2 AND neither option resolves
+ *      to a recognised card-type label. Two-label clusters are
+ *      ambiguous (Yes/No, M/F are valid; Other/Cardholder Name is
+ *      not), and the model has proven untrustworthy with them. We
+ *      keep the rare valid 2-label card-type case (Visa/MasterCard
+ *      on a low-end form) by allow-listing card-type matches.
+ *
+ * Rejected fields are dropped entirely. The legitimate user-typeable
+ * area each "option" was supposed to identify either re-emerges from
+ * Pass 1 as its own text field, or — if it didn't — the user can add
+ * it manually in template review. We strictly prefer one missing
+ * field to one falsely-grouped field that surfaces a useless
+ * `<select>` in the FillPromptModal.
+ *
+ * Runs BEFORE `mergeCardTypeOptionGroup` so the merge pass sees a
+ * clean field list (without spurious model-emitted option-groups
+ * sitting alongside the candidates it would otherwise merge).
+ */
+function dropMisshapenOptionGroups(fields: TemplateField[]): TemplateField[] {
+  const out: TemplateField[] = [];
+  for (const field of fields) {
+    if (field.fieldType !== "option-group") {
+      out.push(field);
+      continue;
+    }
+    const options = field.options ?? [];
+
+    // Gate 1: must have at least two options.
+    if (options.length < 2) {
+      console.log(
+        `[Typeset Gemini] Dropping option-group "${field.label}" on page ${field.pageNumber}: <2 options.`
+      );
+      continue;
+    }
+
+    // Gate 2: no option label may end in `:`.
+    const colonOption = options.find(
+      (opt) => (opt.label ?? "").trim().endsWith(":")
+    );
+    if (colonOption) {
+      console.log(
+        `[Typeset Gemini] Dropping option-group "${field.label}" on page ${field.pageNumber}: option label "${colonOption.label}" ends in ':' (label-for-blank, not selector option).`
+      );
+      continue;
+    }
+
+    // Gate 3: every option must sit on the same visual row
+    // (vertical centers within ~6pt of one another).
+    const centers = options.map((opt) => opt.bbox.y + opt.bbox.height / 2);
+    const minCy = Math.min(...centers);
+    const maxCy = Math.max(...centers);
+    if (maxCy - minCy > 6) {
+      console.log(
+        `[Typeset Gemini] Dropping option-group "${field.label}" on page ${field.pageNumber}: option vertical centers span ${(maxCy - minCy).toFixed(2)}pt (>6pt → not a single row).`
+      );
+      continue;
+    }
+
+    // Gate 4: 2-label clusters must be a recognised card-type pair.
+    // Anything else (Other/Cardholder Name, etc.) is too ambiguous
+    // to trust as a picker. Yes/No or M/F-only forms can still
+    // emerge as two separate boolean checkboxes from Pass 1; the
+    // option-group treatment isn't load-bearing for them.
+    if (options.length === 2) {
+      const cardTypeHits = options.filter(
+        (opt) => normalizeCardTypeLabel(opt.label)
+      ).length;
+      if (cardTypeHits < 2) {
+        console.log(
+          `[Typeset Gemini] Dropping 2-label option-group "${field.label}" on page ${field.pageNumber}: labels not a card-type pair (${options.map((o) => o.label).join(", ")}).`
+        );
+        continue;
+      }
+    }
+
+    out.push(field);
+  }
+  return out;
+}
+
 function mergeCardTypeOptionGroup(fields: TemplateField[]): TemplateField[] {
   const byPage = new Map<number, TemplateField[]>();
   for (const f of fields) {
@@ -1901,10 +2015,19 @@ function mergeCardTypeOptionGroup(fields: TemplateField[]): TemplateField[] {
   const consumed = new Set<string>();
 
   for (const [, pageFields] of byPage) {
-    // Find candidate card-type labels on this page.
+    // v0.5.26 — refuse to merge any candidate whose ORIGINAL (pre-
+    // normalisation) label ends with a colon. A trailing `:` is the
+    // unambiguous signal of a label-for-blank (`Other:` followed by
+    // `____`, `Date:` followed by an underline) and never of a real
+    // selector option. Without this guard, the merge pass would
+    // happily fold an `Other:____` write-in tail into the
+    // option-group whenever Gemini returned the trailing tail's
+    // label as `Other:` instead of the bare `Other` we ask for.
     const cardCandidates = pageFields
       .map((field) => {
-        const norm = normalizeCardTypeLabel(field.label);
+        const trimmedLabel = (field.label ?? "").trim();
+        if (trimmedLabel.endsWith(":")) return null;
+        const norm = normalizeCardTypeLabel(trimmedLabel);
         return norm ? { field, normalized: norm } : null;
       })
       .filter((x): x is { field: TemplateField; normalized: string } => x !== null);
@@ -2455,10 +2578,16 @@ function mapPass1RawFields(
       rawByFieldId.set(field.id, raw);
     }
   }
+  // v0.5.26 — drop spurious model-emitted option-groups (e.g. a
+  // 2-option `["Other:", "Cardholder Name"]` cluster on the Arrow CC
+  // form) BEFORE the merge pass so the merge sees a clean field
+  // list. The shape filter inspects only `fieldType === "option-group"`
+  // entries; everything else passes through untouched.
+  const filtered = dropMisshapenOptionGroups(mapped);
   // v0.5.25 — option-group merge runs BEFORE dedup so the merged
   // cardType field is the one that participates in dedup overlap
   // checks (the original 4-5 sibling text/checkbox fields disappear).
-  const groupMerged = mergeCardTypeOptionGroup(mapped);
+  const groupMerged = mergeCardTypeOptionGroup(filtered);
   const deduped = dedupeFields(groupMerged);
 
   // Drop any raw entries whose mapped field got dedup'd away — the QC

@@ -82,8 +82,8 @@
   font-size: 11px;
   font-weight: 500;
   text-transform: uppercase;
-  letter-spacing: var(--letter-wide);
-  color: var(--text-muted);
+  letter-spacing: var(--letter-section);
+  color: var(--text-label);
 }
 
 .helpText {
@@ -279,4 +279,56 @@
 .keyMeta {
   font-size: 11px;
   color: var(--text-muted);
+}
+
+/*
+ * v0.5.26 — About row. Sits below the action footer, separated by
+ * the existing footer border. Quiet typography so the version
+ * literal and manual update opt-in recede; the line shouldn't
+ * compete with the Save button above it.
+ */
+.about {
+  display: flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 8px;
+  padding: 10px 20px 14px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.aboutVersion {
+  font-variant-numeric: tabular-nums;
+}
+
+.aboutSeparator {
+  color: var(--text-label);
+  opacity: 0.7;
+}
+
+.aboutLink {
+  font: inherit;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  padding: 0;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.aboutLink:hover {
+  color: var(--text);
+}
+
+.aboutStatus {
+  color: var(--text-muted);
+}
+
+.aboutError {
+  color: #991b1b;
+  max-width: 280px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

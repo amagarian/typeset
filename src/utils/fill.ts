@@ -37,19 +37,39 @@ export function getTemplateFieldPromptLabel(field: TemplateField): string {
   return field.promptLabel?.trim() || field.label || "Prompt value";
 }
 
-export function getPromptFields(template: Template): TemplateField[] {
-  // v0.5.25 — option-group fields ALWAYS appear in the fill prompt
-  // (regardless of their `mappedProjectKey`). Users want to pick the
-  // card type per-fill rather than relying solely on the project's
-  // stored `creditCardType`, especially on multi-card workflows where
-  // the same project signs multiple authorisations on different
-  // brands. The prompt UI seeds the picker from the project value
-  // (via `getOptionGroupSelection`) so the typical case stays
-  // single-click.
-  return template.fields.filter(
-    (field) =>
-      field.mappedProjectKey === "__prompt__" || isOptionGroupField(field)
-  );
+export function getPromptFields(
+  template: Template,
+  project?: Project,
+  promptValues: PromptFieldValues = {}
+): TemplateField[] {
+  // v0.5.26 — option-group fields behave like `checkbox-group` and
+  // other auto-fillable kinds: they only show up in the fill prompt
+  // when the project (and any prior prompt entry / template default)
+  // can't supply a value. The selection precedence inside
+  // `getOptionGroupSelection` (prompt → field default → project value)
+  // remains authoritative; this just reflects "do we still need to
+  // ask the user?" in the prompt list.
+  //
+  // v0.5.25 had `option-group` always-included, which forced
+  // `FillPromptModal` to surface the card-type picker on every fill
+  // even when `project.creditCardType` already pinned a brand. That
+  // regressed the auto-fill experience for the common single-card
+  // workflow. Multi-card flows still work fine — the project value
+  // can be overridden in the prompt modal whenever the user opens it
+  // (which happens automatically as soon as any other field needs
+  // their attention).
+  return template.fields.filter((field) => {
+    if (field.mappedProjectKey === "__prompt__") return true;
+    if (isOptionGroupField(field)) {
+      // Only prompt when there's no resolvable selection yet. If
+      // `project` isn't passed (legacy callers), fall back to the
+      // v0.5.25 always-prompt behaviour so we don't silently skip a
+      // genuinely-required option-group.
+      if (!project) return true;
+      return getOptionGroupSelection(project, field, promptValues) === "";
+    }
+    return false;
+  });
 }
 
 /**
