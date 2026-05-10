@@ -43,20 +43,23 @@ export function Sidebar({ projects, selectedId, onSelect, onNewProject }: Sideba
         onSelect={onSelect}
       />
       {/*
-        v0.5.27 — lone footer item. Single hairline divider from the
-        list above; the button itself IS the container (no nested
-        outlined card). Hover treatment matches `Import from PDF`
-        in NewProjectView: bg fades to var(--bg-input), border-color
-        to var(--border-focus), color to var(--text), 0.15s.
+        v0.5.29 — collapsed to a centered icon-only "+" trigger.
+        The "New project" word-mark is gone; discoverability now
+        comes from the native title tooltip ("New project") and
+        the still-full-width hit target inherited from v0.5.27.
+        Hover treatment is anchored to the row background (fades
+        to var(--bg-input) — the same surface the Import-from-PDF
+        button uses) so the primary visual feedback is the full
+        button shading, not the icon glyph color.
       */}
       <button
         type="button"
         className={styles.newProjectBtn}
         onClick={onNewProject}
+        title="New project"
         aria-label="New project"
       >
         <span className={styles.newProjectIcon} aria-hidden="true">+</span>
-        <span>New project</span>
       </button>
     </aside>
   );
