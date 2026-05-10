@@ -2701,6 +2701,33 @@ function bboxArea(b: { width: number; height: number }): number {
 }
 
 /**
+ * Fraction of `inner`'s area that is contained within `outer`. Returns
+ * 0 when they don't intersect, 1 when `inner` is fully covered. Used
+ * by `dedupeFields` to catch the case where two detections share the
+ * same row/value-area but resolve to DIFFERENT canonical ids (e.g. one
+ * is `creditCardNumber`, the other is a stray `creditCardHolder`
+ * dropped onto the same horizontal underline) — IoU is still moderate
+ * because the bboxes have different widths, but one is mostly inside
+ * the other and we want to keep the larger / more-specific survivor
+ * rather than letting both write overlapping text.
+ */
+function bboxContainment(
+  inner: { x: number; y: number; width: number; height: number },
+  outer: { x: number; y: number; width: number; height: number }
+): number {
+  const ix1 = Math.max(inner.x, outer.x);
+  const iy1 = Math.max(inner.y, outer.y);
+  const ix2 = Math.min(inner.x + inner.width, outer.x + outer.width);
+  const iy2 = Math.min(inner.y + inner.height, outer.y + outer.height);
+  const iw = Math.max(0, ix2 - ix1);
+  const ih = Math.max(0, iy2 - iy1);
+  const inter = iw * ih;
+  const innerArea = bboxArea(inner);
+  if (innerArea <= 0) return 0;
+  return inter / innerArea;
+}
+
+/**
  * De-duplicate detections by spatial overlap. Production paperwork
  * legitimately repeats canonical fields (cardholder name in two
  * paragraphs, dates at top and bottom) and every instance needs to be
@@ -2721,9 +2748,26 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
   for (const field of fields) {
     const overlapIdx = result.findIndex((existing) => {
       if (existing.pageNumber !== field.pageNumber) return false;
-      if (existing.fieldType !== field.fieldType) return false;
       const iou = bboxIoU(existing, field);
-      if (iou >= 0.3) return true;
+      // High overlap → always dedupe regardless of fieldType / canonical.
+      // This catches the v0.6.4 escape: a `creditCardHolder` text bbox
+      // dropped onto the same underline as `creditCardNumber` produced
+      // two values written on top of each other (mishmash of letters
+      // and digits) because IoU sat below 0.3 and canonicals differed.
+      if (iou >= 0.5) return true;
+      // Containment: one bbox is mostly-inside the other (the value
+      // area inside a wider row band, or vice-versa). Same idea —
+      // they're claiming the same writable space.
+      const containAB = bboxContainment(existing, field);
+      const containBA = bboxContainment(field, existing);
+      if (Math.max(containAB, containBA) >= 0.7) return true;
+      // Same-fieldType + lower-bar overlap: model-emitted
+      // double-detections of the same conceptual field (the original
+      // "two strings on top of each other" failure for the same
+      // canonical, where the row vs digit-area bboxes sit at slightly
+      // different scales).
+      if (existing.fieldType === field.fieldType && iou >= 0.25) return true;
+      // Same canonical id with any overlap is always a dedupe.
       if (
         existing.canonicalFieldId &&
         existing.canonicalFieldId === field.canonicalFieldId &&
@@ -2731,8 +2775,12 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
       ) {
         return true;
       }
+      // Legacy corner-distance check: cheap fallback for tightly
+      // co-located detections that the above passes missed.
       return (
-        Math.abs(existing.x - field.x) < 12 && Math.abs(existing.y - field.y) < 12
+        existing.fieldType === field.fieldType &&
+        Math.abs(existing.x - field.x) < 12 &&
+        Math.abs(existing.y - field.y) < 12
       );
     });
     if (overlapIdx >= 0) {

@@ -353,6 +353,49 @@ export async function writeFilledPdfBytes(
         });
       }
     } else {
+      // v0.6.5 — multiline-aware rendering. The vertical-centre baseline
+      // we use for single-line text fields drops the value into the
+      // middle of tall multi-line bboxes (e.g. the merged Billing
+      // Address block on the Arrow CC Authorization form), leaving the
+      // first physical line blank. For `multiline` fields we instead
+      // top-align (so a single-line value like a street address lands
+      // on the first underline next to the caption) and split the value
+      // on newlines so a multi-line value spreads down the bbox at
+      // ~1.25× line height.
+      const isMultiline = field.fieldKind === "multiline";
+
+      if (isMultiline) {
+        const lineHeightFactor = 1.25;
+        const lines = rawValue.split(/\r?\n/).filter((s) => s.length > 0);
+        if (lines.length === 0) continue;
+
+        const heightPerLine = field.height / Math.max(1, lines.length);
+        let fontSize: number;
+        if (field.estimatedFontSize) {
+          fontSize = Math.max(7, Math.min(16, Math.round(field.estimatedFontSize * 1.5)));
+        } else {
+          fontSize = Math.max(7, Math.min(12, Math.floor(heightPerLine * 0.6)));
+        }
+        const lineGap = fontSize * lineHeightFactor;
+
+        const inset = Math.max(2, Math.min(4, fontSize * 0.25));
+        let yTopBaseline = yPdfBottom + field.height - fontSize - inset;
+
+        for (const line of lines) {
+          if (yTopBaseline < yPdfBottom) break;
+          const fitted = fitTextToWidth(line, field.width, font, fontSize);
+          page.drawText(fitted, {
+            x: x + 3,
+            y: yTopBaseline,
+            size: fontSize,
+            font,
+            color: rgb(0.1, 0.1, 0.1),
+          });
+          yTopBaseline -= lineGap;
+        }
+        continue;
+      }
+
       let fontSize = defaultFontSize;
       if (field.estimatedFontSize) {
         fontSize = Math.max(7, Math.min(16, Math.round(field.estimatedFontSize * 1.5)));
