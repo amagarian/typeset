@@ -83,11 +83,51 @@
 
 .newProjectBtn:hover {
   background-color: var(--border);
+  animation: none;
 }
 
 .newProjectBtn:focus-visible {
   outline: none;
   background-color: var(--border);
+  animation: none;
+}
+
+/*
+ * v0.5.36 — empty-state pulse. Applied via the
+ * `.newProjectBtnPulse` modifier when the project list is
+ * empty (and the user isn't searching). The animation fades
+ * the background between transparent and the same hover token
+ * (var(--border)) so the empty-state hint and the hover state
+ * are visually related — the pulse "previews" the hover
+ * affordance. Hover/focus override the animation entirely
+ * (animation: none above) so once the user reaches the button
+ * the surface settles to a solid hover background instead of
+ * mid-pulse.
+ *
+ * `prefers-reduced-motion` users get a static, slightly
+ * darker background (50% of the hover color via background-
+ * color-mix) so the empty-state cue is still visible without
+ * any motion.
+ */
+.newProjectBtnPulse {
+  animation: newProjectPulse 2.4s ease-in-out infinite;
+}
+
+@keyframes newProjectPulse {
+  0%,
+  100% {
+    background-color: transparent;
+  }
+  50% {
+    background-color: var(--border);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .newProjectBtnPulse {
+    animation: none;
+    background-color: color-mix(in srgb, var(--border) 50%, transparent);
+  }
 }
 
 .newProjectIcon {

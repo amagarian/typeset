@@ -1,6 +1,5 @@
 import { useState } from "react";
 import { ProjectList } from "../ProjectList/ProjectList";
-import { EmptyStateArrow } from "./EmptyStateArrow";
 import styles from "./Sidebar.module.css";
 
 interface SidebarProps {
@@ -44,25 +43,21 @@ export function Sidebar({ projects, selectedId, onSelect, onNewProject }: Sideba
         onSelect={onSelect}
       />
       {/*
-        v0.5.33 — playful curved arrow shown only when the
+        v0.5.36 — empty-state hint moved from a decorative arrow
+        (v0.5.33, didn't read as an arrow) to a soft background
+        pulse on the `+` button itself. Pulse fires only when the
         project list is genuinely empty (no projects AND no
-        search). We deliberately suppress it when a search
-        returns no matches: at that point the empty state is
-        about the query, not the app, and a hint pointing at
-        "+ New project" would be misleading. Lives between the
-        (empty) ProjectList and the trigger button so it reads
-        as a directional cue at the latter.
-      */}
-      {projects.length === 0 && search === "" && <EmptyStateArrow />}
-      {/*
-        v0.5.33 — collapsed to a centered icon-only "+" trigger.
-        Hover anchors to var(--border) (set in the CSS module);
-        the glyph color stays pinned in every state so the only
-        visual feedback is the row-wide background fade.
+        search) — a "no search results" state isn't about the
+        app being empty, so the pulse would be misleading there.
+        The hover/focus rules in the CSS module win over the
+        pulse, so once the user mouses to the button the pulse
+        snaps to the solid hover background.
       */}
       <button
         type="button"
-        className={styles.newProjectBtn}
+        className={`${styles.newProjectBtn} ${
+          projects.length === 0 && search === "" ? styles.newProjectBtnPulse : ""
+        }`}
         onClick={onNewProject}
         title="New project"
         aria-label="New project"
