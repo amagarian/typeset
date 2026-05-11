@@ -2456,46 +2456,49 @@ function inferCanonicalId(
     return undefined;
   }
 
-  // v0.6.30 — alias scan with "next-field label" filter.
+  // v0.6.31 — alias scan with "next-field label" filter.
   //
   // Previous behaviour (≤ v0.6.29): joined `ctx + " " + aft` into a
-  // single haystack and substring-matched aliases. This created the
-  // following Milk CC Auth bug:
+  // single haystack and substring-matched aliases. v0.6.30 tried to
+  // patch this by checking if an alias hit in `aft` was followed by
+  // a colon (label-shape), but the catalog has BARE aliases like
+  // "company" registered to `productionCompany`, and on the Milk
+  // CC Auth bug the Reference blank's `context_after` started with
+  // "Company Name: …" — the bare "company" matched at position 0
+  // and was followed by " Name" (no colon), so the v0.6.30 fix
+  // didn't skip it. Reference still leaked to `productionCompany`.
   //
-  //   "I authorize Milk Studios … for all costs related to:"
-  //   "Reference: __________"            ← THIS field
-  //   "Company Name: __________"
+  // The robust fix: when `aft` contains a colon, the prefix UP TO
+  // that colon is the next field's label and must be ignored
+  // entirely. Only the segment AFTER the first colon (i.e. the
+  // next field's blank/value area, plus anything further down) is
+  // safe to scan for THIS field's contextual aliases.
   //
-  // For the Reference blank, `context_after` was the literal string
-  // "Company Name: __________" — the NEXT field's label. The alias
-  // "company name" is registered to `productionCompany`, so the
-  // Reference blank got force-fitted to `productionCompany` —
-  // duplicating the Company Name field's canonical and triggering
-  // the proximity-dedup warning to no avail (both still rendered
-  // because they were separate logical detections at the time the
-  // canonical was assigned).
+  //   "Reference: __________"   ← THIS field
+  //   "Company Name: ________"  ← becomes aft for Reference
   //
-  // Rule: when an alias appears in `context_after`, it's a valid
-  // contextual hit ONLY when it's NOT immediately followed by a
-  // colon. A colon-suffixed alias in context_after is the next
-  // field's label — skip it. `context_before` is unaffected (a
-  // colon-suffixed alias there IS this field's own caption).
-  if (!ctx && !aft) return undefined;
+  //   aft = "Company Name: __________"
+  //   first-colon at pos 12
+  //   effective aft = " __________"   ← no aliases here, good
+  //
+  // `ctx` is left as-is: previous-field labels in ctx (e.g.
+  // "City: ____ State:") are this field's own caption when they
+  // sit at the end of ctx, and any earlier same-form aliases in
+  // ctx tend to be section headers / instructions that are
+  // ambiguous enough that letting them disambiguate is more often
+  // a net win than a hijack.
+  let effectiveAft = aft;
+  if (aft) {
+    const colonPos = aft.search(/[:：]/);
+    if (colonPos !== -1) {
+      effectiveAft = aft.slice(colonPos + 1);
+    }
+  }
+  const haystack = `${ctx} ${effectiveAft}`.trim();
+  if (!haystack) return undefined;
   for (const { alias, id } of ALIAS_INDEX) {
     if (alias.length < 3) continue;
-    if (ctx && ctx.includes(alias)) return id;
-    if (!aft) continue;
-    let searchFrom = 0;
-    while (searchFrom <= aft.length) {
-      const pos = aft.indexOf(alias, searchFrom);
-      if (pos === -1) break;
-      const tail = aft.slice(pos + alias.length, pos + alias.length + 5);
-      if (!/^\s*[:：]/.test(tail)) return id;
-      // Alias is a next-field label — keep scanning past this hit
-      // in case the same alias also appears as contextual text
-      // later in the after-string.
-      searchFrom = pos + alias.length;
-    }
+    if (haystack.includes(alias)) return id;
   }
   return undefined;
 }

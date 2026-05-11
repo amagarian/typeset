@@ -1,6 +1,6 @@
 {
   "productName": "Typeset",
-  "version": "0.6.30",
+  "version": "0.6.31",
   "identifier": "com.typeset.app",
   "build": {
     "beforeDevCommand": "npm run dev",
