@@ -2832,15 +2832,21 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
         return true;
       }
 
-      // v0.6.16 — same-canonical proximity dedup. Catches the case
-      // where Gemini emits two detections that resolve to the SAME
-      // canonical id (e.g. two `billingAddress` fields on the Keslow
-      // grid — one on the real Billing Address row, one stray
-      // ~30pt off the row's centre) and whose bboxes don't overlap
-      // enough to trip the IoU/containment/nuclear rules above.
-      // Two same-canonical detections on the same page whose
-      // vertical centres are within max(2 × min(height), 40pt) are
-      // collapsed. Larger-area survivor wins.
+      // v0.6.16 / v0.6.18 — same-canonical / same-label proximity
+      // dedup. Catches the case where Gemini emits two detections
+      // for the same logical row (e.g. two `billingAddress` fields
+      // on the Keslow grid — one labelled `"Billing Address:"` with
+      // a trailing colon and unmapped because of the colon, one
+      // labelled `"Billing Address"` that mapped correctly) and
+      // whose bboxes don't overlap enough to trip the IoU/
+      // containment/nuclear rules above.
+      //
+      // Two same-PAGE detections collapse when EITHER:
+      //   - both carry the SAME non-null `canonicalFieldId`, OR
+      //   - their normalised label strings are equal (case-
+      //     insensitive, trailing `:` / `：` and whitespace stripped).
+      // AND their vertical centres are within
+      // `max(2 × min(height), 40pt)`. Larger-area survivor wins.
       //
       // Why the floor at 40pt: single-line text bboxes are often
       // ~12-20pt tall; 2× that is a tight ~24-40pt threshold which
@@ -2849,9 +2855,22 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
       // signatures that sit at opposite ends of the page (the
       // Keslow top + bottom signatures are ~200pt apart, well
       // beyond this window).
+      const normalizeLabel = (s: string | undefined) =>
+        (s ?? "")
+          .toLowerCase()
+          .replace(/[:：]+\s*$/, "")
+          .replace(/\s+/g, " ")
+          .trim();
+      const haveSameCanonical =
+        !!existing.canonicalFieldId &&
+        existing.canonicalFieldId === field.canonicalFieldId;
+      const existingLabel = normalizeLabel(existing.label);
+      const fieldLabel = normalizeLabel(field.label);
+      const haveSameLabel =
+        existingLabel.length >= 3 && existingLabel === fieldLabel;
+
       if (
-        existing.canonicalFieldId &&
-        existing.canonicalFieldId === field.canonicalFieldId &&
+        (haveSameCanonical || haveSameLabel) &&
         existing.pageNumber === field.pageNumber
       ) {
         const existingCy = existing.y + existing.height / 2;
@@ -2863,8 +2882,8 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
         );
         if (verticalGap < proximityThreshold) {
           console.warn(
-            `[Typeset detector] Same-canonical proximity dedup: collapsing ` +
-              `${existing.canonicalFieldId} pair @y=${existing.y.toFixed(1)},${field.y.toFixed(1)} ` +
+            `[Typeset detector] Proximity dedup (${haveSameCanonical ? "canonical" : "label"}): ` +
+              `collapsing "${existing.label}" / "${field.label}" pair on page ${field.pageNumber} ` +
               `(gap=${verticalGap.toFixed(1)}pt, threshold=${proximityThreshold.toFixed(1)}pt)`
           );
           return true;
