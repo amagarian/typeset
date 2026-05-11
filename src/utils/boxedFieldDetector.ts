@@ -398,6 +398,7 @@ function findBestFieldIndexForBoxedLabel(
   fields: TemplateField[],
   page: number,
   labelRect: { x: number; y: number; width: number; height: number },
+  writableRect: { x: number; y: number; width: number; height: number },
   consumed: Set<number>
 ): { idx: number; score: number } {
   let best = -1;
@@ -415,10 +416,22 @@ function findBestFieldIndexForBoxedLabel(
     ) {
       continue;
     }
-    const s = labelFieldMatchScore(
+    // v0.6.29 — match against BOTH the printed label rect AND the
+    // writable rect. The original code only checked the label rect,
+    // which silently emitted duplicates whenever Gemini correctly
+    // bbox'd the writable line (the writable line never overlaps
+    // the printed-label glyphs that sit to its left). Score is the
+    // MAX of the two matches so a high-confidence overlap on
+    // either side is enough to consume the existing field.
+    const labelScore = labelFieldMatchScore(
       { x: f.x, y: f.y, width: f.width, height: f.height },
       labelRect
     );
+    const writableScore = labelFieldMatchScore(
+      { x: f.x, y: f.y, width: f.width, height: f.height },
+      writableRect
+    );
+    const s = Math.max(labelScore, writableScore);
     if (s > bestScore) {
       bestScore = s;
       best = i;
@@ -484,6 +497,7 @@ export function annotateBoxedFields(
       out,
       e.page,
       e.labelRect,
+      e.writableRect,
       consumed
     );
 

@@ -437,6 +437,20 @@ export interface TemplateField {
    * A1). Optional and best-effort.
    */
   contextBefore?: string;
+  /**
+   * v0.6.28 — auto-detected party this field is intended for.
+   *   - `signer` = the user / their production company (the side
+   *     Wrapkit is filling out on their behalf).
+   *   - `vendor` = the counterparty / supplier (the side that signs
+   *     off on the form from their end, e.g. JEM F/X on a rental
+   *     contract).
+   * Undefined when the detector can't make a confident call. The
+   * value is purely advisory — visualised on the canvas + sidebar
+   * to help the user spot which fields are theirs at a glance —
+   * and never blocks fill. Computed in `annotateFieldsWithParty`
+   * from same-row printed text and the field's section context.
+   */
+  party?: "signer" | "vendor";
 }
 
 /**

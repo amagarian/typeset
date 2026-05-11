@@ -1,4 +1,5 @@
-import { useState, useCallback, useEffect, useLayoutEffect, useRef } from "react";
+import { useState, useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import * as pdfjsLib from "pdfjs-dist";
 import type {
   Template,
   TemplateField,
@@ -9,6 +10,20 @@ import { PdfPageCanvas } from "@/components/PdfPageCanvas/PdfPageCanvas";
 import { DraggableField } from "@/components/DraggableField/DraggableField";
 import { getTemplateFieldValue, normalizeCardType } from "@/utils/fill";
 import styles from "./TemplateReviewModal.module.css";
+
+pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
+
+interface PageDims {
+  width: number;
+  height: number;
+  scale: number;
+}
+
+// v0.6.27 — vertical gap between rendered PDF pages in the review
+// canvas. Doubles as the natural-size carrier so the pinch sizing
+// math (`pdfSizing` width/height) tracks the actual visible extent
+// without overshoot.
+const PAGE_GAP_PX = 16;
 
 const PROJECT_KEY_LABELS: Record<string, string> = {
   jobName: "Job name",
@@ -95,8 +110,16 @@ interface TemplateReviewModalProps {
   onBeginFieldEdit: () => void;
   onFieldChange: (fieldId: string, updates: Partial<TemplateField>) => void;
   onDeleteField: (fieldId: string) => void;
-  onAddField: () => void;
-  onAddCheckbox: () => void;
+  /**
+   * v0.6.21 — optional placement carries the PDF user-space coords
+   * where the new field should be centered. The modal computes this
+   * from the current scroll position + canvas geometry so the new
+   * bbox appears in the middle of the visible viewport (instead of
+   * always at the page's top-left). Callers may ignore `placement`
+   * and fall back to a default position.
+   */
+  onAddField: (placement?: { x: number; y: number; pageNumber: number }) => void;
+  onAddCheckbox: (placement?: { x: number; y: number; pageNumber: number }) => void;
   onProjectChange?: (updates: Partial<Project>) => void;
   onRedetect?: () => void;
 }
@@ -120,7 +143,22 @@ export function TemplateReviewModal({
   onProjectChange,
   onRedetect,
 }: TemplateReviewModalProps) {
-  const [pageDims, setPageDims] = useState<{ width: number; height: number; scale: number } | null>(null);
+  // v0.6.27 — multi-page review canvas. Track per-page dimensions
+  // so each page's DraggableField overlays use that page's own
+  // rendered scale (pages with different sizes get their own
+  // viewports, e.g. landscape pages mixed into a portrait packet).
+  const [pageDimsByPage, setPageDimsByPage] = useState<Map<number, PageDims>>(
+    () => new Map()
+  );
+  const [numPages, setNumPages] = useState<number>(1);
+  const pageWrapsRef = useRef<Map<number, HTMLDivElement | null>>(new Map());
+  const setPageWrapRef = useCallback((page: number) =>
+    (el: HTMLDivElement | null) => {
+      const map = pageWrapsRef.current;
+      if (el) map.set(page, el);
+      else map.delete(page);
+    },
+  []);
   const [selectedFieldId, setSelectedFieldId] = useState<string | null>(null);
   // v0.5.4 — three zoom values:
   //   • liveZoom: transient gesture intent. Updates every wheel
@@ -137,19 +175,110 @@ export function TemplateReviewModal({
   const [lastRenderedZoom, setLastRenderedZoom] = useState(1);
   const fieldListRef = useRef<HTMLUListElement>(null);
   const previewAreaRef = useRef<HTMLDivElement>(null);
+  // v0.6.21 — ref to the inner pdfContainer (the positioning context
+  // for absolute-positioned DraggableField overlays). Used by the
+  // "Add field" handler to compute the visible viewport's center in
+  // PDF user-space so the new bbox lands where the user is looking.
+  const pdfContainerRef = useRef<HTMLDivElement>(null);
 
   // v0.5.6 — closure-stable mirror of `lastRenderedZoom` so the
   // wheel handler (set up once in a useEffect) reads the latest value
   // when computing the cursor anchor's document-space coords.
   const lastRenderedZoomRef = useRef(1);
-  const handleDimensions = useCallback(
-    (dims: { width: number; height: number; scale: number; renderedZoom: number }) => {
-      setPageDims({ width: dims.width, height: dims.height, scale: dims.scale });
-      setLastRenderedZoom(dims.renderedZoom);
-      lastRenderedZoomRef.current = dims.renderedZoom;
-    },
+  // v0.6.27 — per-page dimensions. Each PdfPageCanvas reports its
+  // own viewport; we key by `pageNumber` so a packet with mixed page
+  // sizes still tracks each one correctly. `lastRenderedZoom` is the
+  // zoomFactor passed in, which is identical across pages, so we
+  // only need one copy of it.
+  const handleDimensionsForPage = useCallback(
+    (pageNumber: number) =>
+      (dims: { width: number; height: number; scale: number; renderedZoom: number }) => {
+        setPageDimsByPage((prev) => {
+          const existing = prev.get(pageNumber);
+          if (
+            existing &&
+            existing.width === dims.width &&
+            existing.height === dims.height &&
+            existing.scale === dims.scale
+          ) {
+            return prev;
+          }
+          const next = new Map(prev);
+          next.set(pageNumber, {
+            width: dims.width,
+            height: dims.height,
+            scale: dims.scale,
+          });
+          return next;
+        });
+        setLastRenderedZoom(dims.renderedZoom);
+        lastRenderedZoomRef.current = dims.renderedZoom;
+      },
     [],
   );
+
+  // v0.6.27 — probe the PDF for its page count so we know how many
+  // `PdfPageCanvas` instances to render. Falls back to 1 on error so
+  // the user still sees something even if pdfjs barfs on a damaged
+  // file (the same rasterize-and-overlay path covers fill-time).
+  useEffect(() => {
+    if (!pdfBytes) {
+      setNumPages(1);
+      setPageDimsByPage(new Map());
+      pageWrapsRef.current.clear();
+      return;
+    }
+    let cancelled = false;
+    const bytesCopy = new Uint8Array(pdfBytes);
+    const task = pdfjsLib.getDocument({ data: bytesCopy });
+    task.promise
+      .then((pdf) => {
+        if (cancelled) return;
+        setNumPages(pdf.numPages);
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        console.warn(
+          "[TemplateReviewModal] could not probe PDF page count; falling back to 1.",
+          err
+        );
+        setNumPages(1);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [pdfBytes]);
+
+  // v0.6.27 — derived "primary" dims used by the transient pinch
+  // sizing math and by callers that pre-date multi-page support.
+  // Width is the max page width (the column is centered, the widest
+  // page sets the rail width); height is the sum of all known page
+  // heights + inter-page gaps. Unknown pages contribute 0 (their
+  // canvases will fill in once they finish rendering, growing the
+  // sizing wrapper to match).
+  const pageDimsList = useMemo<Array<{ pageNumber: number; dims: PageDims | null }>>(() => {
+    const list: Array<{ pageNumber: number; dims: PageDims | null }> = [];
+    for (let p = 1; p <= numPages; p += 1) {
+      list.push({ pageNumber: p, dims: pageDimsByPage.get(p) ?? null });
+    }
+    return list;
+  }, [numPages, pageDimsByPage]);
+
+  const totalDims = useMemo<{ width: number; height: number } | null>(() => {
+    let width = 0;
+    let height = 0;
+    let gotAny = false;
+    for (const entry of pageDimsList) {
+      if (!entry.dims) continue;
+      gotAny = true;
+      width = Math.max(width, entry.dims.width);
+      height += entry.dims.height;
+    }
+    if (!gotAny) return null;
+    height += Math.max(0, pageDimsList.length - 1) * PAGE_GAP_PX;
+    return { width, height };
+  }, [pageDimsList]);
+
 
   // v0.5.6 — cursor anchor for zoom-around-cursor behavior. Captured
   // before each liveZoom mutation: pinch wheel events store the actual
@@ -362,6 +491,24 @@ export function TemplateReviewModal({
         return;
       }
 
+      // v0.6.20 — Delete / Backspace removes the selected field.
+      // We gate on `!isEditable` so the shortcut doesn't fire while
+      // the user is mid-edit in the prompt-label / custom-value
+      // inputs in the sidebar. Records an undo snapshot first so
+      // the deletion is reversible via Cmd+Z (same flow as the
+      // sidebar's `×` button).
+      if (
+        selectedFieldId &&
+        !isEditable &&
+        (event.key === "Delete" || event.key === "Backspace")
+      ) {
+        event.preventDefault();
+        onBeginFieldEdit();
+        onDeleteField(selectedFieldId);
+        setSelectedFieldId(null);
+        return;
+      }
+
       const isModifier = event.metaKey || event.ctrlKey;
       if (!isModifier) return;
 
@@ -401,7 +548,7 @@ export function TemplateReviewModal({
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [canRedo, canUndo, onRedo, onUndo, selectedFieldId, template.fields, onFieldChange, onBeginFieldEdit, zoomIn, zoomOut, zoomReset]);
+  }, [canRedo, canUndo, onRedo, onUndo, selectedFieldId, template.fields, onFieldChange, onBeginFieldEdit, onDeleteField, zoomIn, zoomOut, zoomReset]);
 
   useEffect(() => {
     if (!selectedFieldId || !fieldListRef.current) return;
@@ -410,6 +557,68 @@ export function TemplateReviewModal({
       el.scrollIntoView({ behavior: "smooth", block: "nearest" });
     }
   }, [selectedFieldId]);
+
+  /**
+   * v0.6.21 — return the visible viewport's center in PDF
+   * user-space coords, suitable for placing a freshly-added field
+   * so it appears where the user is looking instead of always at
+   * (100, 100). Uses `getBoundingClientRect` on the previewArea
+   * (scroll viewport) and the inner pdfContainer (DraggableField
+   * positioning context), so the math survives:
+   *   - scroll position (we read what's actually visible),
+   *   - zoom factor (pageDims.scale already encodes it),
+   *   - the previewArea's centering padding (the container's
+   *     position relative to the scroll content is non-trivial),
+   *   - mid-pinch transforms (getBoundingClientRect respects them).
+   *
+   * Returns `null` when the canvas hasn't rendered yet — callers
+   * fall back to a default position (App.tsx defaults to 100, 100).
+   */
+  const getViewportCenterPlacement = useCallback(():
+    | { x: number; y: number; pageNumber: number }
+    | null => {
+    const preview = previewAreaRef.current;
+    if (!preview) return null;
+    const previewRect = preview.getBoundingClientRect();
+    const cssCx = previewRect.left + previewRect.width / 2;
+    const cssCy = previewRect.top + previewRect.height / 2;
+    // v0.6.27 — walk each page wrap and find the one whose rect
+    // contains the viewport center. If none contain it (e.g. user
+    // scrolled into the gap between pages, or above/below the
+    // stack), pick the page whose vertical midpoint is closest to
+    // the viewport center. This gives a stable answer even when the
+    // user adds a field while looking at an inter-page gap.
+    let bestPage = -1;
+    let bestDist = Infinity;
+    let bestRect: DOMRect | null = null;
+    let bestDims: PageDims | null = null;
+    for (const [pageNumber, el] of pageWrapsRef.current.entries()) {
+      if (!el) continue;
+      const dims = pageDimsByPage.get(pageNumber);
+      if (!dims || dims.scale <= 0) continue;
+      const rect = el.getBoundingClientRect();
+      if (cssCy >= rect.top && cssCy <= rect.bottom) {
+        bestPage = pageNumber;
+        bestRect = rect;
+        bestDims = dims;
+        break;
+      }
+      const midY = rect.top + rect.height / 2;
+      const dist = Math.abs(cssCy - midY);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestPage = pageNumber;
+        bestRect = rect;
+        bestDims = dims;
+      }
+    }
+    if (!bestRect || !bestDims || bestPage < 0) return null;
+    const localX = cssCx - bestRect.left;
+    const localY = cssCy - bestRect.top;
+    const pdfX = localX / bestDims.scale;
+    const pdfY = localY / bestDims.scale;
+    return { x: pdfX, y: pdfY, pageNumber: bestPage };
+  }, [pageDimsByPage]);
 
   return (
     <div className={styles.overlay} role="dialog" aria-modal="true" aria-labelledby="template-modal-title">
@@ -501,10 +710,10 @@ export function TemplateReviewModal({
                   lastRenderedZoom > 0 ? liveZoom / lastRenderedZoom : 1;
                 const isTransformed = Math.abs(displayScale - 1) > 1e-3;
                 const sizingStyle =
-                  isTransformed && pageDims
+                  isTransformed && totalDims
                     ? {
-                        width: pageDims.width * displayScale,
-                        height: pageDims.height * displayScale,
+                        width: totalDims.width * displayScale,
+                        height: totalDims.height * displayScale,
                       }
                     : undefined;
                 const containerStyle = isTransformed
@@ -515,36 +724,72 @@ export function TemplateReviewModal({
                   : undefined;
                 return (
                   <div className={styles.pdfSizing} style={sizingStyle}>
-                    <div className={styles.pdfContainer} style={containerStyle}>
-                      <PdfPageCanvas
-                        pdfBytes={pdfBytes}
-                        pageNumber={1}
-                        maxWidth={580}
-                        maxHeight={720}
-                        zoomFactor={zoomFactor}
-                        onDimensions={handleDimensions}
-                      />
-                      {pageDims && template.fields.filter((f) => f.pageNumber === 1).map((f) => (
-                        <DraggableField
-                          key={f.id}
-                          field={f}
-                          scale={pageDims.scale}
-                          selected={f.id === selectedFieldId}
-                          onSelect={() => setSelectedFieldId(f.id)}
-                          onChangeStart={onBeginFieldEdit}
-                          onChange={(updates) => onFieldChange(f.id, updates)}
-                          projectValue={project ? getTemplateFieldValue(project, f) : undefined}
-                          onCheckboxClick={
-                            f.fieldType === "checkbox" && onProjectChange
-                              ? (value) => {
-                                  if (f.mappedProjectKey === "creditCardType") {
-                                    const normalized = normalizeCardType(value) || value;
-                                    onProjectChange({ creditCardType: normalized as Project["creditCardType"] });
-                                  }
-                                }
-                              : undefined
+                    <div
+                      ref={pdfContainerRef}
+                      className={styles.pdfContainer}
+                      style={containerStyle}
+                    >
+                      {pageDimsList.map(({ pageNumber: p, dims }) => (
+                        <div
+                          key={p}
+                          ref={setPageWrapRef(p)}
+                          className={styles.pageWrap}
+                          style={
+                            p > 1 ? { marginTop: PAGE_GAP_PX } : undefined
                           }
-                        />
+                        >
+                          <PdfPageCanvas
+                            pdfBytes={pdfBytes}
+                            pageNumber={p}
+                            maxWidth={580}
+                            maxHeight={720}
+                            zoomFactor={zoomFactor}
+                            onDimensions={handleDimensionsForPage(p)}
+                          />
+                          {dims &&
+                            template.fields
+                              .filter((f) => f.pageNumber === p)
+                              .map((f) => (
+                                <DraggableField
+                                  key={f.id}
+                                  field={f}
+                                  scale={dims.scale}
+                                  selected={f.id === selectedFieldId}
+                                  onSelect={() => setSelectedFieldId(f.id)}
+                                  onChangeStart={onBeginFieldEdit}
+                                  onChange={(updates) => onFieldChange(f.id, updates)}
+                                  projectValue={
+                                    project ? getTemplateFieldValue(project, f) : undefined
+                                  }
+                                  onCheckboxClick={
+                                    f.fieldType === "checkbox" && onProjectChange
+                                      ? (value) => {
+                                          if (f.mappedProjectKey === "creditCardType") {
+                                            const normalized =
+                                              normalizeCardType(value) || value;
+                                            onProjectChange({
+                                              creditCardType:
+                                                normalized as Project["creditCardType"],
+                                            });
+                                          }
+                                        }
+                                      : undefined
+                                  }
+                                  onDelete={() => {
+                                    onBeginFieldEdit();
+                                    onDeleteField(f.id);
+                                    if (selectedFieldId === f.id) {
+                                      setSelectedFieldId(null);
+                                    }
+                                  }}
+                                />
+                              ))}
+                          {numPages > 1 && (
+                            <div className={styles.pageBadge}>
+                              Page {p} / {numPages}
+                            </div>
+                          )}
+                        </div>
                       ))}
                     </div>
                   </div>
@@ -564,11 +809,35 @@ export function TemplateReviewModal({
                 <li
                   key={f.id}
                   data-field-id={f.id}
-                  className={`${styles.fieldItem} ${f.id === selectedFieldId ? styles.fieldItemSelected : ""}`}
+                  className={`${styles.fieldItem} ${f.id === selectedFieldId ? styles.fieldItemSelected : ""} ${f.party === "vendor" ? styles.fieldItemVendor : ""}`}
                   onClick={() => setSelectedFieldId(f.id)}
                 >
                   <div className={styles.fieldItemRow}>
                     <span className={styles.fieldItemLabel}>{f.label}</span>
+                    {f.party === "vendor" && (
+                      <span
+                        className={`${styles.fieldItemParty} ${styles.fieldItemPartyVendor}`}
+                        title="Auto-detected as a vendor field (the other party fills this in)"
+                      >
+                        vendor
+                      </span>
+                    )}
+                    {f.party === "signer" && (
+                      <span
+                        className={`${styles.fieldItemParty} ${styles.fieldItemPartySigner}`}
+                        title="Auto-detected as your field (Wrapkit auto-fills)"
+                      >
+                        you
+                      </span>
+                    )}
+                    {numPages > 1 && (
+                      <span
+                        className={styles.fieldItemPage}
+                        title={`Page ${f.pageNumber}`}
+                      >
+                        p{f.pageNumber}
+                      </span>
+                    )}
                     <button
                       type="button"
                       className={styles.deleteBtn}
@@ -697,10 +966,18 @@ export function TemplateReviewModal({
               ))}
             </ul>
             <div className={styles.addActions}>
-              <button type="button" className={styles.addFieldBtn} onClick={onAddField}>
+              <button
+                type="button"
+                className={styles.addFieldBtn}
+                onClick={() => onAddField(getViewportCenterPlacement() ?? undefined)}
+              >
                 + Add field
               </button>
-              <button type="button" className={styles.addFieldBtn} onClick={onAddCheckbox}>
+              <button
+                type="button"
+                className={styles.addFieldBtn}
+                onClick={() => onAddCheckbox(getViewportCenterPlacement() ?? undefined)}
+              >
                 + Add checkbox
               </button>
             </div>

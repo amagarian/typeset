@@ -20,6 +20,43 @@
   z-index: 15;
 }
 
+/* v0.6.29 — party color-coding. SIGNER fields are the user's
+ * (Wrapkit auto-fills them) and stay blue; VENDOR fields belong to
+ * the counterparty (rental house / finance co) and render greyed
+ * out + non-interactive because Wrapkit never fills them. The
+ * user sees that they exist (so they trust detection coverage)
+ * but is steered toward only acting on their own fields.
+ *
+ * Vendor styling intentionally:
+ *   - low-saturation grey, low opacity → recedes visually
+ *   - `cursor: not-allowed` + `pointer-events: none` on the bbox
+ *     → can't be selected, moved, resized, or deleted from canvas
+ *   - hover/selected states do nothing (vendor fields can't be
+ *     interacted with from the review canvas) */
+.field.partyVendor {
+  border-color: #9ca3af;
+  border-style: dashed;
+  background: rgba(156, 163, 175, 0.08);
+  opacity: 0.55;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+.field.partyVendor:hover {
+  border-color: #9ca3af;
+  background: rgba(156, 163, 175, 0.08);
+}
+.field.partyVendor.selected {
+  border-color: #9ca3af;
+  background: rgba(156, 163, 175, 0.08);
+}
+.field.partyVendor .label {
+  background: #9ca3af;
+  color: #ffffff;
+}
+.field.partySigner .label {
+  background: #3b82f6;
+}
+
 .field.dragging {
   opacity: 0.85;
   z-index: 25;
@@ -53,6 +90,26 @@
 .checkboxField.checked {
   background: #10b981;
   border-color: #059669;
+}
+
+/* v0.6.29 — party color-coding for checkbox fields. Vendor =
+ * greyed out + non-interactive (Wrapkit never ticks vendor
+ * checkboxes — the counterparty does that themselves). */
+.checkboxField.partyVendor {
+  border-color: #9ca3af;
+  border-style: dashed;
+  opacity: 0.55;
+  cursor: not-allowed;
+  pointer-events: none;
+}
+.checkboxField.partyVendor:hover {
+  border-color: #9ca3af;
+  background: rgba(255, 255, 255, 0.9);
+  transform: none;
+}
+.checkboxField.partyVendor.checked {
+  background: #9ca3af;
+  border-color: #9ca3af;
 }
 
 .checkmark {
@@ -180,6 +237,64 @@
 .handleNW:hover, .handleNE:hover, .handleSW:hover, .handleSE:hover {
   background: #1e40af;
   transform: scale(1.15);
+}
+
+/*
+ * v0.6.20 — delete button on the bbox itself. Anchored at the
+ * top-right just outside the field rect (mirrors the resize-NE
+ * handle's corner so the two never collide). Visible on hover or
+ * when the field is selected; clicking it deletes the field
+ * (undoable via Cmd+Z).
+ */
+.deleteButton {
+  position: absolute;
+  top: -10px;
+  right: -10px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 2px solid white;
+  background: #dc2626;
+  color: white;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  padding: 0;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  z-index: 22;
+  opacity: 0;
+  transition: opacity 0.15s, transform 0.15s, background 0.15s;
+}
+
+.field:hover .deleteButton,
+.field.selected .deleteButton,
+.checkboxField:hover .deleteButton,
+.checkboxField.selected .deleteButton {
+  opacity: 1;
+}
+
+.deleteButton:hover {
+  background: #b91c1c;
+  transform: scale(1.15);
+}
+
+.deleteButton:focus-visible {
+  outline: 2px solid #1d4ed8;
+  outline-offset: 2px;
+}
+
+/* On checkbox fields the bbox is tiny, so nudge the button further
+ * out so it doesn't overlap the checkmark glyph. */
+.checkboxField .deleteButton {
+  top: -8px;
+  right: -8px;
+  width: 14px;
+  height: 14px;
+  font-size: 9px;
 }
 
 .handleN:hover, .handleS:hover {

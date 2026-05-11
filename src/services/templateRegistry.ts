@@ -432,34 +432,110 @@ export async function publishTemplateAuto(
     return { updated: true, id: data.id, registryRow: rowToTemplate(data) };
   }
 
-  // v0.5.35 — when signed in, stamp the row with `user_id` so
-  // (a) the contribution count includes user-attributed rows from
-  // any device, not just this device id, and (b) the new RLS
-  // policies can authorise UPDATE / DELETE by user_id without
-  // requiring the original device id. Anonymous users (no session)
-  // skip this and the row stays device-bound, exactly as today.
-  const userId = await getCurrentUserIdForRegistry();
+  // v0.6.29 — DO NOT stamp `user_id` on insert. The v0.5.35 RLS
+  // policy added `(user_id is null or user_id = auth.uid())` to
+  // the WITH CHECK clause, which means any insert that includes
+  // `user_id` requires the server to resolve `auth.uid()` to the
+  // SAME value — and that only works when the Authorization JWT
+  // is valid AND the server's JWT secret matches the one used to
+  // sign the token. Any drift (expired token, rotated key,
+  // sign-in/sign-out race, server-side migration not applied,
+  // supabase-js sending an apikey instead of a Bearer) silently
+  // breaks the insert with a confusing RLS error and leaves the
+  // user staring at "Saved locally" forever.
+  //
+  // The fix: always insert with `user_id IS NULL`. The
+  // publisher_device_id column already provides ownership for
+  // updates / deletes. Signed-in users can claim their rows
+  // afterwards via `link_anonymous_device(p_device_id)` — that
+  // RPC was designed for exactly this lifecycle (claim every row
+  // whose device_id matches and whose user_id is null). The end
+  // state is identical to v0.5.35 (rows stamped with both
+  // device_id and user_id); we just take a deferred path that
+  // doesn't depend on the auth flow being healthy at insert
+  // time.
+  //
+  // If we ever want truly atomic device→user attribution, we can
+  // call `link_anonymous_device` immediately after a successful
+  // insert when a session is present.
   const insertPayload = {
     ...payload,
     publisher_device_id: deviceId,
-    ...(userId ? { user_id: userId } : {}),
   };
+  console.log(
+    `[Typeset registry] inserting submission — name="${insertPayload.name}" (${
+      insertPayload.name.length
+    } chars) fields=${insertPayload.fields.length} ` +
+      `device_id=${deviceId.length} chars fingerprint_hash=${insertPayload.fingerprint_hash.slice(0, 12)}…`
+  );
   const { data, error } = await client
     .from(SUBMISSIONS_TABLE)
     .insert(insertPayload)
     .select()
     .single<SubmissionRow>();
-  if (error) throw new Error(`Publish failed: ${error.message}`);
+  if (error) {
+    console.error(
+      "[Typeset registry] Insert rejected — full error:",
+      error,
+      "payload shape:",
+      {
+        nameLen: insertPayload.name.length,
+        fieldCount: insertPayload.fields.length,
+        deviceIdLen: deviceId.length,
+        anchorTermsLen: insertPayload.anchor_terms.length,
+        pageCount: insertPayload.page_count,
+      }
+    );
+    throw new Error(`Publish failed: ${error.message}`);
+  }
   if (!data) throw new Error("Publish failed: empty response.");
+
+  // v0.6.29 — best-effort attribution claim: when the user is
+  // signed in at insert time, immediately link the freshly-
+  // inserted row to their account via the RPC. Failures are
+  // logged but don't fail the publish — the row is already in
+  // the registry, the worst case is they have to call
+  // `link_anonymous_device` next time they sign in to attach it.
+  await claimRowAsUserIfSignedIn(client, deviceId);
+
   return { created: true, id: data.id, registryRow: rowToTemplate(data) };
 }
 
-async function getCurrentUserIdForRegistry(): Promise<string | null> {
+/**
+ * v0.6.29 — call `link_anonymous_device(p_device_id)` to stamp
+ * `user_id = auth.uid()` on every row owned by this device. The
+ * RPC is idempotent and rate-limit-friendly: it only touches rows
+ * whose `user_id is null`. Errors are swallowed (logged) because
+ * this runs as a follow-up to a successful insert and we don't
+ * want a transient auth failure to surface as a publish failure.
+ */
+async function claimRowAsUserIfSignedIn(
+  client: SupabaseClient,
+  deviceId: string
+): Promise<void> {
+  let session = null;
   try {
     const { data } = await getAuthClient().auth.getSession();
-    return data.session?.user.id ?? null;
+    session = data.session;
   } catch {
-    return null;
+    return;
+  }
+  if (!session) return;
+  try {
+    const { error } = await client.rpc("link_anonymous_device", {
+      p_device_id: deviceId,
+    });
+    if (error) {
+      console.warn(
+        "[Typeset registry] link_anonymous_device failed (non-fatal):",
+        error.message
+      );
+    }
+  } catch (err) {
+    console.warn(
+      "[Typeset registry] link_anonymous_device threw (non-fatal):",
+      err instanceof Error ? err.message : String(err)
+    );
   }
 }
 

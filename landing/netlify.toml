@@ -1,0 +1,14 @@
+# Static site — no build step. The base + publish dirs are this folder
+# itself, so Netlify ignores the parent repo's package.json (which is the
+# Tauri app, not a web build).
+[build]
+  base = "."
+  publish = "."
+  command = ""
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Frame-Options = "DENY"
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "strict-origin-when-cross-origin"

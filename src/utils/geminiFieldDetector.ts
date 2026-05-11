@@ -91,6 +91,7 @@ import {
 } from "@/types";
 import {
   CANONICAL_FIELD_DEFINITIONS,
+  getCanonicalFieldDefinition,
   normalizeCardTypeLabel,
 } from "@/utils/fieldCatalog";
 import { normalizeCardType } from "@/utils/fill";
@@ -691,6 +692,742 @@ export async function extractPageTextSnapshot(
 }
 
 /**
+ * v0.6.19 — per-page text-ITEM extraction (item-level positions,
+ * not row-aggregated). Used by `correctFieldLabelsFromPrintedText`
+ * to identify the printed label immediately adjacent to each
+ * detected bbox so we can deterministically override Gemini's
+ * `label` when Gemini reads the wrong cell's caption.
+ *
+ * Returns items in top-down PDF user-space coordinates (matching
+ * `TemplateField.y` convention). Each item carries its glyph
+ * rect AND raw string. Returns an empty record on failure — the
+ * label-correction pass treats that as "no override".
+ */
+interface PrintedItemRect {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  str: string;
+}
+
+async function extractPrintedItemsByPage(
+  pdfBytes: Uint8Array
+): Promise<Record<number, PrintedItemRect[]>> {
+  const out: Record<number, PrintedItemRect[]> = {};
+  const bytesCopy = new Uint8Array(pdfBytes);
+  let pdf: pdfjsLib.PDFDocumentProxy;
+  try {
+    pdf = await pdfjsLib.getDocument({ data: bytesCopy }).promise;
+  } catch (err) {
+    console.warn(
+      "[Typeset detector] extractPrintedItemsByPage getDocument failed; label correction will be skipped.",
+      err
+    );
+    return out;
+  }
+  try {
+    const totalPages = Math.min(pdf.numPages, MAX_RENDERED_PAGES);
+    for (let pageNumber = 1; pageNumber <= totalPages; pageNumber += 1) {
+      let page: pdfjsLib.PDFPageProxy;
+      try {
+        page = await pdf.getPage(pageNumber);
+      } catch (err) {
+        console.warn(
+          `[Typeset detector] extractPrintedItemsByPage getPage(${pageNumber}) failed; skipping.`,
+          err
+        );
+        continue;
+      }
+      const viewport = page.getViewport({ scale: 1 });
+      const pageHeightPt = viewport.height;
+      let textContent: Awaited<ReturnType<pdfjsLib.PDFPageProxy["getTextContent"]>>;
+      try {
+        textContent = await page.getTextContent();
+      } catch (err) {
+        console.warn(
+          `[Typeset detector] getTextContent(page=${pageNumber}) failed; skipping.`,
+          err
+        );
+        continue;
+      }
+      const rects: PrintedItemRect[] = [];
+      for (const raw of textContent.items as Array<{
+        str?: string;
+        transform?: number[];
+        width?: number;
+        height?: number;
+      }>) {
+        const str = (raw.str ?? "").replace(/\s+/g, " ");
+        if (!str.trim()) continue;
+        const tr = raw.transform;
+        if (!Array.isArray(tr) || tr.length < 6) continue;
+        const xUS = tr[4];
+        const yBU = tr[5];
+        const w = typeof raw.width === "number" ? raw.width : 0;
+        const h =
+          typeof raw.height === "number" && raw.height > 0
+            ? raw.height
+            : Math.abs(tr[3] ?? 10);
+        if (!Number.isFinite(xUS) || !Number.isFinite(yBU)) continue;
+        const yTD = pageHeightPt - yBU - h;
+        rects.push({ x: xUS, y: yTD, width: w, height: h, str });
+      }
+      out[pageNumber] = rects;
+    }
+  } finally {
+    try {
+      pdf.destroy();
+    } catch {}
+  }
+  return out;
+}
+
+/**
+ * v0.6.19 / v0.6.24 / v0.6.25 — find the printed cell-prefix
+ * label adjacent to a detected bbox.
+ *
+ * History:
+ *   - v0.6.19: only accepted items whose string ended with `:`.
+ *     Missed pdf.js's common split into `"Name"` + `":"` items.
+ *   - v0.6.24: added composite-label handling for split colons,
+ *     plus a lenient no-colon fallback.
+ *   - v0.6.25: handles items containing MULTIPLE embedded colons.
+ *     The SGPS form's bottom section emits the whole row as one
+ *     text item: `"Name: ___ Phone:"`. v0.6.24 saw the trailing
+ *     colon and treated `"Name: ___ Phone"` as a single label,
+ *     so Gemini's left-column bboxes (over Name's underline) got
+ *     stamped with `"Phone"`. v0.6.25 now splits the item at
+ *     every colon and emits one candidate per `WORD:` segment,
+ *     estimating each colon's x-coordinate by linear
+ *     interpolation across the item's width.
+ *
+ * Algorithm:
+ *   1. Collect row items (vertical overlap with bbox).
+ *   2. For each row item:
+ *      a. EMBEDDED-COLONS pass: scan the item's string for every
+ *         `:` / `：`. For each colon, take the substring back to
+ *         the previous colon (or item start), strip leading
+ *         underscores/whitespace/punctuation, and emit a
+ *         candidate if the remainder is a real word. The
+ *         candidate's `rightEdge` is the colon's estimated x:
+ *         `item.x + (colonIndex + 1) / item.str.length * item.width`.
+ *      b. SPLIT-COLONS pass: handle pdf.js's `"Name"` + `":"`
+ *         emission by joining a row item with an adjacent bare
+ *         `:` item within 6pt.
+ *   3. Filter candidates whose right edge sits in
+ *      `[fieldLeft - 80, fieldLeft + width × 0.5]`.
+ *   4. Pick the candidate whose right edge is CLOSEST to
+ *      `fieldLeft`.
+ *   5. Lenient fallback (no colon found anywhere): accept any
+ *      row item whose right edge sits within 25pt of the bbox's
+ *      left edge.
+ */
+function findPrintedCellLabel(
+  items: PrintedItemRect[],
+  field: TemplateField
+): { text: string; rightEdge: number } | null {
+  if (items.length === 0) return null;
+  const fieldLeft = field.x;
+  const fieldRight = field.x + field.width;
+  const fieldTop = field.y;
+  const fieldBottom = field.y + field.height;
+  const vTol = Math.max(2, field.height * 0.4);
+  const leftSearchEdge = fieldLeft - 80;
+  const rightSearchEdge = fieldLeft + field.width * 0.5;
+
+  // Step 1 — collect row items (vertical overlap with bbox).
+  const rowItems = items.filter((it) => {
+    const itemBottom = it.y + it.height;
+    if (itemBottom < fieldTop - vTol) return false;
+    if (it.y > fieldBottom + vTol) return false;
+    return true;
+  });
+  if (rowItems.length === 0) return null;
+
+  type Candidate = { text: string; rightEdge: number };
+  const candidates: Candidate[] = [];
+
+  // Helper — strip leading non-word filler (underscores, spaces,
+  // punctuation, dashes) from a label fragment, then trim.
+  const cleanLabel = (raw: string): string =>
+    raw.replace(/^[\s_\-—–.,;:()\/\\]+/, "").trim();
+
+  // Step 2a — EMBEDDED-COLONS pass. Walks each item's string and
+  // emits one candidate per `:` / `：` occurrence.
+  for (const item of rowItems) {
+    const str = item.str;
+    if (str.length === 0) continue;
+    const colonIndices: number[] = [];
+    for (let i = 0; i < str.length; i += 1) {
+      const ch = str[i];
+      if (ch === ":" || ch === "：") colonIndices.push(i);
+    }
+    if (colonIndices.length === 0) continue;
+    let prevEnd = 0;
+    for (const colonIdx of colonIndices) {
+      const segment = str.slice(prevEnd, colonIdx);
+      const cleaned = cleanLabel(segment);
+      prevEnd = colonIdx + 1;
+      if (cleaned.length < 2) continue;
+      // Drop segments that are pure punctuation / numbers — these
+      // are not real cell labels (e.g. `"___________ 1:"` from a
+      // numbered list).
+      if (!/[a-zA-Z]/.test(cleaned)) continue;
+      // Linear-interpolate the colon's x position across the item
+      // width. This is approximate (variable-width fonts) but is
+      // accurate to ~10pt, which is well below the search range.
+      const charProgress = (colonIdx + 1) / Math.max(1, str.length);
+      const rightEdge = item.x + item.width * charProgress;
+      candidates.push({ text: cleaned, rightEdge });
+    }
+  }
+
+  // Step 2b — SPLIT-COLONS pass. pdf.js sometimes emits the
+  // colon as its own item; join it with the previous row item.
+  const sorted = [...rowItems].sort((a, b) => a.x - b.x);
+  for (let i = 0; i < sorted.length; i += 1) {
+    const item = sorted[i];
+    const trimmed = item.str.trim();
+    if (!/^[:：]\s*$/.test(trimmed)) continue;
+    const prev = sorted[i - 1];
+    if (!prev) continue;
+    const prevText = prev.str.trim();
+    if (prevText.length === 0) continue;
+    // Skip if the previous item's text already includes a colon —
+    // we'd be double-counting against Step 2a.
+    if (/[:：]/.test(prevText)) continue;
+    const prevRight = prev.x + prev.width;
+    const gap = item.x - prevRight;
+    if (gap > 6) continue;
+    const prevMidY = prev.y + prev.height / 2;
+    const itemMidY = item.y + item.height / 2;
+    if (Math.abs(prevMidY - itemMidY) > Math.max(2, prev.height * 0.5)) continue;
+    const itemRight = item.x + item.width;
+    const cleaned = cleanLabel(prevText);
+    if (cleaned.length < 2) continue;
+    if (!/[a-zA-Z]/.test(cleaned)) continue;
+    candidates.push({ text: cleaned, rightEdge: itemRight });
+  }
+
+  // Step 3 + 4 — filter by horizontal search range and pick the
+  // candidate whose right edge is closest to the bbox's left edge.
+  let best: Candidate | null = null;
+  for (const cand of candidates) {
+    if (cand.rightEdge < leftSearchEdge) continue;
+    if (cand.rightEdge > rightSearchEdge) continue;
+    if (cand.text.length < 2) continue;
+    if (!best || Math.abs(cand.rightEdge - fieldLeft) < Math.abs(best.rightEdge - fieldLeft)) {
+      best = cand;
+    }
+  }
+  if (best) return best;
+
+  // Step 5 — lenient fallback. Forms whose labels lack a colon
+  // (or whose colon glyph pdf.js can't decode) still benefit from
+  // a label override when there's a single printed text island
+  // sitting immediately to the bbox's left.
+  const FALLBACK_LEFT = fieldLeft - 25;
+  const FALLBACK_RIGHT = fieldLeft + 2;
+  let fallback: Candidate | null = null;
+  for (const item of rowItems) {
+    const itemRight = item.x + item.width;
+    if (itemRight < FALLBACK_LEFT) continue;
+    if (itemRight > FALLBACK_RIGHT) continue;
+    if (item.x > fieldRight) continue;
+    const trimmed = cleanLabel(item.str.replace(/[:：]+\s*$/, ""));
+    if (trimmed.length < 2) continue;
+    if (!/[a-zA-Z]/.test(trimmed)) continue;
+    if (!fallback || itemRight > fallback.rightEdge) {
+      fallback = { text: trimmed, rightEdge: itemRight };
+    }
+  }
+  return fallback;
+}
+
+/**
+ * v0.6.19 — deterministic label correction. For each text /
+ * option-group field, look up the printed label adjacent to its
+ * bbox (via {@link findPrintedCellLabel}) and override Gemini's
+ * `label` / `canonicalFieldId` / `mappedProjectKey` if Gemini
+ * picked the wrong cell's caption.
+ *
+ * Conservative rules:
+ *   - Skip checkbox fields entirely (their `label` is the option
+ *     name, not the cell prefix).
+ *   - Skip fields whose label already matches the printed text
+ *     (case-insensitive, colon-stripped).
+ *   - When overriding: re-resolve canonical via `inferByLabel`. If
+ *     the new label doesn't resolve to any canonical AND Gemini's
+ *     original DID resolve, we still prefer the corrected label —
+ *     the printed cell prefix is ground truth, and an
+ *     unmapped-but-correctly-labeled field is better UX than a
+ *     wrong-labeled-but-mapped one (the user can manually pick a
+ *     canonical from the dropdown).
+ */
+function correctFieldLabelsFromPrintedText(
+  fields: TemplateField[],
+  itemsByPage: Record<number, PrintedItemRect[]>
+): TemplateField[] {
+  const normalize = (s: string) =>
+    (s ?? "")
+      .toLowerCase()
+      .replace(/[:：]+\s*$/, "")
+      .replace(/\s+/g, " ")
+      .trim();
+  // v0.6.24 — diagnostic summary so the user can confirm the pass
+  // actually fired. Helps distinguish "label-correction silently
+  // failed" from "user didn't re-detect the template after
+  // updating".
+  const totalItems = Object.values(itemsByPage).reduce(
+    (acc, list) => acc + list.length,
+    0
+  );
+  console.warn(
+    `[Typeset detector] Label-correction pass starting: fields=${fields.length} ` +
+      `pages-with-text=${Object.keys(itemsByPage).length} ` +
+      `total-printed-items=${totalItems}`
+  );
+  if (totalItems === 0) {
+    console.warn(
+      "[Typeset detector] No printed text items extracted — label correction will no-op. " +
+        "This usually means the source PDF is image-only / scanned, or pdf.js failed to parse it."
+    );
+  }
+  let overrides = 0;
+  let skippedNoLabel = 0;
+  const result = fields.map((field) => {
+    if (field.fieldType === "checkbox") return field;
+    if (
+      field.fieldKind === "boolean-checkbox" ||
+      field.fieldKind === "checkbox-group"
+    ) {
+      return field;
+    }
+    const items = itemsByPage[field.pageNumber] ?? [];
+    if (items.length === 0) return field;
+    const found = findPrintedCellLabel(items, field);
+    if (!found) {
+      skippedNoLabel += 1;
+      return field;
+    }
+    const correctedRaw = found.text;
+    if (normalize(correctedRaw) === normalize(field.label)) return field;
+    const fieldType = (field.fieldType ?? "text") as
+      | "text"
+      | "checkbox"
+      | "option-group";
+    const newCanonicalId = inferByLabel(
+      correctedRaw,
+      fieldType,
+      field.checkboxValue
+    );
+
+    // v0.6.26 — REGRESSION FIX. The v0.6.25 path always overrode
+    // `label` + `canonicalFieldId` + `mappedProjectKey` whenever a
+    // printed label differed from Gemini's emission. That stripped
+    // canonical mappings from fields where Gemini's label
+    // ("Cardholder Name") DID resolve to a catalog canonical
+    // (`creditCardHolder`) but the printed prefix
+    // ("Name on Credit Card") didn't match any alias. Those
+    // fields then dropped to `mappedProjectKey: "__prompt__"` and
+    // started appearing in the "Fill required values" modal at
+    // export time — exactly the noise the user reported.
+    //
+    // Decision matrix:
+    //   - old resolves AND new resolves to SAME canonical → no-op.
+    //   - old resolves AND new resolves to DIFFERENT canonical →
+    //     trust the printed prefix; this is the Phone-vs-Name
+    //     case the correction was designed to catch.
+    //   - old resolves AND new DOESN'T resolve → KEEP THE ORIGINAL
+    //     (Gemini's contextual inference is better than the bare
+    //     printed text, and the catalog clearly recognises it).
+    //   - old DOESN'T resolve AND new resolves → use the new.
+    //   - neither resolves → use the new label string (informative
+    //     for the user), keep `__prompt__` mapping.
+    const oldCanonicalId = inferByLabel(
+      field.label,
+      fieldType,
+      field.checkboxValue
+    );
+    if (oldCanonicalId && !newCanonicalId) {
+      // Gemini had it right; printed prefix would only confuse us.
+      return field;
+    }
+    if (oldCanonicalId && newCanonicalId && oldCanonicalId === newCanonicalId) {
+      return field;
+    }
+
+    const newCanonicalDef = newCanonicalId
+      ? getCanonicalFieldDefinition(newCanonicalId)
+      : undefined;
+    const newMappedKey: TemplateMappedProjectKey = newCanonicalDef
+      ? (newCanonicalDef.mappedProjectKey as TemplateMappedProjectKey)
+      : ("__prompt__" as TemplateMappedProjectKey);
+    overrides += 1;
+    console.warn(
+      `[Typeset detector] Label correction (v0.6.26): page=${field.pageNumber} ` +
+        `bbox=(${field.x.toFixed(1)},${field.y.toFixed(1)}) ` +
+        `"${field.label}" (canonical=${oldCanonicalId ?? "—"}) → ` +
+        `"${correctedRaw}" (canonical=${newCanonicalId ?? "—"})`
+    );
+    return {
+      ...field,
+      label: newCanonicalDef?.label ?? correctedRaw,
+      canonicalFieldId: newCanonicalId,
+      mappedProjectKey: newMappedKey,
+      printedLabel: `${correctedRaw}:`,
+    };
+  });
+  console.warn(
+    `[Typeset detector] Label-correction pass done: overrides=${overrides} ` +
+      `skipped-no-label-found=${skippedNoLabel}`
+  );
+  return result;
+}
+
+/**
+ * v0.6.26 — find the printed cell-prefix label that immediately
+ * precedes an underline item. Same multi-colon parsing as
+ * {@link findPrintedCellLabel}, but anchored to the underline's
+ * left edge instead of an existing field bbox. Used by
+ * {@link synthesizeMissingFieldsFromUnderlines} to figure out
+ * what to call a newly-discovered orphan underline.
+ */
+function findLabelPrecedingUnderline(
+  items: PrintedItemRect[],
+  ul: PrintedItemRect
+): { text: string; rightEdge: number } | null {
+  const ulLeft = ul.x;
+  const ulCenterY = ul.y + ul.height / 2;
+  const vTol = Math.max(2, ul.height * 0.4);
+
+  const rowItems = items.filter((it) => {
+    if (it === ul) return false;
+    const itC = it.y + it.height / 2;
+    return Math.abs(itC - ulCenterY) <= vTol;
+  });
+  if (rowItems.length === 0) return null;
+
+  type Cand = { text: string; rightEdge: number };
+  const candidates: Cand[] = [];
+  const cleanLabel = (raw: string) =>
+    raw.replace(/^[\s_\-—–.,;:()\/\\]+/, "").trim();
+
+  for (const item of rowItems) {
+    const str = item.str;
+    if (str.length === 0) continue;
+    const colons: number[] = [];
+    for (let i = 0; i < str.length; i += 1) {
+      const c = str[i];
+      if (c === ":" || c === "：") colons.push(i);
+    }
+    if (colons.length === 0) continue;
+    let prevEnd = 0;
+    for (const ci of colons) {
+      const seg = str.slice(prevEnd, ci);
+      const cleaned = cleanLabel(seg);
+      prevEnd = ci + 1;
+      if (cleaned.length < 2) continue;
+      if (!/[a-zA-Z]/.test(cleaned)) continue;
+      const progress = (ci + 1) / Math.max(1, str.length);
+      const rightEdge = item.x + item.width * progress;
+      candidates.push({ text: cleaned, rightEdge });
+    }
+  }
+
+  // Pick the rightmost candidate that's LEFT of the underline AND
+  // within ~25pt of it (i.e. immediately preceding).
+  let best: Cand | null = null;
+  for (const c of candidates) {
+    if (c.rightEdge > ulLeft + 2) continue;
+    if (c.rightEdge < ulLeft - 25) continue;
+    if (!best || c.rightEdge > best.rightEdge) best = c;
+  }
+  return best;
+}
+
+/**
+ * v0.6.26 — synthesize fields for orphan underlines that Gemini
+ * missed. Motivating case: the SGPS / ShowRig CC auth form's
+ * bottom section emits each row as one pdf.js item like:
+ *
+ *   "Name: ___________________________________ Phone:"
+ *
+ * followed by a SEPARATE underline item:
+ *
+ *   "__________________________"   ← Phone's writable area
+ *
+ * Gemini boxes the left cell (Name) but routinely misses the
+ * right cell (Phone) because the underline lives in its own
+ * unlabeled text item. Same pattern for Job Title / Email.
+ *
+ * Algorithm:
+ *   1. Scan each page's printed text items for "underline" items
+ *      (string is at least 10 underscores AND ≥80% underscores).
+ *   2. Skip any underline that horizontally overlaps an
+ *      already-detected field on the same row — Gemini got that
+ *      one.
+ *   3. For each orphan underline, look for a printed label that
+ *      ends within 25pt to its LEFT on the same row (via
+ *      {@link findLabelPrecedingUnderline}).
+ *   4. If a label is found, synthesize a TemplateField at the
+ *      underline's geometry, resolved through `inferByLabel` so
+ *      `phone` / `email` / etc. get the right canonical id.
+ *
+ * The detection source is `geometry-line` (parity with other
+ * underline-derived fields) and the confidence is intentionally
+ * modest (0.7) so the user knows the field came from a heuristic
+ * rather than a model emission.
+ */
+/**
+ * v0.6.29 — special-case label overrides for synthesized fields.
+ * Certain printed labels are unambiguous signatures even though
+ * `inferByLabel` returns no canonical id (or returns a generic
+ * text canonical). The JEM rental contract uses `Its: ____` as
+ * the lessee's signature-line, and many older contracts use
+ * `By: ____` similarly. Treat both as signatures so Wrapkit
+ * drops the user's signature image / typed signature into them
+ * at fill time instead of prompting for a freeform string.
+ *
+ * Returns null if no override applies — caller falls back to
+ * the default `inferByLabel` resolution.
+ */
+function classifySpecialSignatureLabel(
+  rawLabel: string
+): { canonicalId: CanonicalFieldId; isSignature: true } | null {
+  const norm = rawLabel.trim().toLowerCase().replace(/[:：]+$/, "").trim();
+  if (norm === "its") {
+    return {
+      canonicalId: "cardholderSignature" as CanonicalFieldId,
+      isSignature: true,
+    };
+  }
+  return null;
+}
+
+function synthesizeMissingFieldsFromUnderlines(
+  fields: TemplateField[],
+  itemsByPage: Record<number, PrintedItemRect[]>
+): TemplateField[] {
+  const synthesized: TemplateField[] = [];
+
+  for (const [pageStr, items] of Object.entries(itemsByPage)) {
+    const pageNum = Number(pageStr);
+    const pageFields = fields.filter((f) => f.pageNumber === pageNum);
+
+    const underlines = items.filter((it) => {
+      const trimmed = it.str.trim();
+      // v0.6.29 — lowered from 10 → 6 underscores. The previous
+      // threshold missed short underlines like the JEM contract's
+      // `Its: ______` (Title) line, which has fewer than 10
+      // underscores but is unambiguously a writable field. The
+      // 80% underscore-density gate below is what prevents
+      // spurious matches in body text, not the absolute count.
+      if (trimmed.length < 6) return false;
+      const ucount = (trimmed.match(/_/g) ?? []).length;
+      if (ucount < 6) return false;
+      return ucount / trimmed.length >= 0.8;
+    });
+
+    for (const ul of underlines) {
+      const ulCenterY = ul.y + ul.height / 2;
+      const ulLeft = ul.x;
+      const ulRight = ul.x + ul.width;
+
+      // Skip if an existing field substantially covers this
+      // underline. Use a horizontal-coverage RATIO (≥ 30% of the
+      // underline width contained in the field) rather than any-
+      // pixel-overlap, so a Gemini bbox that bleeds 1-2pt into a
+      // sibling underline doesn't accidentally suppress
+      // synthesis of that sibling.
+      const COVERAGE_THRESHOLD = 0.3;
+      const isCoveredBy = (f: TemplateField): boolean => {
+        if (f.pageNumber !== pageNum) return false;
+        const fCenterY = f.y + f.height / 2;
+        if (Math.abs(ulCenterY - fCenterY) > Math.max(8, f.height)) return false;
+        const fLeft = f.x;
+        const fRight = f.x + f.width;
+        const overlapX = Math.max(0, Math.min(ulRight, fRight) - Math.max(ulLeft, fLeft));
+        return overlapX / Math.max(1, ul.width) >= COVERAGE_THRESHOLD;
+      };
+      if (pageFields.some(isCoveredBy)) continue;
+      if (synthesized.some(isCoveredBy)) continue;
+
+      const label = findLabelPrecedingUnderline(items, ul);
+      if (!label) continue;
+
+      // v0.6.29 — special-case Its: ____ → signature line. Apply
+      // BEFORE the generic `inferByLabel` lookup so "Its" doesn't
+      // get routed to a text-typed canonical.
+      const special = classifySpecialSignatureLabel(label.text);
+      const canonicalId = special?.canonicalId ?? inferByLabel(label.text, "text", undefined);
+      const canonicalDef = canonicalId
+        ? getCanonicalFieldDefinition(canonicalId)
+        : undefined;
+      const mappedKey: TemplateMappedProjectKey = canonicalDef
+        ? (canonicalDef.mappedProjectKey as TemplateMappedProjectKey)
+        : ("__prompt__" as TemplateMappedProjectKey);
+
+      // The underline item's `y` is the top of the glyph bbox
+      // pdf.js reports; the visible underscore stroke sits near
+      // the bottom of that band. Matching the bbox to the glyph's
+      // own rect covers the writable region above the underscore
+      // visual. Force a min height of 14pt so the bbox is at
+      // least as tall as a typical typed-text line.
+      const fieldHeight = Math.max(14, ul.height);
+      // `fieldType` is the narrow trio "text" | "checkbox" |
+      // "option-group" — signatures live on `fieldKind` only. The
+      // pdfWriter's `isSignatureField` keys off `fieldKind`, so
+      // setting kind alone is sufficient for routing.
+      const fieldKind: TemplateField["fieldKind"] = special?.isSignature
+        ? "signature"
+        : "text";
+      const field: TemplateField = {
+        id: `synth-ul-${pageNum}-${Math.round(ul.x)}-${Math.round(ul.y)}`,
+        label: canonicalDef?.label ?? label.text,
+        canonicalFieldId: canonicalId,
+        mappedProjectKey: mappedKey,
+        pageNumber: pageNum,
+        x: ul.x,
+        y: Math.max(0, ul.y),
+        width: ul.width,
+        height: fieldHeight,
+        confidence: 0.7,
+        fieldType: "text",
+        fieldKind,
+        detectionSource: "geometry-line",
+        printedLabel: `${label.text}:`,
+      };
+
+      synthesized.push(field);
+      console.warn(
+        `[Typeset detector] Synthesized missing field (v0.6.26): page=${pageNum} ` +
+          `label="${label.text}" canonical=${canonicalId ?? "—"} ` +
+          `bbox=(${field.x.toFixed(1)},${field.y.toFixed(1)},${field.width.toFixed(1)},${field.height.toFixed(1)})`
+      );
+    }
+  }
+
+  // v0.6.28 — embedded-label-underline pass. Some PDFs emit
+  // `LABEL: ___________________` as a SINGLE text item (the label
+  // and the underline share an item). The standalone-underline pass
+  // above can't catch these because (a) for short labels like
+  // "Its: ___" the item ratio passes the 80% threshold but
+  // `findLabelPrecedingUnderline` searches OTHER items for a label
+  // and finds none, and (b) for longer labels like
+  // "Please print name: ___" the underscore ratio is below 80% so
+  // the item never enters the standalone pass at all.
+  //
+  // For each item, find every `LABEL: ____` substring (regex), use
+  // linear-interpolation to estimate the underline's x-extent (same
+  // trick as the EMBEDDED-COLONS pass in `findPrintedCellLabel`),
+  // and synthesize a field if no existing/synthesized field covers
+  // it.
+  for (const [pageStr, items] of Object.entries(itemsByPage)) {
+    const pageNum = Number(pageStr);
+    const pageFields = fields.filter((f) => f.pageNumber === pageNum);
+
+    const isCoveredAt = (
+      ulLeft: number,
+      ulRight: number,
+      ulCenterY: number,
+      f: TemplateField
+    ): boolean => {
+      if (f.pageNumber !== pageNum) return false;
+      const fCenterY = f.y + f.height / 2;
+      if (Math.abs(ulCenterY - fCenterY) > Math.max(8, f.height)) return false;
+      const fLeft = f.x;
+      const fRight = f.x + f.width;
+      const overlapX = Math.max(0, Math.min(ulRight, fRight) - Math.max(ulLeft, fLeft));
+      const ulWidth = Math.max(1, ulRight - ulLeft);
+      return overlapX / ulWidth >= 0.3;
+    };
+
+    for (const item of items) {
+      const str = item.str;
+      // v0.6.29 — lowered embedded-underline threshold from 10 → 6
+      // for parity with the standalone-underline pass. Catches
+      // patterns like `Its: ______` (JEM contract) where the
+      // underline is in the same item as a short label.
+      if (str.length < 8) continue;
+      if (!/_{6,}/.test(str)) continue;
+
+      const re = /([A-Za-z][A-Za-z0-9 '\-/&.]{0,40}?)\s*[:：]\s*(_{6,})/g;
+      let match: RegExpExecArray | null;
+      while ((match = re.exec(str)) !== null) {
+        const labelText = match[1].trim();
+        const underscores = match[2];
+        const matchStart = match.index;
+        const totalLen = Math.max(1, str.length);
+        const underlineStartIdx =
+          matchStart + match[0].length - underscores.length;
+        const underlineEndIdx = matchStart + match[0].length;
+        const ulX = item.x + item.width * (underlineStartIdx / totalLen);
+        const ulRight = item.x + item.width * (underlineEndIdx / totalLen);
+        const ulWidth = Math.max(10, ulRight - ulX);
+        const ulY = item.y;
+        const ulHeight = item.height || 12;
+        const ulCenterY = ulY + ulHeight / 2;
+
+        if (pageFields.some((f) => isCoveredAt(ulX, ulX + ulWidth, ulCenterY, f))) continue;
+        if (synthesized.some((f) => isCoveredAt(ulX, ulX + ulWidth, ulCenterY, f))) continue;
+
+        // v0.6.29 — same Its-→-signature override as the
+        // standalone-underline pass above. The embedded pass is
+        // typically the one that catches "Its: ___" because
+        // the label + underscores fit in a single pdf.js text
+        // item (the standalone pass requires a separate
+        // underscore-only item).
+        const special = classifySpecialSignatureLabel(labelText);
+        const canonicalId = special?.canonicalId ?? inferByLabel(labelText, "text", undefined);
+        const canonicalDef = canonicalId
+          ? getCanonicalFieldDefinition(canonicalId)
+          : undefined;
+        const mappedKey: TemplateMappedProjectKey = canonicalDef
+          ? (canonicalDef.mappedProjectKey as TemplateMappedProjectKey)
+          : ("__prompt__" as TemplateMappedProjectKey);
+
+        const fieldKind: TemplateField["fieldKind"] = special?.isSignature
+          ? "signature"
+          : "text";
+
+        const field: TemplateField = {
+          id: `synth-emb-${pageNum}-${Math.round(ulX)}-${Math.round(ulY)}`,
+          label: canonicalDef?.label ?? labelText,
+          canonicalFieldId: canonicalId,
+          mappedProjectKey: mappedKey,
+          pageNumber: pageNum,
+          x: ulX,
+          y: Math.max(0, ulY),
+          width: ulWidth,
+          height: Math.max(14, ulHeight),
+          confidence: 0.7,
+          fieldType: "text",
+          fieldKind,
+          detectionSource: "geometry-line",
+          printedLabel: `${labelText}:`,
+        };
+        synthesized.push(field);
+        console.warn(
+          `[Typeset detector] Synthesized embedded-underline field (v0.6.28): page=${pageNum} ` +
+            `label="${labelText}" canonical=${canonicalId ?? "—"} ` +
+            `bbox=(${field.x.toFixed(1)},${field.y.toFixed(1)},${field.width.toFixed(1)},${field.height.toFixed(1)})`
+        );
+      }
+    }
+  }
+
+  if (synthesized.length > 0) {
+    console.warn(
+      `[Typeset detector] Synthesis pass added ${synthesized.length} ` +
+        `field(s) for orphan underlines.`
+    );
+  }
+  return [...fields, ...synthesized];
+}
+
+/**
  * Run section detection on a pre-computed text snapshot. Pure
  * function; no pdf.js calls. Used by the detection pipeline AFTER
  * `extractPageTextSnapshot` so the snapshot can be reused for the
@@ -780,6 +1517,181 @@ export function annotateFieldsWithSections(
     if (!match) return field;
     return { ...field, section: match.label };
   });
+}
+
+/**
+ * v0.6.28 — annotate each field with the party (signer / vendor)
+ * it's intended for, based on nearby printed text and the field's
+ * section label. The user (Wrapkit operator) is always the SIGNER —
+ * the production company filling out a rental, finance, or auth
+ * form. The VENDOR is the counterparty (the rental house, finance
+ * company, or other supplier).
+ *
+ * Detection signals, evaluated in priority order:
+ *   1. Same-row vendor / signer keywords (e.g. a `DATE: ___ LESSOR,
+ *      JEM F/X Inc.` row clearly identifies the date as a vendor
+ *      field).
+ *   2. Nearest preceding row's keywords within ~40pt of the field's
+ *      vertical centre — handles `By: ___` on its own line below a
+ *      `LESSOR, JEM F/X Inc.` row.
+ *   3. The field's `section` label (already annotated by
+ *      `annotateFieldsWithSections`).
+ *   4. The field's own `label` / `printedLabel`.
+ *
+ * Hard-coded vendor name list keeps a few canonical vendors in the
+ * corpus accurate even when the row text lacks the LESSOR keyword
+ * (e.g. some forms just print the company name).
+ *
+ * Never overrides a `party` that was already set upstream — caller-
+ * supplied values win, the detector only fills in missing ones.
+ */
+const VENDOR_KEYWORDS =
+  /\b(lessor|vendor|seller|supplier|provider|landlord|sales\s+rep(?:resentative)?|authorized\s+rep(?:resentative)?|company\s+rep(?:resentative)?|by\s+vendor|vendor\s+signature|vendor\s+rep|owner\s+rep)\b/i;
+const SIGNER_KEYWORDS =
+  /\b(lessee|customer|buyer|renter|client|tenant|cardholder|card\s*holder|production\s+company|production|signer|sublessee|authorized\s+(?:agent|signer))\b/i;
+const VENDOR_NAME_PATTERNS =
+  /\b(j\.?e\.?m\.?\s*f\/?x|jem\s+f\s*\/\s*x|coffey\s+sound|keslow\s+camera|panavision|otto\s+nemenz|sgps|showrig|arrow)\b/i;
+const SIGNER_LABEL_PATTERNS =
+  /\b(cardholder|card\s*holder|customer|buyer|lessee|client|tenant|production\s+company|signer|print\s+name|its)\b/i;
+const VENDOR_LABEL_PATTERNS =
+  /\b(lessor|vendor|by\s+vendor|sales\s+rep|authorized\s+rep|company\s+rep|owner\s+rep)\b/i;
+
+export function annotateFieldsWithParty(
+  fields: TemplateField[],
+  itemsByPage: Record<number, PrintedItemRect[]>
+): TemplateField[] {
+  let signerCount = 0;
+  let vendorCount = 0;
+  const result = fields.map((field) => {
+    if (field.party === "signer" || field.party === "vendor") return field;
+    const items = itemsByPage[field.pageNumber] ?? [];
+    const fCenterY = field.y + field.height / 2;
+
+    // (1) Same-row keywords. pdf.js item y is top-of-glyph; treat
+    // anything whose vertical centre is within ~6pt as same-row.
+    const sameRow = items.filter((it) => {
+      const itC = it.y + it.height / 2;
+      return Math.abs(itC - fCenterY) <= 6;
+    });
+    const sameRowText = sameRow.map((it) => it.str).join(" ");
+    let party: "signer" | "vendor" | undefined;
+    if (VENDOR_NAME_PATTERNS.test(sameRowText)) party = "vendor";
+    else if (VENDOR_KEYWORDS.test(sameRowText)) party = "vendor";
+    else if (SIGNER_KEYWORDS.test(sameRowText)) party = "signer";
+
+    // (2) Nearest preceding row's keywords within ~40pt above the
+    // field. Use the row that's closest (smallest y delta where the
+    // row is above the field).
+    if (!party) {
+      const above = items.filter((it) => {
+        const itC = it.y + it.height / 2;
+        return itC < fCenterY && fCenterY - itC <= 40;
+      });
+      // Cluster by approximate row (4pt buckets) and take the
+      // CLOSEST cluster's combined text.
+      const buckets = new Map<number, string[]>();
+      for (const it of above) {
+        const key = Math.round(it.y / 4) * 4;
+        const arr = buckets.get(key) ?? [];
+        arr.push(it.str);
+        buckets.set(key, arr);
+      }
+      const sortedKeys = [...buckets.keys()].sort(
+        (a, b) => Math.abs(a - fCenterY) - Math.abs(b - fCenterY)
+      );
+      for (const key of sortedKeys) {
+        const rowText = (buckets.get(key) ?? []).join(" ");
+        if (VENDOR_NAME_PATTERNS.test(rowText)) {
+          party = "vendor";
+          break;
+        }
+        if (VENDOR_KEYWORDS.test(rowText)) {
+          party = "vendor";
+          break;
+        }
+        if (SIGNER_KEYWORDS.test(rowText)) {
+          party = "signer";
+          break;
+        }
+      }
+    }
+
+    // (3) Section label.
+    if (!party && field.section) {
+      if (VENDOR_KEYWORDS.test(field.section)) party = "vendor";
+      else if (SIGNER_KEYWORDS.test(field.section)) party = "signer";
+    }
+
+    // (4) Field label / printed label.
+    if (!party) {
+      const labelText = `${field.label ?? ""} ${field.printedLabel ?? ""}`;
+      if (VENDOR_LABEL_PATTERNS.test(labelText)) party = "vendor";
+      else if (SIGNER_LABEL_PATTERNS.test(labelText)) party = "signer";
+    }
+
+    if (!party) return field;
+    if (party === "signer") signerCount += 1;
+    else vendorCount += 1;
+    return { ...field, party };
+  });
+
+  if (signerCount > 0 || vendorCount > 0) {
+    console.warn(
+      `[Typeset detector] Party annotation (v0.6.28): signer=${signerCount} vendor=${vendorCount} unknown=${
+        result.length - signerCount - vendorCount
+      }`
+    );
+  }
+  return result;
+}
+
+/**
+ * v0.6.29 — promote known signature-line labels (currently just
+ * "Its") to `fieldKind: "signature"` so the fill pipeline drops
+ * the user's signature image / typed signature into them
+ * instead of asking for a freeform string.
+ *
+ * Runs AFTER all other detection passes (Gemini, boxed-field,
+ * initials, sections, party) so it catches both Gemini-emitted
+ * fields and synthesized ones that may have slipped through as
+ * text-typed. Idempotent: a field already typed as signature
+ * passes through unchanged.
+ */
+export function promoteSignatureLabelsToSignature(
+  fields: TemplateField[]
+): TemplateField[] {
+  let promoted = 0;
+  const result: TemplateField[] = fields.map((field) => {
+    if (field.fieldKind === "signature") return field;
+    const candidates = [field.label, field.printedLabel].filter(
+      (s): s is string => typeof s === "string"
+    );
+    const isIts = candidates.some((c) => {
+      const norm = c.trim().toLowerCase().replace(/[:：]+$/, "").trim();
+      return norm === "its";
+    });
+    if (!isIts) return field;
+
+    promoted += 1;
+    const canonicalDef = getCanonicalFieldDefinition(
+      "cardholderSignature" as CanonicalFieldId
+    );
+    return {
+      ...field,
+      canonicalFieldId:
+        field.canonicalFieldId ?? ("cardholderSignature" as CanonicalFieldId),
+      mappedProjectKey: canonicalDef
+        ? (canonicalDef.mappedProjectKey as TemplateMappedProjectKey)
+        : field.mappedProjectKey,
+      fieldKind: "signature",
+    };
+  });
+  if (promoted > 0) {
+    console.warn(
+      `[Typeset detector] Promoted ${promoted} "Its"-labeled field(s) to signature (v0.6.29).`
+    );
+  }
+  return result;
 }
 
 
@@ -3715,6 +4627,36 @@ async function detectFieldsImpl(
       verbose: true,
     });
     const snapshot = await textSnapshotPromise;
+    // v0.6.19 — deterministic label correction. Gemini sometimes
+    // reads the WRONG cell's printed caption and applies it to a
+    // neighbour bbox (canonical example: a two-column row like
+    // `Name: ____ Phone: ____` where Gemini bboxes Name's
+    // underline but labels it `Phone`). We solve this by
+    // extracting per-item printed text via pdf.js and overriding
+    // each field's label with the printed prefix that actually
+    // sits adjacent to its bbox. Falls through silently when
+    // extraction fails — the original Gemini label survives.
+    const itemsByPage = await extractPrintedItemsByPage(pdfBytes).catch(
+      (err) => {
+        console.warn(
+          "[Typeset detector] extractPrintedItemsByPage failed; label correction will be skipped.",
+          err
+        );
+        return {} as Record<number, PrintedItemRect[]>;
+      }
+    );
+    const labelCorrected = correctFieldLabelsFromPrintedText(
+      annotated,
+      itemsByPage
+    );
+    // v0.6.26 — synthesize fields for orphan underlines Gemini
+    // missed (canonical example: the right-column cells of
+    // two-column rows like `Name: ___ Phone: ___` on the SGPS
+    // form, where Gemini boxes Name's underline but not Phone's).
+    const withSynthesized = synthesizeMissingFieldsFromUnderlines(
+      labelCorrected,
+      itemsByPage
+    );
     // v0.6.0 (B3) — boxed-field detector. Runs AFTER snap +
     // option-blank annotation so the field set is at its final
     // bbox geometry; the boxed-field pass corrects over-extended
@@ -3724,7 +4666,7 @@ async function detectFieldsImpl(
     // Translate `y` → `yBottom` to match the `TextRow` shape used by
     // the rest of the snap pipeline.
     const boxed = annotateBoxedFields(
-      annotated,
+      withSynthesized,
       pageRenders,
       { textRows: pageTextSnapshotToBoxedTextRows(snapshot) },
       { verbose: true }
@@ -3734,6 +4676,7 @@ async function detectFieldsImpl(
     // a boxed-field bbox is skipped (the boxed-field bbox wins).
     const withInitials = annotateInitialBoxes(boxed, pageRenders, {
       verbose: true,
+      textRowsByPage: snapshot.rowsByPage,
     });
     // v0.6.0 (D3) — annotate fields with the section they fall
     // into. Used by B2 (cross-section bare-Name disambiguation)
@@ -3742,8 +4685,10 @@ async function detectFieldsImpl(
     // detection failed or found no headers.
     const sections = detectSectionsFromSnapshot(snapshot);
     const sectioned = annotateFieldsWithSections(withInitials, sections);
-    onStatus?.(`Gemini detected ${sectioned.length} field(s).`, 1);
-    return sectioned;
+    const partied = annotateFieldsWithParty(sectioned, itemsByPage);
+    const signaturePromoted = promoteSignatureLabelsToSignature(partied);
+    onStatus?.(`Gemini detected ${signaturePromoted.length} field(s).`, 1);
+    return signaturePromoted;
   }
 
   // ----- Pass 2: quality-control audit ------------------------------------
@@ -3779,22 +4724,43 @@ async function detectFieldsImpl(
       verbose: true,
     });
     const snapshot = await textSnapshotPromise;
-    const boxed = annotateBoxedFields(
+    const itemsByPage = await extractPrintedItemsByPage(pdfBytes).catch(
+      (err) => {
+        console.warn(
+          "[Typeset detector] extractPrintedItemsByPage failed (QC fallback); label correction will be skipped.",
+          err
+        );
+        return {} as Record<number, PrintedItemRect[]>;
+      }
+    );
+    const labelCorrected = correctFieldLabelsFromPrintedText(
       annotated,
+      itemsByPage
+    );
+    // v0.6.26 — synthesize fields for orphan underlines.
+    const withSynthesized = synthesizeMissingFieldsFromUnderlines(
+      labelCorrected,
+      itemsByPage
+    );
+    const boxed = annotateBoxedFields(
+      withSynthesized,
       pageRenders,
       { textRows: pageTextSnapshotToBoxedTextRows(snapshot) },
       { verbose: true }
     );
     const withInitials = annotateInitialBoxes(boxed, pageRenders, {
       verbose: true,
+      textRowsByPage: snapshot.rowsByPage,
     });
     const sections = detectSectionsFromSnapshot(snapshot);
     const sectioned = annotateFieldsWithSections(withInitials, sections);
+    const partied = annotateFieldsWithParty(sectioned, itemsByPage);
+    const signaturePromoted = promoteSignatureLabelsToSignature(partied);
     onStatus?.(
-      `Verification failed; using Pass 1 results (${sectioned.length} field(s)).`,
+      `Verification failed; using Pass 1 results (${signaturePromoted.length} field(s)).`,
       1
     );
-    return sectioned;
+    return signaturePromoted;
   }
 
   const snapped = snapFieldsToUnderlines(qcFields, pageRenders, {
@@ -3804,22 +4770,41 @@ async function detectFieldsImpl(
     verbose: true,
   });
   const snapshot = await textSnapshotPromise;
-  const boxed = annotateBoxedFields(
+  const itemsByPage = await extractPrintedItemsByPage(pdfBytes).catch((err) => {
+    console.warn(
+      "[Typeset detector] extractPrintedItemsByPage failed (QC pass); label correction will be skipped.",
+      err
+    );
+    return {} as Record<number, PrintedItemRect[]>;
+  });
+  const labelCorrected = correctFieldLabelsFromPrintedText(
     annotated,
+    itemsByPage
+  );
+  // v0.6.26 — synthesize fields for orphan underlines.
+  const withSynthesized = synthesizeMissingFieldsFromUnderlines(
+    labelCorrected,
+    itemsByPage
+  );
+  const boxed = annotateBoxedFields(
+    withSynthesized,
     pageRenders,
     { textRows: pageTextSnapshotToBoxedTextRows(snapshot) },
     { verbose: true }
   );
   const withInitials = annotateInitialBoxes(boxed, pageRenders, {
     verbose: true,
+    textRowsByPage: snapshot.rowsByPage,
   });
   const sections = detectSectionsFromSnapshot(snapshot);
   const sectioned = annotateFieldsWithSections(withInitials, sections);
+  const partied = annotateFieldsWithParty(sectioned, itemsByPage);
+  const signaturePromoted = promoteSignatureLabelsToSignature(partied);
   onStatus?.(
-    `Detection complete — ${sectioned.length} field(s) after verification.`,
+    `Detection complete — ${signaturePromoted.length} field(s) after verification.`,
     1
   );
-  return sectioned;
+  return signaturePromoted;
 }
 
 // ---------------------------------------------------------------------------

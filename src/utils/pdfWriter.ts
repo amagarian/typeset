@@ -1,4 +1,4 @@
-import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
+import { PDFDocument, PDFPage, StandardFonts, rgb } from "pdf-lib";
 import * as pdfjsLib from "pdfjs-dist";
 import type { Project, Template, TemplateField } from "@/types";
 
@@ -415,35 +415,168 @@ export interface WritePdfOptions {
   promptValues?: PromptFieldValues;
 }
 
+/**
+ * v0.6.25 — page-tree acquisition with a rasterize-and-overlay
+ * fallback for damaged PDFs.
+ *
+ * Some vendor PDFs ship with structurally invalid object
+ * references (the SGPS / ShowRig CC auth form is the motivating
+ * example — pdf-lib emits `Invalid object ref: 29 0 R` warnings
+ * on load, then `PDFCatalog.Pages` later crashes with
+ * `"Expected instance of PDFDict, but got instance of
+ * undefined"`). pdfjs-dist is far more tolerant — it can read and
+ * render those pages without issue.
+ *
+ * When the normal pdf-lib load + page enumeration fails, we
+ * rasterize each page via pdfjs to a JPEG, build a fresh
+ * pdf-lib document with one page per JPEG (preserving the
+ * original page dimensions in user-space pt), and continue with
+ * the rest of the writer pipeline against THAT doc. The output
+ * is image-backed rather than vector — text in the original PDF
+ * is no longer selectable — but the form fills correctly and the
+ * PDF prints / signs as expected.
+ */
+async function preparePdfDocForWrite(
+  sourcePdfBytes: Uint8Array
+): Promise<{ pdfDoc: PDFDocument; pages: PDFPage[]; isFallback: boolean }> {
+  try {
+    const pdfDoc = await PDFDocument.load(sourcePdfBytes, {
+      ignoreEncryption: true,
+    });
+    try {
+      const form = pdfDoc.getForm();
+      const fields = form.getFields();
+      if (fields.length > 0) {
+        console.log(
+          `[pdfWriter] Flattening ${fields.length} existing AcroForm fields`
+        );
+        form.flatten();
+      }
+    } catch {
+      // No form or form access failed — safe to continue.
+    }
+    // pdf-lib's page-tree resolution is lazy — getPages() may
+    // throw on damaged docs even when load() succeeds. Trigger it
+    // here so we catch and fall back early, before we've started
+    // embedding fonts / drawing.
+    const pages = pdfDoc.getPages();
+    return { pdfDoc, pages, isFallback: false };
+  } catch (err) {
+    console.warn(
+      `[pdfWriter] pdf-lib load/getPages failed; switching to rasterize-and-overlay fallback. (${
+        err instanceof Error ? err.message : String(err)
+      })`
+    );
+    return rasterizePdfWithPdfJsFallback(sourcePdfBytes);
+  }
+}
+
+async function rasterizePdfWithPdfJsFallback(
+  sourcePdfBytes: Uint8Array
+): Promise<{ pdfDoc: PDFDocument; pages: PDFPage[]; isFallback: true }> {
+  const bytesCopy = new Uint8Array(sourcePdfBytes);
+  const pdfjsDoc = await pdfjsLib.getDocument({ data: bytesCopy }).promise;
+  const newDoc = await PDFDocument.create();
+  const pages: PDFPage[] = [];
+  try {
+    for (let pageNum = 1; pageNum <= pdfjsDoc.numPages; pageNum += 1) {
+      const pdfjsPage = await pdfjsDoc.getPage(pageNum);
+      const viewportPt = pdfjsPage.getViewport({ scale: 1 });
+      // Render at ~2× DPI so the raster looks crisp at 100% zoom
+      // in a viewer and prints cleanly. Higher scales bloat file
+      // size disproportionately; 2× is a good middle ground.
+      const renderScale = 2;
+      const renderVp = pdfjsPage.getViewport({ scale: renderScale });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.round(renderVp.width);
+      canvas.height = Math.round(renderVp.height);
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        throw new Error(
+          `Could not acquire 2D canvas context to rasterize page ${pageNum}.`
+        );
+      }
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await pdfjsPage.render({ canvasContext: ctx, viewport: renderVp })
+        .promise;
+      // JPEG at 92% quality keeps file size reasonable while
+      // preserving form-line legibility. Empty white space
+      // compresses extremely well at this quality.
+      const blob: Blob | null = await new Promise((resolve) =>
+        canvas.toBlob((b) => resolve(b), "image/jpeg", 0.92)
+      );
+      if (!blob) {
+        throw new Error(`canvas.toBlob returned null for page ${pageNum}.`);
+      }
+      const jpegBytes = new Uint8Array(await blob.arrayBuffer());
+      const pdfImage = await newDoc.embedJpg(jpegBytes);
+      // The fresh page uses the ORIGINAL page dimensions in
+      // user-space points (not the rasterization scale). All field
+      // bboxes in `template.fields` are in user-space pt, so this
+      // keeps every coordinate consistent.
+      const newPage = newDoc.addPage([viewportPt.width, viewportPt.height]);
+      newPage.drawImage(pdfImage, {
+        x: 0,
+        y: 0,
+        width: viewportPt.width,
+        height: viewportPt.height,
+      });
+      pages.push(newPage);
+    }
+  } finally {
+    try {
+      await pdfjsDoc.destroy();
+    } catch {}
+  }
+  return { pdfDoc: newDoc, pages, isFallback: true };
+}
+
 export async function writeFilledPdfBytes(
   sourcePdfBytes: Uint8Array,
   template: Template,
   project: Project,
   options: WritePdfOptions = {}
 ): Promise<Uint8Array> {
-  const pdfDoc = await PDFDocument.load(sourcePdfBytes);
+  // v0.6.22 — vendor PDFs are frequently saved with "Restrict
+  // editing" / owner-password encryption (Acrobat's default when
+  // someone hits "Protect → Restrict Editing"). pdf-lib refuses to
+  // load these by default and surfaces:
+  //   "Input document to `PDFDocument.load` is encrypted."
+  // The AcroForm ingestor already passes `ignoreEncryption: true`
+  // (see `acroFormIngest.ts`), so failing here while succeeding
+  // there left the user with detected fields but a broken export.
+  // Matching the ingestor's flag closes that gap. Owner-password
+  // restrictions are cosmetic — pdf-lib still reads + writes the
+  // page contents — so the resulting filled PDF is valid.
+  //
+  // v0.6.25 — `preparePdfDocForWrite` also adds a
+  // rasterize-and-overlay fallback for PDFs whose object refs are
+  // structurally damaged (pdf-lib crashes at `PDFCatalog.Pages`
+  // with "Expected instance of PDFDict, but got instance of
+  // undefined"). pdfjs handles those PDFs fine, so we
+  // re-rasterize via pdfjs and overlay fields on the raster.
+  const { pdfDoc, pages, isFallback } = await preparePdfDocForWrite(
+    sourcePdfBytes
+  );
+  if (isFallback) {
+    console.warn(
+      "[pdfWriter] Rasterize-and-overlay fallback in use. The exported PDF " +
+        "will be image-backed; text in the source PDF will no longer be " +
+        "selectable, but field values will overlay correctly."
+    );
+  }
   // v0.6.14 — extract every printed-text rectangle from the source
   // PDF up front so the per-field loop can deterministically
   // shift the rendered value past any printed prefix label sitting
   // INSIDE the bbox (Layout A1 boxed-cell-prefix forms). This runs
   // ONCE per fill, not per field, and falls back to {} on failure.
+  // Note: we still extract from the SOURCE bytes (not the fallback
+  // doc), because pdfjs is more lenient than pdf-lib and the
+  // printed-text positions live in the source PDF's user-space
+  // coordinates, which `template.fields` was detected against.
   const printedTextByPage = await extractPrintedTextByPage(sourcePdfBytes);
 
-  // Flatten existing AcroForm fields so they don't cover our drawn text.
-  // Interactive widgets render on top of page content in PDF viewers,
-  // so we must remove them before writing.
-  try {
-    const form = pdfDoc.getForm();
-    const fields = form.getFields();
-    if (fields.length > 0) {
-      console.log(`[pdfWriter] Flattening ${fields.length} existing AcroForm fields`);
-      form.flatten();
-    }
-  } catch {
-    // No form or form access failed — safe to continue
-  }
-
-  const pages = pdfDoc.getPages();
   const font = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const signatureFont = await pdfDoc.embedFont(StandardFonts.TimesRomanItalic);
 
@@ -495,6 +628,14 @@ export async function writeFilledPdfBytes(
   }
 
   for (const field of repairedTemplate.fields) {
+    // v0.6.29 — vendor (counterparty) fields are NEVER filled by
+    // Wrapkit. They're left blank in the output PDF for the other
+    // party to fill in by hand or with their own software. This
+    // mirrors the no-prompt behaviour in `getPromptFields`. See
+    // `annotateFieldsWithParty` in `geminiFieldDetector.ts` for
+    // the tagging heuristic.
+    if (field.party === "vendor") continue;
+
     const pageIndex = Math.max(0, Math.min(pages.length - 1, field.pageNumber - 1));
     const page = pages[pageIndex];
 

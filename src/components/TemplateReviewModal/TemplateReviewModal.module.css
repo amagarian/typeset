@@ -146,7 +146,36 @@
 
 .pdfContainer {
   position: relative;
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* v0.6.27 — per-page wrapper: positioning context for the
+ * absolute-positioned DraggableField overlays on this page only. */
+.pageWrap {
+  position: relative;
   display: inline-block;
+}
+
+/* v0.6.27 — small page indicator in the top-left of each page,
+ * shown only when the PDF has more than one page so single-page
+ * forms don't acquire a useless label. */
+.pageBadge {
+  position: absolute;
+  top: 6px;
+  left: 6px;
+  padding: 2px 6px;
+  font-size: 9px;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: var(--letter-section);
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.92);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  pointer-events: none;
+  z-index: 2;
 }
 
 /*
@@ -221,6 +250,18 @@
   box-shadow: 0 0 0 1px var(--text);
 }
 
+/* v0.6.29 — vendor (counterparty) fields render greyed out in the
+ * sidebar to mirror the canvas treatment. The user can still see
+ * the row (so they trust detection coverage) and can still delete
+ * it or change its mapping if auto-detection misfired, but the
+ * visual weight matches the bbox: low-emphasis. */
+.fieldItemVendor {
+  opacity: 0.6;
+}
+.fieldItemVendor:hover {
+  opacity: 0.85;
+}
+
 .fieldItemRow {
   display: flex;
   justify-content: space-between;
@@ -236,6 +277,47 @@
 .fieldItemConfidence {
   font-size: 10px;
   color: var(--text-muted);
+}
+
+/* v0.6.27 — small page indicator (`p2`, `p3`, …) shown next to each
+ * sidebar field label when the document has more than one page. */
+.fieldItemPage {
+  margin-left: auto;
+  margin-right: 4px;
+  padding: 1px 5px;
+  font-size: 9px;
+  font-weight: 500;
+  color: var(--text-muted);
+  background: var(--bg-input);
+  border-radius: 3px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* v0.6.28 — small party chip ("you" / "vendor") shown next to each
+ * sidebar field. The first chip on the row gets `margin-left: auto`
+ * so the chips+button cluster aligns to the right of the label. */
+.fieldItemParty {
+  margin-left: auto;
+  margin-right: 4px;
+  padding: 1px 5px;
+  font-size: 9px;
+  font-weight: 500;
+  border-radius: 3px;
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+}
+.fieldItemPartySigner {
+  color: #1e40af;
+  background: rgba(59, 130, 246, 0.12);
+}
+.fieldItemPartyVendor {
+  color: #4b5563;
+  background: rgba(156, 163, 175, 0.2);
+}
+/* When the party chip is present, the page chip drops its
+ * auto-left so the two chips stack naturally. */
+.fieldItemParty + .fieldItemPage {
+  margin-left: 0;
 }
 
 .select {

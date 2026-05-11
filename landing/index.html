@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Typeset — auto-fill production PDFs</title>
+    <meta
+      name="description"
+      content="Typeset auto-fills film and production PDFs from your project data. A quiet macOS app that lives in your menu bar."
+    />
+
+    <link rel="icon" type="image/png" href="/icon.png" />
+    <link rel="apple-touch-icon" href="/icon.png" />
+
+    <meta property="og:title" content="Typeset" />
+    <meta
+      property="og:description"
+      content="Auto-fill production PDFs. A quiet macOS app for film and production."
+    />
+    <meta property="og:image" content="https://mytypeset.com/icon.png" />
+    <meta property="og:url" content="https://mytypeset.com" />
+    <meta name="twitter:card" content="summary" />
+
+    <style>
+      :root {
+        --bg: #efe9dc;
+        --fg: #161513;
+        --muted: #6b6558;
+        --border: rgba(22, 21, 19, 0.14);
+        --button-bg: #161513;
+        --button-fg: #efe9dc;
+        --button-bg-hover: #2a2823;
+      }
+
+      @media (prefers-color-scheme: dark) {
+        :root {
+          --bg: #151515;
+          --fg: #efe9dc;
+          --muted: #9c9588;
+          --border: rgba(239, 233, 220, 0.14);
+          --button-bg: #efe9dc;
+          --button-fg: #151515;
+          --button-bg-hover: #ffffff;
+        }
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        height: 100%;
+        background: var(--bg);
+        color: var(--fg);
+        font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text",
+          "Inter", "Helvetica Neue", Helvetica, Arial, sans-serif;
+        font-feature-settings: "ss01", "cv11";
+        -webkit-font-smoothing: antialiased;
+        -moz-osx-font-smoothing: grayscale;
+        text-rendering: optimizeLegibility;
+      }
+
+      main {
+        position: relative;
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        padding: 48px 24px 18vh;
+        text-align: center;
+      }
+
+      .icon {
+        width: 88px;
+        height: 88px;
+        border-radius: 20px;
+        margin-bottom: 28px;
+        box-shadow: 0 1px 2px rgba(0, 0, 0, 0.06),
+          0 8px 24px rgba(0, 0, 0, 0.08);
+      }
+
+      h1 {
+        margin: 0 0 10px;
+        font-size: 40px;
+        letter-spacing: -0.02em;
+        font-weight: 600;
+      }
+
+      p.tagline {
+        margin: 0 0 36px;
+        max-width: 460px;
+        font-size: 17px;
+        line-height: 1.45;
+        color: var(--muted);
+      }
+
+      .download {
+        display: inline-flex;
+        align-items: center;
+        gap: 10px;
+        padding: 14px 22px;
+        background: var(--button-bg);
+        color: var(--button-fg);
+        border-radius: 999px;
+        font-size: 15px;
+        font-weight: 500;
+        text-decoration: none;
+        letter-spacing: -0.01em;
+        transition: background 120ms ease, transform 120ms ease;
+      }
+
+      .download:hover {
+        background: var(--button-bg-hover);
+        transform: translateY(-1px);
+      }
+
+      .download:active {
+        transform: translateY(0);
+      }
+
+      .download svg {
+        width: 16px;
+        height: 16px;
+        flex: none;
+      }
+
+      .platform {
+        margin-top: 14px;
+        font-size: 13px;
+        color: var(--muted);
+        letter-spacing: 0.01em;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <img src="/icon.png" alt="Typeset" class="icon" />
+      <h1>Typeset</h1>
+      <p class="tagline">
+        Auto-fill production PDFs from your project data. A quiet
+        macOS app for film and production.
+      </p>
+
+      <a
+        class="download"
+        href="https://github.com/amagarian/typeset/releases/latest/download/Typeset.dmg"
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          aria-hidden="true"
+        >
+          <path d="M12 3v12" />
+          <path d="m7 10 5 5 5-5" />
+          <path d="M5 21h14" />
+        </svg>
+        Download for Mac
+      </a>
+      <div class="platform">
+        Apple Silicon · macOS 12+ · <span id="version">latest</span>
+      </div>
+    </main>
+
+    <script>
+      // Replace the placeholder "latest" with the live tag from GitHub.
+      // Fails silently — the download URL itself is version-agnostic.
+      fetch("https://api.github.com/repos/amagarian/typeset/releases/latest")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((d) => {
+          if (!d || !d.tag_name) return;
+          const el = document.getElementById("version");
+          if (el) el.textContent = d.tag_name;
+        })
+        .catch(() => {});
+    </script>
+  </body>
+</html>

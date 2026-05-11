@@ -59,6 +59,15 @@ export function getPromptFields(
   // (which happens automatically as soon as any other field needs
   // their attention).
   return template.fields.filter((field) => {
+    // v0.6.29 — vendor (counterparty) fields are never filled by
+    // Wrapkit. The detector tags them as `party: "vendor"` based on
+    // row context (e.g. "LESSOR" / "By:" / signature blocks tied
+    // to the rental house). Skip them entirely so the user is not
+    // prompted to enter "Counterparty's signature" or "Vendor's
+    // signer name" in the fill modal. See `annotateFieldsWithParty`
+    // in `geminiFieldDetector.ts` for tagging logic.
+    if (field.party === "vendor") return false;
+
     if (field.mappedProjectKey === "__prompt__") return true;
     if (isOptionGroupField(field)) {
       // Only prompt when there's no resolvable selection yet. If

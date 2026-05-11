@@ -14,6 +14,14 @@ interface DraggableFieldProps {
   projectValue?: string;
   /** For checkbox fields: callback when checkbox is clicked */
   onCheckboxClick?: (checkboxValue: string) => void;
+  /**
+   * v0.6.20 — caller-supplied delete handler. When provided, the
+   * field renders a small red × button anchored at its top-right
+   * corner (visible on hover / when selected). The handler is
+   * expected to record an undo snapshot before removing the field
+   * from the template so the deletion is reversible via Cmd+Z.
+   */
+  onDelete?: () => void;
 }
 
 type DragMode = 
@@ -47,7 +55,31 @@ export function DraggableField({
   onChange,
   projectValue,
   onCheckboxClick,
+  onDelete,
 }: DraggableFieldProps) {
+  // v0.6.20 — shared delete-button renderer. Stops propagation so a
+  // click on × doesn't also fire the parent's mousedown/select
+  // handlers (which would start a drag or move the focus mid-delete).
+  const renderDeleteButton = () =>
+    onDelete ? (
+      <button
+        type="button"
+        className={styles.deleteButton}
+        onMouseDown={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+        }}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onDelete();
+        }}
+        title="Delete field (Backspace)"
+        aria-label={`Delete ${field.label}`}
+      >
+        ×
+      </button>
+    ) : null;
   const containerRef = useRef<HTMLDivElement>(null);
   const [dragMode, setDragMode] = useState<DragMode>(null);
   const startPos = useRef({ x: 0, y: 0, fieldX: 0, fieldY: 0, fieldW: 0, fieldH: 0 });
@@ -347,12 +379,19 @@ export function DraggableField({
       <div
         ref={containerRef}
         data-draggable-field
-        className={`${styles.field} ${styles.optionGroup ?? ""} ${selected ? styles.selected : ""} ${dragMode ? styles.dragging : ""}`}
+        className={`${styles.field} ${styles.optionGroup ?? ""} ${
+          field.party === "vendor"
+            ? styles.partyVendor
+            : field.party === "signer"
+              ? styles.partySigner
+              : ""
+        } ${selected ? styles.selected : ""} ${dragMode ? styles.dragging : ""}`}
         style={scaledStyle}
         onMouseDown={handleFieldMouseDown}
         title={`${field.label} — drag to move (option group)`}
       >
         <span className={styles.label}>{field.label}</span>
+        {renderDeleteButton()}
 
         {sharedStrokeRect && (() => {
           // Always draw the dashed marker over the detected
@@ -597,7 +636,13 @@ export function DraggableField({
       <div
         ref={containerRef}
         data-draggable-field
-        className={`${styles.checkboxField} ${isChecked ? styles.checked : ""} ${selected ? styles.selected : ""} ${dragMode ? styles.dragging : ""}`}
+        className={`${styles.checkboxField} ${
+          field.party === "vendor"
+            ? styles.partyVendor
+            : field.party === "signer"
+              ? styles.partySigner
+              : ""
+        } ${isChecked ? styles.checked : ""} ${selected ? styles.selected : ""} ${dragMode ? styles.dragging : ""}`}
         style={{
           left: field.x * scale,
           top: field.y * scale,
@@ -627,6 +672,7 @@ export function DraggableField({
         }
       >
         {isChecked && <span className={styles.checkmark}>✓</span>}
+        {renderDeleteButton()}
       </div>
     );
   }
@@ -636,13 +682,20 @@ export function DraggableField({
     <div
       ref={containerRef}
       data-draggable-field
-      className={`${styles.field} ${selected ? styles.selected : ""} ${dragMode ? styles.dragging : ""}`}
+      className={`${styles.field} ${
+        field.party === "vendor"
+          ? styles.partyVendor
+          : field.party === "signer"
+            ? styles.partySigner
+            : ""
+      } ${selected ? styles.selected : ""} ${dragMode ? styles.dragging : ""}`}
       style={scaledStyle}
       onMouseDown={handleFieldMouseDown}
       title={`${field.label} — drag to move`}
     >
       <span className={styles.label}>{field.label}</span>
-      
+      {renderDeleteButton()}
+
       {/* Corner handles */}
       <div
         data-handle="nw"

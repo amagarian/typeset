@@ -41,6 +41,20 @@
 import type { TemplateField } from "@/types";
 import type { PageRender } from "@/utils/underlineSnap";
 
+/**
+ * v0.6.29 — one text row per page used by the adjacent-paragraph
+ * gate. Matches the shape produced by `extractPageTextSnapshot` in
+ * `geminiFieldDetector.ts` (already computed once per detection,
+ * passed through here to validate clusters).
+ */
+export interface InitialBoxTextRow {
+  /** Top-down PDF y of the row's baseline. */
+  y: number;
+  xMin: number;
+  xMax: number;
+  text: string;
+}
+
 export interface InitialBoxDetectorOptions {
   minSquarePt?: number;
   maxSquarePt?: number;
@@ -53,6 +67,24 @@ export interface InitialBoxDetectorOptions {
   minSquaresInCluster?: number;
   darkLuminance?: number;
   verbose?: boolean;
+  /**
+   * v0.6.29 — per-page text rows used to gate clause-initial
+   * clusters. Without this gate the detector latches onto
+   * non-initial-box graphics (e.g. decorative borders next to a
+   * letterhead address block on the MILK CC Auth form), emitting
+   * a column of false "Clause initials" fields. With the gate, a
+   * cluster only survives when most squares sit next to a
+   * paragraph-width text row.
+   */
+  textRowsByPage?: Record<number, InitialBoxTextRow[]>;
+  /** Min paragraph-row width (in PDF points) to count as a clause
+   *  paragraph. Address lines / captions are typically ≤ 200pt;
+   *  real clause body text is usually ≥ 350pt. */
+  minAdjacentRowWidthPt?: number;
+  /** Min char count for an adjacent paragraph row to be "substantial". */
+  minAdjacentRowChars?: number;
+  /** Vertical tolerance for matching a square to a text row. */
+  adjacentRowVerticalTolPt?: number;
 }
 
 const DEFAULT_OPTS: Required<InitialBoxDetectorOptions> = {
@@ -62,9 +94,18 @@ const DEFAULT_OPTS: Required<InitialBoxDetectorOptions> = {
   xClusterTolPt: 6,
   minVerticalGapPt: 18,
   maxVerticalGapPt: 100,
-  minSquaresInCluster: 3,
+  // v0.6.29 — raised from 3 → 4. Real clause-initial columns on
+  // rental agreements have 8-20+ stacked boxes; tightening to 4
+  // still keeps every legitimate corpus case while rejecting the
+  // 3-square noise patterns we've seen (e.g. the 3 logo squares on
+  // some studio letterheads).
+  minSquaresInCluster: 4,
   darkLuminance: 80,
   verbose: false,
+  textRowsByPage: {},
+  minAdjacentRowWidthPt: 250,
+  minAdjacentRowChars: 40,
+  adjacentRowVerticalTolPt: 18,
 };
 
 interface ShortRun {
@@ -277,6 +318,43 @@ function clusterSquares(
 }
 
 /**
+ * v0.6.29 — return `true` if at least 2/3 of the squares in this
+ * cluster sit adjacent to a substantial paragraph row (one with
+ * width ≥ `minAdjacentRowWidthPt` and at least
+ * `minAdjacentRowChars` characters). Real clause-initial columns
+ * sit beside legal body text — usually 400+pt wide lines spanning
+ * 60+ characters per line. Decorative letterhead artifacts (e.g.
+ * MILK's address block: ~150pt-wide short lines) fail both gates.
+ *
+ * When the caller didn't supply `textRowsByPage` we fall through to
+ * `true` so behaviour matches v0.6.28 for any code path that hasn't
+ * been updated yet — never silently regress clause-initial output.
+ */
+function clusterHasParagraphContext(
+  cluster: ColumnCluster,
+  opts: Required<InitialBoxDetectorOptions>
+): boolean {
+  const rows = opts.textRowsByPage[cluster.page];
+  if (!rows || rows.length === 0) return true;
+
+  let validSquares = 0;
+  for (const sq of cluster.squares) {
+    const sqCenterY = sq.y + sq.height / 2;
+    const adjacent = rows.find((row) => {
+      if (Math.abs(row.y - sqCenterY) > opts.adjacentRowVerticalTolPt) return false;
+      const rowWidth = row.xMax - row.xMin;
+      if (rowWidth < opts.minAdjacentRowWidthPt) return false;
+      if (row.text.length < opts.minAdjacentRowChars) return false;
+      return true;
+    });
+    if (adjacent) validSquares += 1;
+  }
+
+  const threshold = Math.ceil((cluster.squares.length * 2) / 3);
+  return validSquares >= threshold;
+}
+
+/**
  * Public entry point. Returns the augmented field list with one
  * `clauseInitials` field per detected square in qualifying
  * column-clusters. Existing fields are not modified — initials
@@ -297,12 +375,35 @@ export function annotateInitialBoxes(
   }
   if (allCandidates.length === 0) return fields;
 
-  const clusters = clusterSquares(allCandidates, opts).filter(
+  const rawClusters = clusterSquares(allCandidates, opts).filter(
     (c) => c.squares.length >= opts.minSquaresInCluster
   );
-  if (clusters.length === 0) {
+  if (rawClusters.length === 0) {
     if (opts.verbose) {
       console.log(`[initialBox] ${allCandidates.length} square(s) found but no cluster met min=${opts.minSquaresInCluster}.`);
+    }
+    return fields;
+  }
+
+  // v0.6.29 — adjacent-paragraph gate. Drop clusters whose squares
+  // don't sit next to legal-body-style paragraph text.
+  const clusters = rawClusters.filter((c) => {
+    const ok = clusterHasParagraphContext(c, opts);
+    if (!ok) {
+      console.warn(
+        `[initialBox] dropping cluster (v0.6.29): page=${c.page} ` +
+          `squares=${c.squares.length} centerX=${c.centerX.toFixed(1)} ` +
+          `— no adjacent paragraph row (≥${opts.minAdjacentRowWidthPt}pt × ` +
+          `${opts.minAdjacentRowChars} chars) for at least 2/3 of squares.`
+      );
+    }
+    return ok;
+  });
+  if (clusters.length === 0) {
+    if (opts.verbose) {
+      console.log(
+        `[initialBox] all ${rawClusters.length} cluster(s) rejected by paragraph gate.`
+      );
     }
     return fields;
   }

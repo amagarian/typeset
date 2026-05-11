@@ -1074,81 +1074,103 @@ function MainApp() {
     [templateModal]
   );
 
-  const handleAddField = useCallback(() => {
-    if (!templateModal) return;
-    recordTemplateUndoSnapshot();
-    const referenceFields = templateModal.template.fields.filter(
-      (field) => field.fieldType !== "checkbox" && field.height > 0
-    );
-    const heightSamples = (referenceFields.length > 0 ? referenceFields : templateModal.template.fields)
-      .map((field) => Math.round(field.height))
-      .filter((height) => height > 0)
-      .sort((left, right) => left - right);
-    const inferredHeight =
-      heightSamples.length > 0
-        ? heightSamples[Math.floor(heightSamples.length / 2)]
-        : 22;
-    const newField: TemplateField = {
-      id: `new-${Date.now()}`,
-      label: "New field",
-      mappedProjectKey: "",
-      pageNumber: 1,
-      x: 100,
-      y: 100,
-      width: 150,
-      height: inferredHeight,
-      confidence: 0.5,
-      fieldType: "text",
-      fieldKind: "text",
-      detectionSource: "manual",
-    };
-    const next = {
-      ...templateModal.template,
-      fields: [...templateModal.template.fields, newField],
-    };
-    setTemplateModal({ template: next });
-    setDraftTemplate((prev) =>
-      prev ? { ...prev, fields: [...prev.fields, newField] } : null
-    );
-  }, [recordTemplateUndoSnapshot, templateModal]);
+  const handleAddField = useCallback(
+    (placement?: { x: number; y: number; pageNumber: number }) => {
+      if (!templateModal) return;
+      recordTemplateUndoSnapshot();
+      const referenceFields = templateModal.template.fields.filter(
+        (field) => field.fieldType !== "checkbox" && field.height > 0
+      );
+      const heightSamples = (referenceFields.length > 0 ? referenceFields : templateModal.template.fields)
+        .map((field) => Math.round(field.height))
+        .filter((height) => height > 0)
+        .sort((left, right) => left - right);
+      const inferredHeight =
+        heightSamples.length > 0
+          ? heightSamples[Math.floor(heightSamples.length / 2)]
+          : 22;
+      const width = 150;
+      const height = inferredHeight;
+      // v0.6.21 — center the new field on `placement` (the visible
+      // viewport center from the modal). Clamp to non-negative
+      // coords so a partially-scrolled-off viewport still places
+      // the bbox on-page. Fall back to (100, 100) when the modal
+      // couldn't compute a placement (e.g. canvas not yet rendered).
+      const cx = placement?.x ?? 100 + width / 2;
+      const cy = placement?.y ?? 100 + height / 2;
+      const x = Math.max(0, cx - width / 2);
+      const y = Math.max(0, cy - height / 2);
+      const newField: TemplateField = {
+        id: `new-${Date.now()}`,
+        label: "New field",
+        mappedProjectKey: "",
+        pageNumber: placement?.pageNumber ?? 1,
+        x,
+        y,
+        width,
+        height,
+        confidence: 0.5,
+        fieldType: "text",
+        fieldKind: "text",
+        detectionSource: "manual",
+      };
+      const next = {
+        ...templateModal.template,
+        fields: [...templateModal.template.fields, newField],
+      };
+      setTemplateModal({ template: next });
+      setDraftTemplate((prev) =>
+        prev ? { ...prev, fields: [...prev.fields, newField] } : null
+      );
+    },
+    [recordTemplateUndoSnapshot, templateModal]
+  );
 
-  const handleAddCheckbox = useCallback(() => {
-    if (!templateModal) return;
-    recordTemplateUndoSnapshot();
-    const checkboxSamples = templateModal.template.fields
-      .filter((field) => field.fieldType === "checkbox")
-      .flatMap((field) => [Math.round(field.width), Math.round(field.height)])
-      .filter((size) => size > 0)
-      .sort((left, right) => left - right);
-    const inferredCheckboxSize =
-      checkboxSamples.length > 0
-        ? checkboxSamples[Math.floor(checkboxSamples.length / 2)]
-        : 16;
+  const handleAddCheckbox = useCallback(
+    (placement?: { x: number; y: number; pageNumber: number }) => {
+      if (!templateModal) return;
+      recordTemplateUndoSnapshot();
+      const checkboxSamples = templateModal.template.fields
+        .filter((field) => field.fieldType === "checkbox")
+        .flatMap((field) => [Math.round(field.width), Math.round(field.height)])
+        .filter((size) => size > 0)
+        .sort((left, right) => left - right);
+      const inferredCheckboxSize =
+        checkboxSamples.length > 0
+          ? checkboxSamples[Math.floor(checkboxSamples.length / 2)]
+          : 16;
 
-    const newField: TemplateField = {
-      id: `checkbox-${Date.now()}`,
-      label: "New checkbox",
-      mappedProjectKey: "",
-      pageNumber: 1,
-      x: 100,
-      y: 100,
-      width: inferredCheckboxSize,
-      height: inferredCheckboxSize,
-      confidence: 0.5,
-      fieldType: "checkbox",
-      fieldKind: "boolean-checkbox",
-      detectionSource: "manual",
-      checkboxValue: "yes",
-    };
-    const next = {
-      ...templateModal.template,
-      fields: [...templateModal.template.fields, newField],
-    };
-    setTemplateModal({ template: next });
-    setDraftTemplate((prev) =>
-      prev ? { ...prev, fields: [...prev.fields, newField] } : null
-    );
-  }, [recordTemplateUndoSnapshot, templateModal]);
+      // v0.6.21 — center on viewport (same logic as handleAddField).
+      const cx = placement?.x ?? 100 + inferredCheckboxSize / 2;
+      const cy = placement?.y ?? 100 + inferredCheckboxSize / 2;
+      const x = Math.max(0, cx - inferredCheckboxSize / 2);
+      const y = Math.max(0, cy - inferredCheckboxSize / 2);
+      const newField: TemplateField = {
+        id: `checkbox-${Date.now()}`,
+        label: "New checkbox",
+        mappedProjectKey: "",
+        pageNumber: placement?.pageNumber ?? 1,
+        x,
+        y,
+        width: inferredCheckboxSize,
+        height: inferredCheckboxSize,
+        confidence: 0.5,
+        fieldType: "checkbox",
+        fieldKind: "boolean-checkbox",
+        detectionSource: "manual",
+        checkboxValue: "yes",
+      };
+      const next = {
+        ...templateModal.template,
+        fields: [...templateModal.template.fields, newField],
+      };
+      setTemplateModal({ template: next });
+      setDraftTemplate((prev) =>
+        prev ? { ...prev, fields: [...prev.fields, newField] } : null
+      );
+    },
+    [recordTemplateUndoSnapshot, templateModal]
+  );
 
   /**
    * Save a template locally and, if the public registry is configured,
@@ -1291,14 +1313,25 @@ function MainApp() {
           );
         }
       } catch (err) {
-        // Local save already succeeded; treat the registry failure as
-        // additive. We deliberately keep the toast at "info" rather
-        // than "error" so the user understands their work is safe.
-        console.warn("[Typeset] Registry publish failed:", err);
-        showToast(
-          "Saved locally. Couldn't reach the community registry — try again later.",
-          "info"
+        // v0.6.23 — local save already succeeded and the registry
+        // publish is a background, additive nice-to-have. The old
+        // toast ("Couldn't reach the community registry — try again
+        // later.") was misleading because the user can't actually
+        // do anything about it.
+        //
+        // v0.6.25 — bump the diagnostic from `console.warn` to
+        // `console.error` and stringify the underlying cause so it
+        // surfaces clearly in devtools. This lets us actually
+        // figure out *why* the publish keeps failing (RLS policy,
+        // schema drift, network, auth state) when a user reports
+        // "still only saving locally".
+        const errMessage = err instanceof Error ? err.message : String(err);
+        console.error(
+          `[Typeset] Registry publish failed — local save succeeded; ` +
+            `community sync rejected with: ${errMessage}`,
+          err
         );
+        showToast("Saved template locally.", "success");
       }
     },
     [activeDocumentId, selectedProjectId, showToast, updateDocumentInProject]
