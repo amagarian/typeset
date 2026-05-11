@@ -2824,6 +2824,46 @@ function dedupeFields(fields: TemplateField[]): TemplateField[] {
       ) {
         return true;
       }
+
+      // v0.6.16 — same-canonical proximity dedup. Catches the case
+      // where Gemini emits two detections that resolve to the SAME
+      // canonical id (e.g. two `billingAddress` fields on the Keslow
+      // grid — one on the real Billing Address row, one stray
+      // ~30pt off the row's centre) and whose bboxes don't overlap
+      // enough to trip the IoU/containment/nuclear rules above.
+      // Two same-canonical detections on the same page whose
+      // vertical centres are within max(2 × min(height), 40pt) are
+      // collapsed. Larger-area survivor wins.
+      //
+      // Why the floor at 40pt: single-line text bboxes are often
+      // ~12-20pt tall; 2× that is a tight ~24-40pt threshold which
+      // misses a stray bbox that landed half a row off. The 40pt
+      // floor catches those without conflating two legitimate
+      // signatures that sit at opposite ends of the page (the
+      // Keslow top + bottom signatures are ~200pt apart, well
+      // beyond this window).
+      if (
+        existing.canonicalFieldId &&
+        existing.canonicalFieldId === field.canonicalFieldId &&
+        existing.pageNumber === field.pageNumber
+      ) {
+        const existingCy = existing.y + existing.height / 2;
+        const fieldCy = field.y + field.height / 2;
+        const verticalGap = Math.abs(existingCy - fieldCy);
+        const proximityThreshold = Math.max(
+          Math.min(existing.height, field.height) * 2,
+          40
+        );
+        if (verticalGap < proximityThreshold) {
+          console.warn(
+            `[Typeset detector] Same-canonical proximity dedup: collapsing ` +
+              `${existing.canonicalFieldId} pair @y=${existing.y.toFixed(1)},${field.y.toFixed(1)} ` +
+              `(gap=${verticalGap.toFixed(1)}pt, threshold=${proximityThreshold.toFixed(1)}pt)`
+          );
+          return true;
+        }
+      }
+
       return (
         sameType &&
         Math.abs(existing.x - field.x) < 12 &&
