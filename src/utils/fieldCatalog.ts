@@ -195,6 +195,12 @@ export const CANONICAL_FIELD_DEFINITIONS: CanonicalFieldDefinition[] = [
       "company name",
       "production co",
       "prod co",
+      // v0.6.17 — bare "Company:" cell label (e.g. the Keslow CC Auth
+      // header grid's row 2 left cell). Without this alias, Gemini
+      // either resolved the cell to no canonical OR (worse) labelled
+      // it with the neighbor cell's printed text ("Invoice #") and
+      // we had no way to recover the mapping.
+      "company",
     ],
     sectionHints: ["billing", "contact", "header"],
   },
