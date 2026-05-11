@@ -2456,11 +2456,46 @@ function inferCanonicalId(
     return undefined;
   }
 
-  const haystack = `${ctx} ${aft}`.trim();
-  if (!haystack) return undefined;
+  // v0.6.30 — alias scan with "next-field label" filter.
+  //
+  // Previous behaviour (≤ v0.6.29): joined `ctx + " " + aft` into a
+  // single haystack and substring-matched aliases. This created the
+  // following Milk CC Auth bug:
+  //
+  //   "I authorize Milk Studios … for all costs related to:"
+  //   "Reference: __________"            ← THIS field
+  //   "Company Name: __________"
+  //
+  // For the Reference blank, `context_after` was the literal string
+  // "Company Name: __________" — the NEXT field's label. The alias
+  // "company name" is registered to `productionCompany`, so the
+  // Reference blank got force-fitted to `productionCompany` —
+  // duplicating the Company Name field's canonical and triggering
+  // the proximity-dedup warning to no avail (both still rendered
+  // because they were separate logical detections at the time the
+  // canonical was assigned).
+  //
+  // Rule: when an alias appears in `context_after`, it's a valid
+  // contextual hit ONLY when it's NOT immediately followed by a
+  // colon. A colon-suffixed alias in context_after is the next
+  // field's label — skip it. `context_before` is unaffected (a
+  // colon-suffixed alias there IS this field's own caption).
+  if (!ctx && !aft) return undefined;
   for (const { alias, id } of ALIAS_INDEX) {
     if (alias.length < 3) continue;
-    if (haystack.includes(alias)) return id;
+    if (ctx && ctx.includes(alias)) return id;
+    if (!aft) continue;
+    let searchFrom = 0;
+    while (searchFrom <= aft.length) {
+      const pos = aft.indexOf(alias, searchFrom);
+      if (pos === -1) break;
+      const tail = aft.slice(pos + alias.length, pos + alias.length + 5);
+      if (!/^\s*[:：]/.test(tail)) return id;
+      // Alias is a next-field label — keep scanning past this hit
+      // in case the same alias also appears as contextual text
+      // later in the after-string.
+      searchFrom = pos + alias.length;
+    }
   }
   return undefined;
 }
