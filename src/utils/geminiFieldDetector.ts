@@ -1059,6 +1059,18 @@ function correctFieldLabelsFromPrintedText(
       // Gemini had it right; printed prefix would only confuse us.
       return field;
     }
+    if (
+      (field.canonicalFieldId === "ccv" || oldCanonicalId === "ccv") &&
+      newCanonicalId &&
+      /^creditCardType/.test(newCanonicalId)
+    ) {
+      // CVV rows commonly include instructional text like
+      // "3 digit number on back of Visa/MC, 4 digits on front of AMEX".
+      // The label-correction pass can see those card-brand tokens near the
+      // writable blank, but they are not the field label. Keep the original
+      // CVV mapping so the writer uses the security-code value, not card type.
+      return field;
+    }
     if (oldCanonicalId && newCanonicalId && oldCanonicalId === newCanonicalId) {
       return field;
     }
