@@ -981,9 +981,38 @@ export async function writeFilledPdfBytes(
         baseFontSize
       );
 
+      // v0.6.37 — baseline anchor on the bbox BOTTOM (= stroke),
+      // not vertically centered. The detection pipeline places
+      // every text-field bbox with `bbox_bottom == stroke_y`
+      // (text-baseline geometry; see the v0.5.18 comment block in
+      // `geminiFieldDetector.ts`). The correct visual placement is
+      // therefore "baseline a few pt above the bottom edge so the
+      // typed text sits ON the underline, the way printed labels
+      // do". Earlier versions (pre-v0.6.37) used a centered-in-bbox
+      // formula `(field.height - fontSize) / 2 + 2`, which works
+      // OK for underline-style forms whose bbox height is close to
+      // line-height, but breaks on TABLE/GRID forms where the bbox
+      // spans a full row cell and is much taller than the font.
+      //
+      // Real evidence (v0.6.36 CC Auth Form USD): Cardholder
+      // (h=24.55, fs=11) → 8.78pt above bottom; Billing Address
+      // shrunk to ~7pt to fit a long string (h=26.93, fs=7) →
+      // 11.97pt above bottom — text floated near the TOP of the
+      // 27pt cell while the printed "Billing Address:" label sat
+      // at the cell's BOTTOM border. The shorter the font (after
+      // shrink-to-fit), the higher the centered text drifted.
+      //
+      // Fix: a constant 3pt baseline padding. Text descenders sit
+      // safely above the stroke, text caps extend up by the
+      // font's cap height (~7pt for 10pt body text), and the
+      // visual position is invariant across font sizes — so a
+      // shrunken billing address renders flush with the printed
+      // label, exactly like an unshrunken cardholder name.
+      const baselineAboveBottom = 3;
+
       page.drawText(value, {
         x: x + insetX,
-        y: yPdfBottom + Math.max(4, (field.height - actualFontSize) / 2) + 2,
+        y: yPdfBottom + baselineAboveBottom,
         size: actualFontSize,
         font,
         color: rgb(0.1, 0.1, 0.1),
