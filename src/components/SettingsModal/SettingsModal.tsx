@@ -9,7 +9,13 @@ import {
   testGeminiConnection,
   getGeminiKeyStatus,
 } from "@/services/geminiClient";
-import { LOCKED_MODEL } from "@/services/geminiSettings";
+import {
+  GEMINI_THINKING_OPTIONS,
+  LOCKED_MODEL,
+  getGeminiThinkingMode,
+  setGeminiThinkingMode,
+  type GeminiThinkingMode,
+} from "@/services/geminiSettings";
 import packageJson from "../../../package.json";
 import styles from "./SettingsModal.module.css";
 
@@ -85,6 +91,8 @@ export function SettingsModal({
   const [geminiBusy, setGeminiBusy] = useState(false);
   const [geminiError, setGeminiError] = useState<string | null>(null);
   const [geminiOk, setGeminiOk] = useState<string | null>(null);
+  const [geminiThinkingMode, setGeminiThinkingModeState] =
+    useState<GeminiThinkingMode>(() => getGeminiThinkingMode());
 
   // Bubble verifyOtp / token-rejected errors into the modal as toast-
   // style copy. Local state (not the global Toast) because the modal
@@ -114,6 +122,7 @@ export function SettingsModal({
     setGeminiKeyInput("");
     setGeminiError(null);
     setGeminiOk(null);
+    setGeminiThinkingModeState(getGeminiThinkingMode());
     void (async () => {
       const status = await getGeminiKeyStatus();
       if (status) {
@@ -285,6 +294,19 @@ export function SettingsModal({
     }
   }, []);
 
+  const handleGeminiThinkingChange = useCallback((mode: GeminiThinkingMode) => {
+    setGeminiThinkingModeState(mode);
+    setGeminiThinkingMode(mode);
+    setGeminiOk(
+      mode === "fast"
+        ? "Gemini thinking set to Fast."
+        : mode === "balanced"
+          ? "Gemini thinking set to Balanced."
+          : "Gemini thinking set to Deep."
+    );
+    window.setTimeout(() => setGeminiOk(null), 2500);
+  }, []);
+
   const handleResetLocalTemplates = useCallback(() => {
     writeLocalTemplates([]);
     setResetConfirming(false);
@@ -357,6 +379,29 @@ export function SettingsModal({
             {geminiKeychainPresent && (
               <p className={styles.helpText}>A keychain key is on file. Paste below to replace it.</p>
             )}
+            <div className={styles.subsection}>
+              <span className={styles.subLabel}>Thinking strength</span>
+              <p className={styles.helpText}>
+                Higher thinking can improve tricky table/label reasoning, but it will take longer.
+              </p>
+              <div className={styles.radioGroup}>
+                {GEMINI_THINKING_OPTIONS.map((option) => (
+                  <button
+                    key={option.id}
+                    type="button"
+                    className={`${styles.radioOption} ${
+                      geminiThinkingMode === option.id ? styles.radioOptionActive : ""
+                    }`}
+                    onClick={() => handleGeminiThinkingChange(option.id)}
+                  >
+                    <span className={styles.radioOptionLabel}>{option.label}</span>
+                    <span className={styles.radioOptionDescription}>
+                      {option.description}
+                    </span>
+                  </button>
+                ))}
+              </div>
+            </div>
             <input
               type="password"
               className={styles.input}

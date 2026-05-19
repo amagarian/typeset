@@ -118,6 +118,7 @@ export interface DetectFieldsOptions {
   responseSchema: Record<string, unknown> | null;
   maxOutputTokens?: number;
   temperature?: number;
+  thinkingMode?: "fast" | "balanced" | "deep";
 }
 
 function isTauriAvailable(): boolean {
@@ -181,6 +182,7 @@ export async function detectFieldsWithGemini(
           response_schema: opts.responseSchema,
           max_output_tokens: opts.maxOutputTokens,
           temperature: opts.temperature,
+          thinking_mode: opts.thinkingMode,
         },
       }
     );
@@ -238,6 +240,7 @@ export async function detectFieldsWithGeminiImages(
           response_schema: opts.responseSchema,
           max_output_tokens: opts.maxOutputTokens,
           temperature: opts.temperature,
+          thinking_mode: opts.thinkingMode,
         },
       }
     );

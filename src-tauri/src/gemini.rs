@@ -83,6 +83,11 @@ pub struct DetectFieldsRequest {
     /// Sampling temperature, 0.0 - 2.0. Lower = more deterministic.
     /// Defaults to 0.0 server-side when omitted.
     pub temperature: Option<f32>,
+    /// Gemini 3.5 Flash hidden-thinking mode:
+    /// - fast: thinking disabled
+    /// - balanced: low thinking
+    /// - deep: medium thinking
+    pub thinking_mode: Option<String>,
 }
 
 /// One rendered page, ready to inline as `inlineData` in the request
@@ -110,6 +115,7 @@ pub struct DetectFieldsImagesRequest {
     pub response_schema: Value,
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f32>,
+    pub thinking_mode: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -182,6 +188,7 @@ struct StreamArgs {
     response_schema: Value,
     max_output_tokens: Option<u32>,
     temperature: Option<f32>,
+    thinking_mode: Option<String>,
     /// Detail string for the initial `uploading_file` progress event.
     upload_detail: String,
 }
@@ -229,6 +236,16 @@ async fn run_gemini_stream(
     }
     if let Some(m) = args.max_output_tokens {
         generation_config["maxOutputTokens"] = json!(m);
+    }
+    // Gemini 3.5 Flash defaults to medium hidden thinking effort, which
+    // improves hard layout reasoning but explains the latency jump vs.
+    // Flash-Lite. Let the renderer pick the trade-off per user setting:
+    // Fast disables thinking, Balanced uses low thinking, Deep uses the
+    // model's medium thinking tier.
+    match args.thinking_mode.as_deref().unwrap_or("fast") {
+        "balanced" => generation_config["thinkingConfig"] = json!({ "thinkingLevel": "low" }),
+        "deep" => generation_config["thinkingConfig"] = json!({ "thinkingLevel": "medium" }),
+        _ => generation_config["thinkingConfig"] = json!({ "thinkingBudget": 0 }),
     }
 
     // Append the user prompt text part to whatever inlineData parts
@@ -422,6 +439,7 @@ pub async fn gemini_detect_fields(
             response_schema: request.response_schema,
             max_output_tokens: request.max_output_tokens,
             temperature: request.temperature,
+            thinking_mode: request.thinking_mode,
             upload_detail,
         },
     )
@@ -483,6 +501,7 @@ pub async fn gemini_detect_fields_images(
             response_schema: request.response_schema,
             max_output_tokens: request.max_output_tokens,
             temperature: request.temperature,
+            thinking_mode: request.thinking_mode,
             upload_detail,
         },
     )

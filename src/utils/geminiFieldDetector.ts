@@ -80,7 +80,12 @@ import {
 if (!pdfjsLib.GlobalWorkerOptions.workerSrc) {
   pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 }
-import { getAccuracyMode, getModelPreference } from "@/services/geminiSettings";
+import {
+  getAccuracyMode,
+  getGeminiThinkingMode,
+  getModelPreference,
+  type GeminiThinkingMode,
+} from "@/services/geminiSettings";
 import {
   type CanonicalFieldId,
   type FieldOption,
@@ -1550,7 +1555,7 @@ const VENDOR_KEYWORDS =
 const SIGNER_KEYWORDS =
   /\b(lessee|customer|buyer|renter|client|tenant|cardholder|card\s*holder|production\s+company|production|signer|sublessee|authorized\s+(?:agent|signer))\b/i;
 const VENDOR_NAME_PATTERNS =
-  /\b(j\.?e\.?m\.?\s*f\/?x|jem\s+f\s*\/\s*x|coffey\s+sound|keslow\s+camera|panavision|otto\s+nemenz|sgps|showrig|arrow)\b/i;
+  /\b(j\.?e\.?m\.?\s*f\/?x|jem\s+f\s*\/\s*x|coffey\s+sound|keslow\s+camera|panavision|otto\s+nemenz|sgps|showrig)\b/i;
 const SIGNER_LABEL_PATTERNS =
   /\b(cardholder|card\s*holder|customer|buyer|lessee|client|tenant|production\s+company|signer|print\s+name|its)\b/i;
 const VENDOR_LABEL_PATTERNS =
@@ -1566,6 +1571,16 @@ export function annotateFieldsWithParty(
     if (field.party === "signer" || field.party === "vendor") return field;
     const items = itemsByPage[field.pageNumber] ?? [];
     const fCenterY = field.y + field.height / 2;
+    let party: "signer" | "vendor" | undefined;
+
+    // (0) Field label / printed label. This intentionally runs before
+    // row-level vendor-name matching: forms often include the vendor's
+    // name in the header/nearby row (e.g. "ARROW"), but labels like
+    // "Production Company", "Cardholder", and "Customer" are always
+    // signer-side fields unless the label itself says lessor/vendor.
+    const labelText = `${field.label ?? ""} ${field.printedLabel ?? ""}`;
+    if (VENDOR_LABEL_PATTERNS.test(labelText)) party = "vendor";
+    else if (SIGNER_LABEL_PATTERNS.test(labelText)) party = "signer";
 
     // (1) Same-row keywords. pdf.js item y is top-of-glyph; treat
     // anything whose vertical centre is within ~6pt as same-row.
@@ -1574,10 +1589,11 @@ export function annotateFieldsWithParty(
       return Math.abs(itC - fCenterY) <= 6;
     });
     const sameRowText = sameRow.map((it) => it.str).join(" ");
-    let party: "signer" | "vendor" | undefined;
-    if (VENDOR_NAME_PATTERNS.test(sameRowText)) party = "vendor";
-    else if (VENDOR_KEYWORDS.test(sameRowText)) party = "vendor";
-    else if (SIGNER_KEYWORDS.test(sameRowText)) party = "signer";
+    if (!party) {
+      if (VENDOR_NAME_PATTERNS.test(sameRowText)) party = "vendor";
+      else if (VENDOR_KEYWORDS.test(sameRowText)) party = "vendor";
+      else if (SIGNER_KEYWORDS.test(sameRowText)) party = "signer";
+    }
 
     // (2) Nearest preceding row's keywords within ~40pt above the
     // field. Use the row that's closest (smallest y delta where the
@@ -1620,13 +1636,6 @@ export function annotateFieldsWithParty(
     if (!party && field.section) {
       if (VENDOR_KEYWORDS.test(field.section)) party = "vendor";
       else if (SIGNER_KEYWORDS.test(field.section)) party = "signer";
-    }
-
-    // (4) Field label / printed label.
-    if (!party) {
-      const labelText = `${field.label ?? ""} ${field.printedLabel ?? ""}`;
-      if (VENDOR_LABEL_PATTERNS.test(labelText)) party = "vendor";
-      else if (SIGNER_LABEL_PATTERNS.test(labelText)) party = "signer";
     }
 
     if (!party) return field;
@@ -4172,6 +4181,7 @@ async function runGeminiRoundTrip(args: {
   responseSchema: Record<string, unknown> | null;
   maxOutputTokens: number;
   temperature: number;
+  thinkingMode: GeminiThinkingMode;
   onStatus?: (status: string, progress?: number) => void;
   phase: DetectionPhase;
   /** Inclusive lower fraction of the progress-bar band for this phase. */
@@ -4217,6 +4227,7 @@ async function runGeminiRoundTrip(args: {
       responseSchema: args.responseSchema,
       maxOutputTokens: args.maxOutputTokens,
       temperature: args.temperature,
+      thinkingMode: args.thinkingMode,
     });
     return {
       text: result.text,
@@ -4431,6 +4442,7 @@ async function runPass1Single(
     // well within the 65k output budget on Gemini 2.5/3.x Pro.
     maxOutputTokens: 32768,
     temperature: 0.0,
+    thinkingMode: getGeminiThinkingMode(),
     onStatus,
     phase: "pass1",
     bandStart: 0,
@@ -4481,6 +4493,7 @@ async function runStage1a(
     // Gemini 3.x Pro's output budget.
     maxOutputTokens: 16384,
     temperature: 0.0,
+    thinkingMode: getGeminiThinkingMode(),
     onStatus,
     phase: "stage1a",
     bandStart: 0.05,
@@ -4532,6 +4545,7 @@ async function runStage1b(
     // shape and dimensionality of output.
     maxOutputTokens: 32768,
     temperature: 0.0,
+    thinkingMode: getGeminiThinkingMode(),
     onStatus,
     phase: "stage1b",
     bandStart: 0.30,
@@ -5151,6 +5165,7 @@ async function runQualityControlPass(args: QcArgs): Promise<TemplateField[]> {
     // ~150 fields and keeps us well below the model's 65k output cap.
     maxOutputTokens: 16384,
     temperature: 0.0,
+    thinkingMode: getGeminiThinkingMode(),
     onStatus: args.onStatus,
     phase: "qc",
     // Pass 2 occupies [0.55, 0.95] in Maximum mode; the final 0.05 is
@@ -5345,6 +5360,7 @@ export async function extractProjectFromPdfWithClaude(
     responseSchema: projectSchema,
     maxOutputTokens: 2048,
     temperature: 0.0,
+    thinkingMode: getGeminiThinkingMode(),
   });
 
   let parsed: Record<string, unknown> = {};

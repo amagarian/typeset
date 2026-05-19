@@ -36,6 +36,45 @@ export type AccuracyMode = "maximum" | "fast";
 export const LOCKED_ACCURACY_MODE: AccuracyMode = "fast";
 
 /**
+ * Gemini 3.5 Flash exposes a hidden-thinking budget. Native Gemini likely
+ * benefits from this on hard layout reasoning, but it also explains the
+ * latency jump from ~6s on Flash-Lite to 20s+ on 3.5 Flash. Keep it user
+ * selectable so normal forms stay quick and difficult forms can opt into
+ * more reasoning.
+ */
+export type GeminiThinkingMode = "fast" | "balanced" | "deep";
+
+export interface GeminiThinkingOption {
+  id: GeminiThinkingMode;
+  label: string;
+  description: string;
+}
+
+export const GEMINI_THINKING_OPTIONS: GeminiThinkingOption[] = [
+  {
+    id: "fast",
+    label: "Fast",
+    description: "Thinking off. Best latency for normal credit-card forms.",
+  },
+  {
+    id: "balanced",
+    label: "Balanced",
+    description: "Low thinking. Slower, but better for tricky labels and tables.",
+  },
+  {
+    id: "deep",
+    label: "Deep",
+    description: "Medium thinking. Slowest; use for difficult or messy forms.",
+  },
+];
+
+const THINKING_MODE_STORAGE_KEY = "typeset.gemini-thinking-mode.v1";
+
+function isGeminiThinkingMode(value: unknown): value is GeminiThinkingMode {
+  return value === "fast" || value === "balanced" || value === "deep";
+}
+
+/**
  * Back-compat shim. Detector + project-import call this to discover
  * the model id; it now always returns the locked id.
  */
@@ -49,4 +88,23 @@ export function getModelPreference(): string {
  */
 export function getAccuracyMode(): AccuracyMode {
   return LOCKED_ACCURACY_MODE;
+}
+
+export function getGeminiThinkingMode(): GeminiThinkingMode {
+  if (typeof window === "undefined") return "fast";
+  try {
+    const stored = window.localStorage.getItem(THINKING_MODE_STORAGE_KEY);
+    return isGeminiThinkingMode(stored) ? stored : "fast";
+  } catch {
+    return "fast";
+  }
+}
+
+export function setGeminiThinkingMode(mode: GeminiThinkingMode): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(THINKING_MODE_STORAGE_KEY, mode);
+  } catch {
+    // Non-fatal: the current session still receives the in-memory state.
+  }
 }
