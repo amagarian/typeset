@@ -4,6 +4,7 @@ node_modules/
 # Build output
 dist/
 target/
+tmp/
 *.tsbuildinfo
 vite.config.js
 vite.config.d.ts

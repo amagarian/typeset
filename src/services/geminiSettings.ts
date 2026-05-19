@@ -8,9 +8,19 @@
 /**
  * Locked Gemini model id.
  *
- * Flash-Lite tier for cost/latency; spatial calibration targets production paperwork.
+ * v0.6.32 — upgraded from `gemini-3.1-flash-lite` to `gemini-3.5-flash`
+ * after the I/O 2026 launch. Trades roughly 2x per-token cost (Flash-Lite
+ * was $0.25/$1.50 per 1M; 3.5 Flash is $0.50/$3) for materially better
+ * reasoning at Flash latency. Worth it for field detection: Layout A vs.
+ * Layout B disambiguation, party (signer/vendor) inference, and
+ * canonical-id resolution all benefit from the stronger reasoning.
+ *
+ * If Google has not yet promoted this to a stable id (only `-preview`
+ * is live), the detector will surface the upstream 404 verbatim via
+ * the existing error path in `gemini.rs`; swap to `gemini-3.5-flash-preview`
+ * if that happens.
  */
-export const LOCKED_MODEL = "gemini-3.1-flash-lite";
+export const LOCKED_MODEL = "gemini-3.5-flash";
 
 /**
  * Locked accuracy mode. v0.5.36 supported `"maximum"` (three-pass —

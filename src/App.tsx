@@ -45,6 +45,13 @@ import {
   upsertLocalTemplate,
 } from "@/services/templateCache";
 import {
+  loadDocuments,
+  loadDocumentPdf,
+  saveDocuments,
+  saveDocumentPdf,
+  deleteDocumentPdf,
+} from "@/services/documentStore";
+import {
   initRegistry,
   findRegistryMatches,
   publishTemplateAuto,
@@ -309,6 +316,22 @@ function MainApp() {
     Record<string, PromptFieldValues>
   >({});
   const [projectDocuments, setProjectDocuments] = useState<Record<string, ProjectDocument[]>>({});
+  // v0.6.32 — always-current view of the in-memory map for callbacks
+  // that read at fire time (lazy-load, persistence flush). Without
+  // this, the debounce closures would race with the latest state.
+  const projectDocumentsRef = useRef<Record<string, ProjectDocument[]>>(projectDocuments);
+  projectDocumentsRef.current = projectDocuments;
+  // v0.6.32 — gates the autosave effect off until the initial load
+  // finishes. Without this, an in-progress `loadDocuments()` call
+  // would race against the first render's `useEffect` and overwrite
+  // the on-disk metadata with the empty initial state.
+  const [documentsHydrated, setDocumentsHydrated] = useState(false);
+  // v0.6.32 — the autosave debounce timer for `documents.enc`.
+  // Mirrors `useProjects`'s 500ms cadence so the user experiences
+  // the same "edits feel instant, save is silent" rhythm. We do not
+  // expose a save indicator for documents (no UI surface for it
+  // yet), so the timer just fires-and-forgets.
+  const documentsSaveTimerRef = useRef<number | null>(null);
   const [activeDocumentId, setActiveDocumentId] = useState<string | null>(null);
   const [matchModal, setMatchModal] = useState<PdfMatchResult | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -415,6 +438,74 @@ function MainApp() {
     }
   }, []);
 
+  // v0.6.32 — hydrate per-project documents from the encrypted
+  // metadata blob on mount. Bytes (`pdfBytes`) are NOT loaded here
+  // — they're fetched lazily when a doc is opened/previewed/filled
+  // (see `ensureDocumentBytes` below). This keeps cold-start fast
+  // and memory bounded for users with many large PDFs in history.
+  //
+  // The autosave effect is gated on `documentsHydrated` to prevent
+  // the first render's empty `projectDocuments` from racing the
+  // load and overwriting on-disk metadata.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const stored = await loadDocuments();
+        if (cancelled) return;
+        const grouped: Record<string, ProjectDocument[]> = {};
+        for (const meta of stored) {
+          if (!grouped[meta.projectId]) grouped[meta.projectId] = [];
+          // `pdfBytes` deliberately omitted; populated on-demand.
+          grouped[meta.projectId].push(meta as ProjectDocument);
+        }
+        setProjectDocuments(grouped);
+      } catch (err) {
+        // Keychain denied or other hard error: keep the in-memory
+        // map empty so the app stays usable. The user-facing toast
+        // is already wired through `projectsError`; we don't double-
+        // toast here.
+        console.warn("[Typeset] loadDocuments failed:", err);
+      } finally {
+        if (!cancelled) setDocumentsHydrated(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // v0.6.32 — debounced autosave of the document metadata blob.
+  // Every change to `projectDocuments` resets a 500ms timer; the
+  // trailing-edge fire flattens the map back to a list and writes
+  // through `saveDocuments`. We skip until hydration completes (see
+  // above) and never block the UI on the write — failures are
+  // logged but not surfaced (the user will just see their docs
+  // again on next launch; they only "lose" the very last edit if
+  // the keychain is permanently denied).
+  useEffect(() => {
+    if (!documentsHydrated) return;
+    if (documentsSaveTimerRef.current !== null) {
+      window.clearTimeout(documentsSaveTimerRef.current);
+    }
+    documentsSaveTimerRef.current = window.setTimeout(() => {
+      documentsSaveTimerRef.current = null;
+      const flat: ProjectDocument[] = [];
+      for (const docs of Object.values(projectDocumentsRef.current)) {
+        for (const doc of docs) flat.push(doc);
+      }
+      void saveDocuments(flat).catch((err) => {
+        console.warn("[Typeset] saveDocuments failed:", err);
+      });
+    }, 500);
+    return () => {
+      if (documentsSaveTimerRef.current !== null) {
+        window.clearTimeout(documentsSaveTimerRef.current);
+        documentsSaveTimerRef.current = null;
+      }
+    };
+  }, [projectDocuments, documentsHydrated]);
+
   // Boot the public template registry. Since v0.5.8 credentials are
   // baked in, so this is unconditional and synchronous — no
   // keychain round-trip, no "is configured?" gate. Subsequent calls
@@ -459,6 +550,18 @@ function MainApp() {
   const deleteProject = useCallback(
     (id: string) => {
       deleteProjectInStore(id);
+      // v0.6.32 — fan out PDF file deletes for every doc that
+      // belonged to this project. Best-effort: missing files are
+      // a no-op (see `delete_document_pdf` in Rust). Doing this
+      // before the state clear means we still have access to the
+      // doc ids; after the metadata autosave fires the on-disk
+      // metadata is also flushed.
+      const docs = projectDocumentsRef.current[id] ?? [];
+      for (const doc of docs) {
+        void deleteDocumentPdf(doc.id).catch((err) => {
+          console.warn("[Typeset] deleteDocumentPdf failed:", err);
+        });
+      }
       setProjectDocuments((prev) => {
         const next = { ...prev };
         delete next[id];
@@ -477,10 +580,35 @@ function MainApp() {
       ...prev,
       [projectId]: [...(prev[projectId] ?? []), doc],
     }));
+    // v0.6.32 — if the freshly-created doc already has bytes
+    // attached (the "ingest with bytes" path), persist them right
+    // now. Bytes write through the per-doc file pair, not the
+    // metadata blob — see `documentStore.ts` for the split.
+    if (doc.pdfBytes) {
+      void saveDocumentPdf(doc.id, doc.pdfBytes).catch((err) => {
+        console.warn("[Typeset] saveDocumentPdf failed:", err);
+      });
+    }
   }, []);
 
   const updateDocumentInProject = useCallback(
     (projectId: string, docId: string, updates: Partial<ProjectDocument>) => {
+      // v0.6.32 — if this update is what introduces PDF bytes for
+      // the first time (the common pattern: create doc → async
+      // load file → update with bytes), persist them. We compare
+      // identity against the current ref so a re-set of the same
+      // Uint8Array (e.g. a lazy-load that has just hydrated state)
+      // doesn't rewrite the file.
+      if (updates.pdfBytes) {
+        const existing = (projectDocumentsRef.current[projectId] ?? []).find(
+          (d) => d.id === docId
+        );
+        if (!existing || existing.pdfBytes !== updates.pdfBytes) {
+          void saveDocumentPdf(docId, updates.pdfBytes).catch((err) => {
+            console.warn("[Typeset] saveDocumentPdf (update) failed:", err);
+          });
+        }
+      }
       setProjectDocuments((prev) => ({
         ...prev,
         [projectId]: (prev[projectId] ?? []).map((d) =>
@@ -495,10 +623,52 @@ function MainApp() {
 
   const removeDocumentFromProject = useCallback(
     (projectId: string, docId: string) => {
+      // v0.6.32 — drop both the metadata entry and the on-disk
+      // PDF file. The metadata autosave picks up the state change
+      // through its debounce; the byte file is removed eagerly.
+      void deleteDocumentPdf(docId).catch((err) => {
+        console.warn("[Typeset] deleteDocumentPdf failed:", err);
+      });
       setProjectDocuments((prev) => ({
         ...prev,
         [projectId]: (prev[projectId] ?? []).filter((d) => d.id !== docId),
       }));
+    },
+    []
+  );
+
+  // v0.6.32 — lazy-load PDF bytes for a document. Returns the
+  // already-resident bytes when present; otherwise reads them from
+  // disk and patches them into state (so subsequent reads through
+  // the same `doc.pdfBytes` access path are instant). Returns
+  // `null` when the file is missing (e.g. older project whose
+  // bytes were never persisted), in which case the renderer falls
+  // back to the "ask user to re-upload" message.
+  const ensureDocumentBytes = useCallback(
+    async (projectId: string, docId: string): Promise<Uint8Array | null> => {
+      const docs = projectDocumentsRef.current[projectId] ?? [];
+      const doc = docs.find((d) => d.id === docId);
+      if (!doc) return null;
+      if (doc.pdfBytes && doc.pdfBytes.byteLength > 0) {
+        return doc.pdfBytes;
+      }
+      try {
+        const bytes = await loadDocumentPdf(docId);
+        if (!bytes) return null;
+        // Patch state without going through `updateDocumentInProject`
+        // (which would re-fire `saveDocumentPdf`). This is a load
+        // hydration, not a write.
+        setProjectDocuments((prev) => ({
+          ...prev,
+          [projectId]: (prev[projectId] ?? []).map((d) =>
+            d.id === docId ? { ...d, pdfBytes: bytes } : d
+          ),
+        }));
+        return bytes;
+      } catch (err) {
+        console.warn("[Typeset] loadDocumentPdf failed:", err);
+        return null;
+      }
     },
     []
   );
@@ -1658,10 +1828,15 @@ function MainApp() {
             onDeleteProject={() => {
               if (selectedProjectId) deleteProject(selectedProjectId);
             }}
-            onOpenDocument={(doc) => {
+            onOpenDocument={async (doc) => {
               setActiveDocumentId(doc.id);
-              if (doc.pdfBytes) {
-                setPdfSource({ fileName: doc.fileName, bytes: doc.pdfBytes });
+              // v0.6.32 — lazy-hydrate bytes from disk on first
+              // open after a fresh launch; subsequent opens hit
+              // the in-memory copy.
+              const bytes =
+                doc.pdfBytes ?? (await ensureDocumentBytes(doc.projectId, doc.id));
+              if (bytes) {
+                setPdfSource({ fileName: doc.fileName, bytes });
               }
               if (doc.templateId) {
                 const tpl = getTemplateById(doc.templateId);
@@ -1671,14 +1846,20 @@ function MainApp() {
                 setMatchModal(doc.matchResult);
               }
             }}
-            onDownloadDocument={(doc) => {
+            onDownloadDocument={async (doc) => {
               if (!doc.templateId) {
                 showToast("No template assigned to this document.", "error");
                 return;
               }
-              const bytes = doc.pdfBytes ?? pdfSource?.bytes;
+              const bytes =
+                doc.pdfBytes ??
+                (await ensureDocumentBytes(doc.projectId, doc.id)) ??
+                pdfSource?.bytes;
               if (!bytes) {
-                showToast("PDF data not available. Try clicking the document name first.", "error");
+                showToast(
+                  "PDF data not available. The original file may need to be re-imported.",
+                  "error"
+                );
                 return;
               }
               setActiveDocumentId(doc.id);
@@ -1689,10 +1870,12 @@ function MainApp() {
                 targetDocumentId: doc.id,
               });
             }}
-            onEditTemplateDocument={(doc) => {
+            onEditTemplateDocument={async (doc) => {
               setActiveDocumentId(doc.id);
-              if (doc.pdfBytes) {
-                setPdfSource({ fileName: doc.fileName, bytes: doc.pdfBytes });
+              const bytes =
+                doc.pdfBytes ?? (await ensureDocumentBytes(doc.projectId, doc.id));
+              if (bytes) {
+                setPdfSource({ fileName: doc.fileName, bytes });
               }
               if (doc.templateId) {
                 handleOpenTemplateReview(doc.templateId);
@@ -1700,14 +1883,20 @@ function MainApp() {
                 showToast("No template assigned to this document.", "error");
               }
             }}
-            onPreviewDocument={(doc) => {
+            onPreviewDocument={async (doc) => {
               if (!doc.templateId) {
                 showToast("No template assigned to this document.", "error");
                 return;
               }
-              const bytes = doc.pdfBytes ?? pdfSource?.bytes;
+              const bytes =
+                doc.pdfBytes ??
+                (await ensureDocumentBytes(doc.projectId, doc.id)) ??
+                pdfSource?.bytes;
               if (!bytes) {
-                showToast("PDF data not available. Try clicking the document name first, then Preview.", "error");
+                showToast(
+                  "PDF data not available. The original file may need to be re-imported.",
+                  "error"
+                );
                 return;
               }
               setActiveDocumentId(doc.id);

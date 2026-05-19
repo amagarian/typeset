@@ -1,6 +1,6 @@
 {
   "productName": "Typeset",
-  "version": "0.6.31",
+  "version": "0.6.32",
   "identifier": "com.typeset.app",
   "build": {
     "beforeDevCommand": "npm run dev",
@@ -80,7 +80,9 @@
     },
     "deep-link": {
       "desktop": {
-        "schemes": ["typeset"]
+        "schemes": [
+          "typeset"
+        ]
       }
     },
     "updater": {

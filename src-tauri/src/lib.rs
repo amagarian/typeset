@@ -1,4 +1,5 @@
 mod auth;
+mod documents;
 mod gemini;
 mod keychain;
 mod projects;
@@ -53,6 +54,11 @@ pub fn run() {
             gemini::gemini_test_connection,
             projects::read_projects,
             projects::write_projects,
+            documents::read_documents,
+            documents::write_documents,
+            documents::read_document_pdf,
+            documents::write_document_pdf,
+            documents::delete_document_pdf,
             auth::auth_save_session,
             auth::auth_load_session,
             auth::auth_clear_session,
