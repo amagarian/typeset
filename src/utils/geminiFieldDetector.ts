@@ -1095,6 +1095,39 @@ function correctFieldLabelsFromPrintedText(
     const newCanonicalDef = newCanonicalId
       ? getCanonicalFieldDefinition(newCanonicalId)
       : undefined;
+
+    // v0.6.36 — field-kind drift guard. The label-correction pass
+    // is intended to fix LABEL text near the bbox; it is NOT meant
+    // to reinterpret the underlying field kind. When the new
+    // canonical's `fieldKind` disagrees with the field's current
+    // `fieldKind` across the signature ↔ text/date boundary, the
+    // new label almost certainly came from a neighbouring row's
+    // printed text overlapping the field's bbox — typically because
+    // an upstream snap expanded the bbox far enough left/right to
+    // cover an adjacent row's label.
+    //
+    // Real evidence (v0.6.35 CC Auth Form USD):
+    //   Field 16 label="Authorization Valid Through Date"
+    //     kind=date → corrected to "Signature"
+    //     (canonical=cardholderSignature, kind=signature).
+    //   The preceding `underlineSnap` resize-fit had stretched the
+    //   bbox 225pt to the left along a page-wide row underline,
+    //   putting its center over the "Signature:" printed label one
+    //   row above. The v0.6.36 leftward-extension cap in
+    //   `underlineSnap.ts` now prevents that bbox drift, but this
+    //   guard backstops any future slip: a date/text field whose
+    //   label was a multi-word descriptive caption is never
+    //   silently re-typed to a signature canonical.
+    if (newCanonicalDef) {
+      const newKind = newCanonicalDef.fieldKind;
+      const currentKind = field.fieldKind;
+      const signatureMismatch =
+        (newKind === "signature" && currentKind !== "signature") ||
+        (currentKind === "signature" && newKind !== "signature");
+      if (signatureMismatch) {
+        return field;
+      }
+    }
     const newMappedKey: TemplateMappedProjectKey = newCanonicalDef
       ? (newCanonicalDef.mappedProjectKey as TemplateMappedProjectKey)
       : ("__prompt__" as TemplateMappedProjectKey);
@@ -3090,6 +3123,55 @@ function mapToTemplateField(
         canonicalId = "authorizedSignerName";
       }
       // else — leave undefined; falls to `__prompt__` below.
+    }
+  }
+
+  // v0.6.36 — Suffix-Name backstop. When the field's label clearly
+  // ends with "Name" (e.g. "Third Party Sponsor Name", "Sponsor
+  // Name", "Print Name", "Cardholder Name") but the resolved
+  // canonical points to a non-person destination, the deterministic
+  // resolvers almost certainly leaked from sibling-row alias context.
+  //
+  // Real-world example (204 Credit Card Authorization, v0.6.35):
+  //   Field 25 label="Third Party Sponsor Name", gemini_canonical=—.
+  //   The 3rd-Party Agreement paragraph above the blank contains
+  //   instructional tokens ("…sponsor's federal tax id …", "tin",
+  //   "ein"), all registered as aliases on `federalTaxId` in the
+  //   catalog. `inferCanonicalId` substring-scans
+  //   `context_before + context_after` for those aliases and routes
+  //   the Name field to `federalTaxId`. The UI then displays
+  //   `canonicalDef.label = "Federal Tax ID"`, hiding the original
+  //   label entirely.
+  //
+  // The fix: if `canonicalId` is set, the label has a trailing
+  // "Name" / "Name:" / "Name." token, and the canonical is NOT a
+  // person-name destination, drop the canonical so the field falls
+  // through to `__prompt__` rather than confidently mismapping.
+  // Person-name canonicals (creditCardHolder, authorizedSignerName,
+  // secondAuthorizedSignerName, accountingContactName) are exempt —
+  // those are the correct destinations for Name-suffixed labels and
+  // the v0.5.16 + v0.6.0 backstops above route to them deliberately.
+  //
+  // Why not catalog-side: removing "tax id" / "ein" / "tin" from
+  // `federalTaxId`'s aliases would break the correct-direction
+  // resolution on forms where those tokens ARE the label (W-9 lines,
+  // vendor-info headers). The right scope is per-field, gated on
+  // the label's own suffix — kept here as a final-tier guard.
+  if (canonicalId) {
+    const lbl = (raw.label ?? "").trim().toLowerCase();
+    const isNameSuffix = /\bname\s*[:.]?$/.test(lbl);
+    const personNameCanonicals: ReadonlySet<CanonicalFieldId> =
+      new Set<CanonicalFieldId>([
+        "creditCardHolder",
+        "authorizedSignerName",
+        "secondAuthorizedSignerName",
+        "accountingContactName",
+      ]);
+    if (isNameSuffix && !personNameCanonicals.has(canonicalId)) {
+      console.warn(
+        `[Typeset detector] Suffix-Name guard: label="${raw.label}" had non-person canonical=${canonicalId}; resetting to __prompt__.`
+      );
+      canonicalId = undefined;
     }
   }
 

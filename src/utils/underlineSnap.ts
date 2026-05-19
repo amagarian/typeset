@@ -1229,6 +1229,56 @@ function tryHorizontalSnap(
     return null;
   }
 
+  // Cap 2c (v0.6.36): leftward-extension cap on resize-fit. The
+  // ratio caps above (2.5× row-connector / 2.0× widthRatio) catch
+  // run-walks that balloon the bbox to many multiples of its
+  // original width. They do NOT catch the case where the underline
+  // run is the bottom border of a TABLE ROW that spans both the
+  // printed label column and the writable area — there, the run
+  // is "only" ~1.3–2.0× the original bbox width (Gemini sized the
+  // field to start after the label), but its left edge sits BEHIND
+  // the label text. The 50% bbox-interval overlap rule still passes
+  // (the run shares the same y-row and ≥ half the original bbox is
+  // covered) so the snap fires in resize-fit mode and drags the
+  // bbox's left edge under the printed label.
+  //
+  // Real evidence (v0.6.35 CC Auth Form USD):
+  //   Field 9  Card #              x: 237.46→71.91 (Δ=-165.55pt)
+  //   Field 12 Cardholder's Name   x: 197.68→71.91 (Δ=-125.77pt)
+  //   Field 16 Auth Valid Through  x: 296.82→71.91 (Δ=-224.91pt)
+  // All three landed at newX ≈ 72pt (the left content margin),
+  // overlapping the printed "Cardholder's Name:" / "Billing
+  // Address:" / "Signature:" labels. Width ratios were 1.36×–1.90×,
+  // safely under both ratio caps. The downstream label-correction
+  // pass then re-labeled Field 16 ("Authorization Valid Through
+  // Date") to "Signature" because its NEW bbox center sat over
+  // the Signature row's printed text.
+  //
+  // 100pt threshold: typical printed labels run 60–100pt wide
+  // ("Cardholder's Name:", "Billing Address:", "Authorization Valid
+  // Through Date:"). Legitimate Gemini left-edge under-detection
+  // tops out around 70–80pt (Ruby form v0.5.21 evidence cited in
+  // the cap-removal comment above). 100pt sits in the gap: it
+  // permits the legitimate sub-100pt expansions and rejects the
+  // row-separator snaps that drag the bbox into the label column.
+  //
+  // Resize-fit only: relocate already has the strict per-edge
+  // `maxHorizontalDeltaPoints` cap (Cap 3 below). This adds the
+  // missing equivalent for resize-fit, but applies only to the
+  // LEFT edge — rightward extension into a clean margin almost
+  // never causes a printed-text collision, and the existing 2.0×
+  // width-ratio cap already bounds it.
+  const MAX_LEFTWARD_EXTENSION_PT = 100;
+  if (isResizeToFit && leftDeltaPt < -MAX_LEFTWARD_EXTENSION_PT) {
+    counts.hSkippedTooFar += 1;
+    if (wantLog) {
+      console.log(
+        `[underlineSnap] field=${field.id} hSnap=skipped:left-extension mode=${mode} (leftΔ=${leftDeltaPt.toFixed(2)}pt < -${MAX_LEFTWARD_EXTENSION_PT}pt — underline likely extends under printed label, leaving bbox at Gemini's extent)`
+      );
+    }
+    return null;
+  }
+
   // Cap 3: per-edge delta — RELOCATE ONLY (v0.5.21). Resize-fit
   // candidates skip this cap entirely; the ≥ 50% overlap rule is
   // itself proof we're on the same stroke (any wrong-stroke snap
