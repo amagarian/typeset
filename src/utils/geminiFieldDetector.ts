@@ -1059,6 +1059,23 @@ function correctFieldLabelsFromPrintedText(
       // Gemini had it right; printed prefix would only confuse us.
       return field;
     }
+    // v0.6.35 — when the field already carries a model-assigned
+    // canonical, the printed-prefix label is decoration, not a
+    // mapping override. Gemini 3.5 reliably picks canonicals from
+    // contextual reading; the printed-prefix matcher only sees a
+    // narrow rectangle of text and frequently grabs adjacent
+    // tokens (the CVV → AMEX bug fixed in v0.6.34 was exactly
+    // this pattern). Skip the override entirely when the existing
+    // canonical disagrees with the new one — leave the canonical
+    // alone and avoid touching the label/mapped key. The user can
+    // still rename in the template review modal.
+    if (
+      field.canonicalFieldId &&
+      newCanonicalId &&
+      field.canonicalFieldId !== newCanonicalId
+    ) {
+      return field;
+    }
     if (
       (field.canonicalFieldId === "ccv" || oldCanonicalId === "ccv") &&
       newCanonicalId &&
@@ -1286,6 +1303,23 @@ function synthesizeMissingFieldsFromUnderlines(
         ? (canonicalDef.mappedProjectKey as TemplateMappedProjectKey)
         : ("__prompt__" as TemplateMappedProjectKey);
 
+      // v0.6.35 — skip synthesis when a model-detected field on
+      // the same page already maps to this canonical. Gemini 3.5
+      // reliably finds Phone/Email/Cardholder Name fields; running
+      // synthesis on top produces duplicate, overlapping bboxes
+      // in the template editor. Only synthesize for canonicals the
+      // model actually missed.
+      if (canonicalId) {
+        const duplicate = pageFields.some(
+          (f) => f.canonicalFieldId === canonicalId
+        );
+        if (duplicate) continue;
+        const duplicateSynth = synthesized.some(
+          (f) => f.pageNumber === pageNum && f.canonicalFieldId === canonicalId
+        );
+        if (duplicateSynth) continue;
+      }
+
       // The underline item's `y` is the top of the glyph bbox
       // pdf.js reports; the visible underscore stroke sits near
       // the bottom of that band. Matching the bbox to the glyph's
@@ -1404,6 +1438,22 @@ function synthesizeMissingFieldsFromUnderlines(
         const mappedKey: TemplateMappedProjectKey = canonicalDef
           ? (canonicalDef.mappedProjectKey as TemplateMappedProjectKey)
           : ("__prompt__" as TemplateMappedProjectKey);
+
+        // v0.6.35 — duplicate-canonical guard for the embedded-
+        // label-underline pass (mirrors the standalone-underline
+        // pass above). With Gemini 3.5 reliably finding most
+        // Phone/Email/Cardholder Name fields, this prevents
+        // synthesis from creating overlapping duplicates.
+        if (canonicalId) {
+          const duplicate = pageFields.some(
+            (f) => f.canonicalFieldId === canonicalId
+          );
+          if (duplicate) continue;
+          const duplicateSynth = synthesized.some(
+            (f) => f.pageNumber === pageNum && f.canonicalFieldId === canonicalId
+          );
+          if (duplicateSynth) continue;
+        }
 
         const fieldKind: TemplateField["fieldKind"] = special?.isSignature
           ? "signature"
@@ -2896,25 +2946,29 @@ function mapToTemplateField(
     pages.find((p) => p.pageNumber === pageNumber) ?? pages[0];
   if (!page) return null;
 
-  // Four-tier canonical-id resolution. v0.5.15 reordered so LABEL
-  // wins over context/pattern: the user's v0.5.14 "Print Name field
-  // detecting as a date field" report was a precedence bug — for a
-  // row like `Signature ____ Print Name ____ Date ____`, the Print
-  // Name blank's `context_after` starts with "Date", which made
-  // `inferByPattern`'s `^date` regex hijack the canonical id even
-  // though Gemini correctly returned `label: "Print Name"`. Labels
-  // are the most specific local signal Gemini gives us; trust them
-  // first, fall back to context only when the label is ambiguous.
+  // Four-tier canonical-id resolution. v0.6.35 reordered so the
+  // MODEL's `canonical_field_id` wins first. Gemini 3.5 Flash returns
+  // specific canonical ids reliably; the deterministic ladder
+  // (label/alias/pattern) was originally written to compensate for
+  // 3.1-flash-lite's weak canonical assignments. Running the
+  // deterministic ladder before the model produced regressions on
+  // 3.5 where:
+  //   - "Reference" was being hijacked into `productionCompany` via
+  //     sibling-row alias leakage (v0.6.30, v0.6.31).
+  //   - "Cardholder Name" was being mapped to a generic `name`
+  //     because label-alias matching is coarser than the model's
+  //     contextual reading.
+  //   - "Print Name" mappings the v0.5.16 backstop still catches
+  //     (kept post-resolution, see below).
   //
-  //   1. Label alias / preflight — exact-label canonical match,
-  //      including the v0.5.15 name-label preflight that catches
-  //      "Print Name" / "First Name" / etc. directly.
-  //   2. Context alias — explicit-label rows whose label was empty
+  // Order (first non-undefined wins):
+  //   1. Model semantic — Gemini's `canonical_field_id` when valid.
+  //   2. Label alias / preflight — exact-label canonical match.
+  //   3. Context alias — explicit-label rows whose label was empty
   //      or generic, where `context_before + context_after` carries
   //      the canonical signal.
-  //   3. Pattern match — body-text patterns alias matching can't see
+  //   4. Pattern match — body-text patterns alias matching can't see
   //      (e.g. `I, ___, authorize…`).
-  //   4. Model semantic — Gemini's `canonical_field_id`, last resort.
   const labelId = inferByLabel(raw.label, rawFieldType, raw.checkbox_value);
   const aliasId = inferCanonicalId(
     raw.context_before,
@@ -2943,7 +2997,7 @@ function mapToTemplateField(
       ? (raw.canonical_field_id as CanonicalFieldId)
       : undefined;
   let canonicalId: CanonicalFieldId | undefined =
-    labelId ?? aliasId ?? patternId ?? geminiId;
+    geminiId ?? labelId ?? aliasId ?? patternId;
 
   // v0.5.16 — Last-mile label override (5th tier, runs AFTER the
   // four-tier ladder above). Person-name labels on cardholder rows
@@ -4622,22 +4676,24 @@ async function detectFieldsImpl(
     );
   }
 
-  // v0.5.37 — both `getModelPreference` and `getAccuracyMode` now
-  // return locked constants (see `services/geminiSettings.ts` for
-  // the current model id; v0.6.32 bumped it to `gemini-3.5-flash`).
-  // The model dropdown and accuracy radio group were removed from
-  // the SettingsModal so beta testers see a single paved-path
-  // experience. The two-pass / Maximum-mode codepaths below are
-  // still in place but unreachable from the UI; safe to prune in a
-  // future cleanup pass.
+  // v0.6.35 — decouple "run two-stage Pass 1" from "run Pass 2 QC".
+  // Pre-v0.6.35, both were gated together behind `accuracyMode === "maximum"`.
+  // With Gemini 3.5 Flash, the Stage 1a free-form description pass
+  // (designed to scaffold 3.1's weaker structured output) is no
+  // longer needed; but the Pass 2 model-vs-model audit IS still
+  // useful for borderline cases. So:
+  //   - `runStage1aStage1b`  → accuracy mode "maximum" (legacy
+  //      switch, not exposed in UI today).
+  //   - `runQc`              → accuracy mode "maximum" OR thinking
+  //      strength "deep". With deep thinking selected, Pass 1 is
+  //      single-shot (cheap) and Pass 2 verifies on top.
   const model = getModelPreference();
   const accuracyMode = getAccuracyMode();
-  const twoPass = accuracyMode === "maximum";
+  const thinkingMode = getGeminiThinkingMode();
+  const runStage1aStage1b = accuracyMode === "maximum";
+  const runQc = accuracyMode === "maximum" || thinkingMode === "deep";
 
-  // v0.4.12: Maximum mode runs the new two-stage Pass 1 (free-form
-  // description → description-aware structured JSON). Fast mode
-  // continues to use the legacy single-shot Pass 1.
-  const pass1 = twoPass
+  const pass1 = runStage1aStage1b
     ? await runPass1TwoStage(pages, filename, model, onStatus)
     : await runPass1Single(pages, filename, model, onStatus);
 
@@ -4673,7 +4729,7 @@ async function detectFieldsImpl(
     return { rowsByPage: {}, pageHeightsPt: {} } as PageTextSnapshot;
   });
 
-  if (!twoPass) {
+  if (!runQc) {
     // v0.5.5 snap runs once per detection regardless of accuracy
     // mode, AFTER mapToTemplateField + dedup but BEFORE we hand the
     // fields back to the UI. Verbose logging is on so the snap's
@@ -4689,7 +4745,7 @@ async function detectFieldsImpl(
     // (DraggableField, pdfWriter) draws an X on the blank for
     // annotated options and a circle around the label otherwise.
     const annotated = annotateOptionGroupBlanks(snapped, pageRenders, {
-      verbose: true,
+      verbose: false,
     });
     const snapshot = await textSnapshotPromise;
     // v0.6.19 — deterministic label correction. Gemini sometimes
@@ -4734,13 +4790,13 @@ async function detectFieldsImpl(
       withSynthesized,
       pageRenders,
       { textRows: pageTextSnapshotToBoxedTextRows(snapshot) },
-      { verbose: true }
+      { verbose: false }
     );
     // v0.6.0 (F) — clause-initials column detection. Runs after
     // the boxed-field pass so any initials cluster that overlaps
     // a boxed-field bbox is skipped (the boxed-field bbox wins).
     const withInitials = annotateInitialBoxes(boxed, pageRenders, {
-      verbose: true,
+      verbose: false,
       textRowsByPage: snapshot.rowsByPage,
     });
     // v0.6.0 (D3) — annotate fields with the section they fall
@@ -4786,7 +4842,7 @@ async function detectFieldsImpl(
       verbose: true,
     });
     const annotated = annotateOptionGroupBlanks(snapped, pageRenders, {
-      verbose: true,
+      verbose: false,
     });
     const snapshot = await textSnapshotPromise;
     const itemsByPage = await extractPrintedItemsByPage(pdfBytes).catch(
@@ -4811,10 +4867,10 @@ async function detectFieldsImpl(
       withSynthesized,
       pageRenders,
       { textRows: pageTextSnapshotToBoxedTextRows(snapshot) },
-      { verbose: true }
+      { verbose: false }
     );
     const withInitials = annotateInitialBoxes(boxed, pageRenders, {
-      verbose: true,
+      verbose: false,
       textRowsByPage: snapshot.rowsByPage,
     });
     const sections = detectSectionsFromSnapshot(snapshot);
@@ -4832,7 +4888,7 @@ async function detectFieldsImpl(
     verbose: true,
   });
   const annotated = annotateOptionGroupBlanks(snapped, pageRenders, {
-    verbose: true,
+    verbose: false,
   });
   const snapshot = await textSnapshotPromise;
   const itemsByPage = await extractPrintedItemsByPage(pdfBytes).catch((err) => {
@@ -4855,10 +4911,10 @@ async function detectFieldsImpl(
     withSynthesized,
     pageRenders,
     { textRows: pageTextSnapshotToBoxedTextRows(snapshot) },
-    { verbose: true }
+    { verbose: false }
   );
   const withInitials = annotateInitialBoxes(boxed, pageRenders, {
-    verbose: true,
+    verbose: false,
     textRowsByPage: snapshot.rowsByPage,
   });
   const sections = detectSectionsFromSnapshot(snapshot);
