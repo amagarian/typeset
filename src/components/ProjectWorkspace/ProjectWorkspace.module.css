@@ -27,6 +27,17 @@
 }
 
 .summaryTitle {
+  /*
+   * v0.6.38 — Explicit sans override. This is rendered as an <h2>
+   * for accessibility/semantic structure, but the visual treatment
+   * is the "small uppercase section label" pattern shared with
+   * DocumentList.heading (h3), ProjectDetailForm.legend, etc. The
+   * global `h1, h2` rule in index.css forces display/mono on every
+   * h2, so without this override JOB INFO renders in JetBrains Mono
+   * while the section labels next to it (DOCUMENTS, etc.) render
+   * in the sans body font.
+   */
+  font-family: var(--font-sans);
   font-size: 11px;
   font-weight: 500;
   text-transform: uppercase;
