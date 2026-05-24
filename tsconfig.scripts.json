@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "skipLibCheck": true,
+    "types": ["node"],
+    "allowSyntheticDefaultImports": true,
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["src/*"]
+    },
+    "noUnusedLocals": true,
+    "noUnusedParameters": true
+  },
+  "include": ["scripts/**/*.ts", "src/types/**/*.ts", "src/utils/templateAccuracy.ts", "src/utils/fieldCatalog.ts"]
+}

@@ -1,0 +1,53 @@
+{
+  "id": "sample-credit-card-auth-expected",
+  "name": "Sample credit card authorization",
+  "status": "local-verified",
+  "pageCount": 1,
+  "fields": [
+    {
+      "id": "expected-production-company",
+      "label": "Production Company",
+      "mappedProjectKey": "productionCompany",
+      "canonicalFieldId": "productionCompany",
+      "pageNumber": 1,
+      "x": 120,
+      "y": 180,
+      "width": 280,
+      "height": 22,
+      "confidence": 1,
+      "fieldType": "text",
+      "fieldKind": "text"
+    },
+    {
+      "id": "expected-job-name",
+      "label": "Job Name",
+      "mappedProjectKey": "jobName",
+      "canonicalFieldId": "jobName",
+      "pageNumber": 1,
+      "x": 120,
+      "y": 220,
+      "width": 280,
+      "height": 22,
+      "confidence": 1,
+      "fieldType": "text",
+      "fieldKind": "text"
+    },
+    {
+      "id": "expected-amex",
+      "label": "AMEX",
+      "mappedProjectKey": "creditCardType",
+      "canonicalFieldId": "creditCardTypeAmex",
+      "pageNumber": 1,
+      "x": 118,
+      "y": 318,
+      "width": 12,
+      "height": 12,
+      "confidence": 1,
+      "fieldType": "checkbox",
+      "fieldKind": "checkbox-group",
+      "checkboxValue": "amex"
+    }
+  ],
+  "createdAt": "2026-01-01T00:00:00.000Z",
+  "updatedAt": "2026-01-01T00:00:00.000Z"
+}

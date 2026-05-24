@@ -29,6 +29,30 @@ npm run dev
 
 Then open http://localhost:5173.
 
+## Form accuracy feedback loop
+
+The repo includes a headless evaluation loop for batch field-accuracy work:
+
+```bash
+npm run eval:forms:sample
+```
+
+For real PDFs, create a manifest under `fixtures/form-eval/` with source PDFs,
+reviewed ground-truth template JSON, optional app console logs, and optional
+filled result PDFs. Then run:
+
+```bash
+GEMINI_API_KEY=... npm run eval:forms -- \
+  --manifest fixtures/form-eval/manifest.json \
+  --provider gemini \
+  --threshold 1 \
+  --repeat 0
+```
+
+The loop writes provider responses, predicted templates, per-field accuracy
+reports, and an improvement brief under `.eval/form-feedback`. A passing run at
+`--threshold 1` requires every expected field to match with no extras.
+
 ## Architecture
 
 ```

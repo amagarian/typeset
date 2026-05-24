@@ -17,6 +17,7 @@ vite.config.d.ts
 # Logs
 *.log
 npm-debug.log*
+.eval/
 
 # Environment
 .env

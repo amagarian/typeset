@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "id": "sample-credit-card-auth",
+      "pdf": "pdfs/sample-credit-card-auth.pdf",
+      "expectedTemplate": "expected/sample-credit-card-auth.template.json",
+      "predictedTemplate": "predicted/sample-credit-card-auth.template.json",
+      "consoleLog": "logs/sample-credit-card-auth.console.txt",
+      "filledPdf": "filled/sample-credit-card-auth.filled.pdf",
+      "notes": "Example case structure. Replace placeholder paths with real PDFs, app console logs, filled PDFs, and reviewed templates."
+    }
+  ]
+}

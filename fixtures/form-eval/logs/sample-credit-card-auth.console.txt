@@ -1,0 +1,2 @@
+[Typeset Claude] model=fixture thinking=none stop=end_turn tool_calls=1 file_id=file_fixture usage={"inputTokens":0,"outputTokens":0}
+[Typeset Claude] Produced 3 field(s) from 3 raw entries (detected_via=fixture).
