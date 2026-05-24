@@ -1,0 +1,13 @@
+{
+  "description": "Example corpus manifest. Copy to manifest.json and replace paths with local PDFs.",
+  "samples": [
+    {
+      "id": "cc-auth-usd",
+      "pdf": "/Users/aidenmagarian/TYPEFACE Dropbox/Aiden Magarian/_AI DOCUMENTS/credit card auths/CC Auth Form USD.pdf",
+      "expected": "expected/cc-auth-usd.json",
+      "correction": "corrections/cc-auth-usd.json",
+      "filledPdf": "/Users/aidenmagarian/Downloads/CC Auth Form USD - FILLED2.pdf",
+      "consoleLog": "/Users/aidenmagarian/Downloads/204.rtf"
+    }
+  ]
+}

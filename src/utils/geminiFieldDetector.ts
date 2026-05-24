@@ -1839,6 +1839,7 @@ function buildPass1SharedSystemPrompt(): string {
     "",
     "## Output schema notes",
     "  - `bbox` MUST be `[y_min, x_min, y_max, x_max]` integers in the normalized 0-1000 range, computed against the dimensions of the image that contains the field. Y-first ordering is mandatory. (0,0) is the TOP-LEFT corner of the image; y increases downward.",
+    "  - Normalize `bbox` against the FULL page image height and width — never against a cropped content region, table region, visible ink bounds, or just the top half of the page. A field halfway down the page should have y values around 500, not 250.",
     "  - `page_number` is 1-based and corresponds to the position of the page image in the parts list (page_number=1 → first image, page_number=2 → second image, etc.).",
     "  - `field_type` is `text` or `checkbox`.",
     "  - `field_kind` is one of: text, multiline, date, signature, checkbox-group, boolean-checkbox.",
@@ -1916,6 +1917,19 @@ function buildPass1SharedSystemPrompt(): string {
     "### Mandatory rule for label-BELOW rows",
     "When a printed all-caps or small-caps short label appears in the form, do NOT assume the writable area is at the label's coordinates. Look at the row IMMEDIATELY ABOVE the label. If that preceding row is empty (whitespace, a drawn underline, or an empty rectangle), THAT empty row is the writable area and the bbox MUST cover it. The label below names the field; it does NOT define the bbox.",
     "",
+    "### Label-below signature/date closing blocks — horizontal alignment is mandatory",
+    "Some forms stack closing-block lines like:",
+    "  ```",
+    "  Date: ________",
+    "  ______________________________",
+    "  renting party, representative",
+    "  ______________________________",
+    "  print name and phone #",
+    "  ```",
+    "Pair each underline with the caption DIRECTLY BELOW it and horizontally overlapping it. The first long underline above `renting party, representative` is the signature field, not the Date field, even if the word `Date:` appears nearby above/left. The next long underline above `print name and phone #` is the printed-name/phone field, not another signature. A short date blank must sit horizontally next to or after the printed `Date:` label; never steal a full-width signature line just because it is vertically nearby.",
+    "Before assigning any label-below caption, verify x-overlap: the caption's x-range must overlap the underline/bbox's x-range. If it does not overlap, keep looking for the correct local caption or emit an unlabeled prompt field rather than borrowing a neighboring label.",
+    "For signature / print-name / date blocks where captions sit BELOW large empty bands, the bbox should occupy the actual empty band immediately above the caption. Do not place the bbox up in the paragraph text above the band. Its bottom edge should sit close to the caption/underline row; if it overlaps paragraph text, shift it down into the empty band.",
+    "",
     "When a row's label is BELOW the writable area, populate the field's `label` from that label (Title Case, e.g. `\"Phone Number\"`, `\"Exp Date\"`, `\"CVV\"`, `\"Zip Code\"`, `\"Credit Card Number\"`). Populate `canonical_field_id` by matching the label text against the canonical alias list (the same way you would for a Layout A or Layout B row). For label-BELOW, `context_before` should still capture the surrounding paragraph or row context BEFORE the writable area, and `context_after` MAY include the label that sits BELOW it.",
     "",
     "### Concrete example using the 204 CC-auth form",
@@ -1977,6 +1991,8 @@ function buildPass1SharedSystemPrompt(): string {
     "If the row has a trailing `Other:___` continuation line (a writable blank after the `Other` option), emit the option-group as described AND ALSO emit a SEPARATE text field for the `Other:___` blank line. The `Other` option's bbox covers the printed word `Other`; the trailing `___` is its own field.",
     "",
     "Set `canonical_field_id: 'cardType'` when the option set matches the credit-card brand pattern (≥ 3 of {Visa, MasterCard, AMEX, Discover, Other}, case-insensitive synonyms allowed: `Mastercard`, `Master Card`, `Amex`, `American Express`, `Discover Card`).",
+    "If you see the card-brand labels but cannot find drawn checkbox squares/circles next to them, DO NOT skip the brands. Emit the no-box row as an `option-group` with per-option label bboxes. Only emit separate checkbox fields when actual checkbox/radio marks are drawn.",
+    "Rows like `__ Visa  __ Mastercard  __ Amex  __ Discover` are underline selectors, not four independent checkboxes. Emit ONE `option-group` for the brands; the downstream renderer will mark the selected underline/label.",
     "",
     "Few-shot examples for option-group:",
     "  Form text: `Card Type:  Visa  MasterCard  AMEX  Discover  Other:_______`",
@@ -2342,6 +2358,16 @@ function inferByPattern(
   // paragraph ("I, ___, authorize my credit card to be charged an
   // additional $...") instances consistently.
   if (/^i,?$/.test(ctx) && /^,?\s*authoriz/.test(aft)) {
+    return "creditCardHolder";
+  }
+
+  // "I, ____ (full name as it appears on the credit card) ..." is
+  // the cardholder name even when the authorization verb appears
+  // later in the sentence. HD CCAUTH uses this parenthetical form.
+  if (
+    /^i,?$/.test(ctx) &&
+    /\bfull\s+name\s+as\s+it\s+appears\s+on\s+(?:the\s+)?credit\s+card\b/.test(aft)
+  ) {
     return "creditCardHolder";
   }
 
@@ -3170,6 +3196,48 @@ function mapToTemplateField(
     if (isNameSuffix && !personNameCanonicals.has(canonicalId)) {
       console.warn(
         `[Typeset detector] Suffix-Name guard: label="${raw.label}" had non-person canonical=${canonicalId}; resetting to __prompt__.`
+      );
+      canonicalId = undefined;
+    }
+  }
+
+  // v0.6.39 — third-party / sponsor agreement blanks are still
+  // fillable by the Wrapkit user, but they are NOT the primary
+  // cardholder/signature/date fields from the saved Project profile.
+  // Example: 204 Credit Card Authorization has a separate
+  // "3RD PARTY AGREEMENT" block with sponsor name, signature, print
+  // name, and date. The labels contain generic tokens ("Signature",
+  // "Print Name", "Date") that the canonical ladder would otherwise
+  // route to `cardholderSignature`, `creditCardHolder`, or
+  // `authorizationDate`, causing the filler to write the primary
+  // cardholder's values into the sponsor section. Leave these as
+  // prompt-backed fields so the user can supply sponsor-specific
+  // values when needed.
+  if (canonicalId) {
+    const thirdPartyHaystack = [
+      raw.label,
+      raw.context_before,
+      raw.context_after,
+      raw.group_id,
+    ]
+      .filter((s): s is string => typeof s === "string")
+      .join(" ")
+      .toLowerCase();
+    const hasThirdPartyContext =
+      /\b(?:3rd|third)\s+party\b/.test(thirdPartyHaystack) ||
+      /\bsponsor\b/.test(thirdPartyHaystack) ||
+      /\bco-?signer\b/.test(thirdPartyHaystack);
+    const primaryPersonCanonicals: ReadonlySet<CanonicalFieldId> =
+      new Set<CanonicalFieldId>([
+        "creditCardHolder",
+        "cardholderSignature",
+        "authorizationDate",
+        "authorizedSignerName",
+        "authorizedSignerTitle",
+      ]);
+    if (hasThirdPartyContext && primaryPersonCanonicals.has(canonicalId)) {
+      console.warn(
+        `[Typeset detector] Third-party guard: label="${raw.label}" canonical=${canonicalId}; resetting to __prompt__.`
       );
       canonicalId = undefined;
     }
